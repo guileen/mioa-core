@@ -20,3 +20,8 @@ Page startup requires only the basic page/network/runtime protocol. Site-icon
 subscription starts on the first `NativePage.site_icon()` call; a backend
 without that extension reports `capability_unavailable` for the icon request,
 not for ordinary navigation or rendering.
+
+`profile.migrate(name, binary=..., assets={"fonts": [...]})` explicitly upgrades
+a native runtime and its font locations in one snapshotted revision. Environment
+id, seed and storage remain owned by the profile; `rollback=snapshot` restores
+the prior tree. Startup never silently accepts a different pinned binary/font.

@@ -672,7 +672,7 @@ def _exchange_directories(left: Path, right: Path) -> None:
 
 
 def migrate(name: str, *, binary: str | Path | None = None, overrides: dict[str, Any] | None = None,
-            rollback: str | Path | None = None,
+            assets: dict[str, list[str]] | None = None, rollback: str | Path | None = None,
             runtime_adapters: RuntimeAdapters | None = None) -> dict[str, Any]:
     name = sanitize(name)
     with exclusive(name, kind="spawn") as serialized, exclusive(name) as owned, exclusive("catalog", kind="catalog") as catalog:
@@ -683,8 +683,8 @@ def migrate(name: str, *, binary: str | Path | None = None, overrides: dict[str,
         if cfg.get("mode") != "managed" or cfg.get("schema") not in (2, SCHEMA):
             raise ProfileError("incompatible_profile: migration requires managed schema2/3")
         if rollback is not None:
-            if binary is not None or overrides is not None:
-                raise ProfileError("invalid_config: rollback cannot change runtime or overrides")
+            if binary is not None or overrides is not None or assets is not None:
+                raise ProfileError("invalid_config: rollback cannot change runtime, overrides or assets")
             staging = Path(tempfile.mkdtemp(prefix=".rollback-", dir=store())).resolve()
             try:
                 extracted, previous, manifest = _extract_archive(Path(rollback).expanduser(), staging)
@@ -735,8 +735,10 @@ def migrate(name: str, *, binary: str | Path | None = None, overrides: dict[str,
         from .native_spec import check_identity_collision
         if runtime in NATIVE_RUNTIMES:
             from .native_spec import migrate_native_spec
-            result = migrate_native_spec(cfg, binary=binary, overrides=overrides)
+            result = migrate_native_spec(cfg, binary=binary, overrides=overrides, assets=assets)
         else:
+            if assets is not None:
+                raise ProfileError("invalid_config: asset migration requires a native runtime")
             result = _runtime_adapter(runtime, runtime_adapters).migrate(
                 cfg, name=name, binary=binary, overrides=overrides, inline_proxy=inline_proxy)
         with (directory / "config.json").open("rb") as stream:
