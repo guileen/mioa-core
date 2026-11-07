@@ -1,0 +1,37 @@
+# Python bytecode, build and packaging output
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv caches and local environments
+.uv-cache/
+.uv-tools/
+.uv-python/
+
+# Native build output (frame_atomic.c is source and stays tracked)
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Runtime and test byproducts: never part of the source release
+*.log
+*.prof
+*.pyc
+.DS_Store
+.local/
+
+# Do not commit installed runtime/font artifacts
+*.otf
+*.ttf
+*.woff
+*.woff2

@@ -1,0 +1,62 @@
+Mioa shared core and headless service
+=====================================
+
+Copyright (c) 2026 anti-trace contributors
+
+This distribution is licensed under the MIT License. See LICENSE in this
+directory for the full permission and warranty notice.
+
+Provenance
+----------
+
+The Python source in mioa_core/ and mioa_headless/ was reconciled from the
+Mioa shared-core work and from the anti-trace product modules named in each
+module docstring (Engine, ControlState, RefStore, ScriptOperations, NativePage,
+native_spec and profile). Those modules are MIT-licensed work of the anti-trace
+contributors. Source identity of the reconciliation inputs:
+
+  reconcile-desktop-atb-core-20261107T114222Z   mioa-core, mioa-headless
+  integration-atb-consumer-20261107T112231Z     migrated headless tests
+
+No ATB CLI, desktop UI, HTTP viewer, Camoufox adapter or Playwright adapter
+source is included in this tree. Per-file SHA-256 digests are in
+MANIFEST.sha256.
+
+Third-party Python dependencies
+-------------------------------
+
+No third-party source is vendored. The declared runtime dependencies are
+resolved by the package locks and remain under their own licenses:
+
+  psutil 7.2.2                 BSD-3-Clause
+  requests 2.34.2              Apache-2.0
+  certifi 2026.10.23           MPL-2.0
+  charset-normalizer 3.5.2     MIT
+  idna 3.20                    BSD-3-Clause
+  urllib3 2.8.0                MIT
+
+Installing this project does not relicense those packages. Their notices are
+shipped with the packages installed from the Python Package Index.
+
+Native runtime (not included)
+-----------------------------
+
+This tree contains no browser engine, renderer binary, font or other native
+runtime artifact. mioa_core can launch a separately obtained native runtime
+only at a caller-supplied path; that program is not part of this distribution
+and is licensed separately by its authors.
+
+The development engine pinned by the source is Lightpanda Browser
+(https://github.com/lightpanda-io/browser). Its LICENSE file is the GNU Affero
+General Public License version 3 (AGPL-3.0) text. The alternate engine path
+named in the source, Obscura, declares Apache-2.0. Neither program is
+redistributed here,
+and nothing in this notice grants rights to them. Operators who obtain or run
+those programs are responsible for complying with their licenses.
+
+Test fixture
+------------
+
+The string "hunter2" in mioa-headless/tests/test_axtree_observation.py is a
+literal used to verify that password values are masked. It is not a
+credential.
