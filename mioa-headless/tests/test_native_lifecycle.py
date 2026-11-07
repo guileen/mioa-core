@@ -1,0 +1,361 @@
+"""Owner EOF, native death, and durable native shutdown regressions."""
+import asyncio
+from contextlib import ExitStack
+import io
+import json
+import os
+from pathlib import Path
+import struct
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, Mock, patch
+
+from mioa_headless.native_service import NativeProtocol
+
+
+class NativeProcess:
+    def __init__(self):
+        self.returncode = None
+        self.exited = asyncio.Event()
+        self.waiting = asyncio.Event()
+
+    async def wait(self):
+        self.waiting.set()
+        await self.exited.wait()
+        return self.returncode
+
+    def exit(self, code):
+        self.returncode = code
+        self.exited.set()
+
+
+class Engine:
+    def __init__(self):
+        self.name = "lifecycle"
+        self.stopping = asyncio.Event()
+        self.control = SimpleNamespace(pause=Mock())
+        self.native = self.context = None
+        self.starting = asyncio.Event()
+        self.launched = asyncio.Event()
+        self.launch_gate = asyncio.Event()
+        self.launch_gate.set()
+        self.start_gate = asyncio.Event()
+        self.start_gate.set()
+        self.cleanup_gate = asyncio.Event()
+        self.cleanup_gate.set()
+        self.cleanup_started = asyncio.Event()
+        self.shutdown_calls = self.close_count = 0
+        self.start_error = self.shutdown_error = None
+        self.cdp_dead = asyncio.Event()
+        self.closed = False
+
+    async def _launch(self, config):
+        await self.launch_gate.wait()
+        process = NativeProcess()
+        cdp = SimpleNamespace(reader=asyncio.create_task(self.cdp_dead.wait()), failure=None, listeners=[])
+        self.context = SimpleNamespace(cdp=cdp, pages=[], on=Mock(), remove_listener=Mock())
+        self.native = SimpleNamespace(process=process, pid=123, close=self.close_native)
+        self.launched.set()
+
+    async def start(self):
+        self.starting.set()
+        await self._launch({})
+        await self.start_gate.wait()
+        if self.start_error:
+            raise self.start_error
+
+    async def close_native(self):
+        if self.closed:
+            return
+        self.cleanup_started.set()
+        await self.cleanup_gate.wait()
+        if self.native.process.returncode is None:
+            self.native.process.exit(0)
+        self.context.cdp.reader.cancel()
+        await asyncio.gather(self.context.cdp.reader, return_exceptions=True)
+        self.closed = True
+        self.close_count += 1
+
+    async def shutdown(self):
+        self.shutdown_calls += 1
+        if self.shutdown_error:
+            raise self.shutdown_error
+        if self.native:
+            await self.native.close()
+
+
+class Output(io.StringIO):
+    def __init__(self):
+        super().__init__()
+        self.ready = asyncio.Event()
+
+    def write(self, value):
+        result = super().write(value)
+        if json.loads(value).get("event") == "ready":
+            self.ready.set()
+        return result
+
+    def messages(self):
+        return [json.loads(line) for line in self.getvalue().splitlines()]
+
+
+class NativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        directory = self.stack.enter_context(tempfile.TemporaryDirectory())
+        root = Path(directory)
+        read_fd, self.parent_fd = os.pipe()
+        stdin = self.stack.enter_context(os.fdopen(read_fd, "rb", buffering=0))
+        self.output = Output()
+        self.stack.enter_context(patch("mioa_headless.native_service.sys.stdin", stdin))
+        self.stack.enter_context(patch("mioa_headless.native_service.sys.stdout", self.output))
+        self.ring = self.stack.enter_context(patch("mioa_headless.native_service.FrameRing")).return_value
+        self.session = SimpleNamespace(state=AsyncMock(return_value={"pages": []}), close=Mock())
+        self.stack.enter_context(patch("mioa_headless.native_service.Session", return_value=self.session))
+        self.engine = Engine()
+        self.protocol = NativeProtocol(self.engine, root, root / "control", root / "frame")
+        self.run_task = None
+        self.addAsyncCleanup(self.finish)
+
+    def disconnect_parent(self):
+        if self.parent_fd is not None:
+            os.close(self.parent_fd)
+            self.parent_fd = None
+
+    async def finish(self):
+        self.disconnect_parent()
+        self.engine.launch_gate.set()
+        self.engine.start_gate.set()
+        self.engine.cleanup_gate.set()
+        self.engine.stopping.set()
+        if self.run_task is not None:
+            await asyncio.wait_for(self.run_task, 2)
+
+    def start_service(self):
+        self.run_task = asyncio.create_task(self.protocol.run())
+
+    async def ready(self):
+        self.start_service()
+        await asyncio.wait_for(self.output.ready.wait(), 1)
+
+    async def result(self):
+        return await asyncio.wait_for(self.run_task, 1)
+
+    async def connect(self):
+        reader, writer = await asyncio.open_unix_connection(str(self.protocol.socket))
+        self.addAsyncCleanup(self.close_writer, writer)
+        return reader, writer
+
+    async def close_writer(self, writer):
+        writer.close()
+        await writer.wait_closed()
+
+    async def send(self, writer, request):
+        body = json.dumps(request).encode()
+        writer.write(struct.pack("<I", len(body)) + body)
+        await writer.drain()
+
+    async def receive(self, reader):
+        prefix = await asyncio.wait_for(reader.readexactly(4), 1)
+        length, = struct.unpack("<I", prefix)
+        return json.loads(await asyncio.wait_for(reader.readexactly(length), 1))
+
+    def assert_cleaned(self):
+        self.assertEqual(self.engine.shutdown_calls, 1)
+        if self.engine.native:
+            self.assertTrue(self.engine.closed)
+            self.assertEqual(self.engine.close_count, 1)
+            self.assertTrue(self.engine.context.cdp.reader.done())
+        self.ring.close.assert_called_once()
+
+    async def test_parent_eof_cancels_startup_before_native_exposure(self):
+        self.engine.launch_gate.clear()
+        self.start_service()
+        await asyncio.wait_for(self.engine.starting.wait(), 1)
+        self.disconnect_parent()
+        self.assertEqual(await self.result(), 1)
+        self.assertIsNone(self.engine.native)
+        self.assertFalse(self.protocol.socket.exists())
+        self.assertEqual(self.output.messages()[0]["error"]["code"], "runtime_error")
+        self.assertNotIn("_launch", self.engine.__dict__)
+        self.assert_cleaned()
+
+    async def test_parent_eof_awaits_launch_owned_cleanup_before_shutdown(self):
+        provisional = NativeProcess()
+        created = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        self.addCleanup(release_cleanup.set)
+        cancellation_started = asyncio.Event()
+
+        async def launch(config):
+            created.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancellation_started.set()
+                await release_cleanup.wait()
+                provisional.exit(0)
+
+        self.engine._launch = launch
+        self.start_service()
+        await asyncio.wait_for(created.wait(), 1)
+        self.disconnect_parent()
+        await asyncio.wait_for(cancellation_started.wait(), 1)
+        self.assertEqual(self.engine.shutdown_calls, 0)
+        self.assertFalse(self.run_task.done())
+        release_cleanup.set()
+        self.assertEqual(await self.result(), 1)
+        self.assertEqual(provisional.returncode, 0)
+        self.assertIs(self.engine._launch, launch)
+        self.assert_cleaned()
+
+    async def test_parent_eof_cleans_child_while_startup_is_pending(self):
+        self.engine.start_gate.clear()
+        self.start_service()
+        await asyncio.wait_for(self.engine.launched.wait(), 1)
+        self.disconnect_parent()
+        self.assertEqual(await self.result(), 1)
+        self.assertFalse(self.protocol.ready)
+        self.assert_cleaned()
+
+    async def test_parent_eof_without_socket_accept_cleans_idle_child(self):
+        await self.ready()
+        self.assertIsNone(self.protocol.writer)
+        self.disconnect_parent()
+        self.assertEqual(await self.result(), 1)
+        self.assertEqual([message["event"] for message in self.output.messages()], ["ready", "error"])
+        self.assertEqual(self.output.messages()[-1]["error"]["code"], "runtime_error")
+        self.assert_cleaned()
+
+    async def test_parent_eof_emits_terminal_error_on_connected_socket(self):
+        await self.ready()
+        reader, writer = await self.connect()
+        await self.send(writer, {"id": 1, "method": "state"})
+        await self.receive(reader)
+        self.disconnect_parent()
+        terminal = await self.receive(reader)
+        self.assertEqual(await self.result(), 1)
+        self.assertEqual(terminal, self.output.messages()[-1])
+        self.assertEqual(terminal["event"], "error")
+        self.assertEqual(terminal["error"]["code"], "runtime_error")
+        self.assert_cleaned()
+
+    async def test_process_death_during_pending_startup_is_terminal(self):
+        self.engine.start_gate.clear()
+        self.start_service()
+        await asyncio.wait_for(self.engine.launched.wait(), 1)
+        self.engine.native.process.exit(17)
+        self.assertEqual(await self.result(), 1)
+        self.assertFalse(self.protocol.ready)
+        self.assertEqual(self.output.messages()[-1]["error"]["code"], "runtime_error")
+        self.assert_cleaned()
+
+    async def test_cdp_death_during_pending_startup_is_terminal(self):
+        self.engine.start_gate.clear()
+        self.start_service()
+        await asyncio.wait_for(self.engine.launched.wait(), 1)
+        self.engine.context.cdp.failure = RuntimeError("private startup detail")
+        self.engine.cdp_dead.set()
+        self.assertEqual(await self.result(), 1)
+        self.assertFalse(self.protocol.ready)
+        self.assertNotIn("private", self.output.getvalue())
+        self.assert_cleaned()
+
+    async def test_idle_process_death_without_client_is_terminal(self):
+        await self.ready()
+        await asyncio.wait_for(self.engine.native.process.waiting.wait(), 1)
+        self.engine.native.process.exit(9)
+        self.assertEqual(await self.result(), 1)
+        self.assertEqual(self.output.messages()[-1]["event"], "error")
+        self.assert_cleaned()
+
+    async def test_idle_cdp_death_emits_sanitized_terminal_on_both_channels(self):
+        await self.ready()
+        reader, writer = await self.connect()
+        await self.send(writer, {"id": 1, "method": "state"})
+        self.assertEqual(await self.receive(reader), {"id": 1, "result": {"pages": []}})
+        self.engine.context.cdp.failure = RuntimeError("secret URL and credentials")
+        self.engine.cdp_dead.set()
+        terminal = await self.receive(reader)
+        self.assertEqual(await self.result(), 1)
+        self.assertEqual(terminal, self.output.messages()[-1])
+        self.assertEqual(terminal["event"], "error")
+        self.assertNotIn("secret", json.dumps(terminal))
+        self.assert_cleaned()
+
+    async def test_shutdown_ack_occurs_once_after_durable_cleanup(self):
+        await self.ready()
+        reader, writer = await self.connect()
+        self.engine.cleanup_gate.clear()
+        await self.send(writer, {"id": 8, "method": "shutdown"})
+        await asyncio.wait_for(self.engine.cleanup_started.wait(), 1)
+        self.assertFalse(self.run_task.done())
+        self.assertFalse(self.engine.closed)
+        self.assertFalse(reader._buffer)
+        self.engine.cleanup_gate.set()
+        self.assertEqual(await self.receive(reader), {"id": 8, "result": {"status": "ok", "flushed": True}})
+        self.assertEqual(await self.result(), 0)
+        self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
+        self.assertEqual([message["event"] for message in self.output.messages()], ["ready"])
+        self.assert_cleaned()
+
+    async def test_signal_stop_does_not_misclassify_cleanup_as_native_death(self):
+        await self.ready()
+        self.engine.stopping.set()  # same callback installed for SIGTERM/SIGINT
+        self.assertEqual(await self.result(), 0)
+        self.assertIsNone(self.protocol.fatal)
+        self.assertEqual([message["event"] for message in self.output.messages()], ["ready"])
+        self.assert_cleaned()
+
+    async def test_startup_exception_still_closes_owned_native_child(self):
+        self.engine.start_error = RuntimeError("private startup details")
+        self.start_service()
+        self.assertEqual(await self.result(), 1)
+        self.assertNotIn("private", self.output.getvalue())
+        self.assertFalse(self.protocol.ready)
+        self.assert_cleaned()
+
+    async def test_shutdown_exception_still_closes_child_and_returns_one_error_ack(self):
+        await self.ready()
+        reader, writer = await self.connect()
+        self.engine.shutdown_error = RuntimeError("private shutdown details")
+        await self.send(writer, {"id": 9, "method": "shutdown"})
+        response = await self.receive(reader)
+        self.assertEqual(response["id"], 9)
+        self.assertIn("error", response)
+        self.assertNotIn("private", json.dumps(response))
+        self.assertEqual(await self.result(), 1)
+        self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
+        self.assert_cleaned()
+
+    async def test_ring_cleanup_failure_returns_error_ack_and_finishes_teardown(self):
+        loop = asyncio.get_running_loop()
+        connect_read_pipe = loop.connect_read_pipe
+        transports = []
+
+        async def connect(*args, **kwargs):
+            result = await connect_read_pipe(*args, **kwargs)
+            transports.append(result[0])
+            return result
+
+        with patch.object(loop, "connect_read_pipe", side_effect=connect), patch.object(
+            loop, "remove_signal_handler", wraps=loop.remove_signal_handler
+        ) as remove_signal_handler:
+            await self.ready()
+            reader, writer = await self.connect()
+            self.ring.close.side_effect = RuntimeError("private artifact unlink failure")
+            await self.send(writer, {"id": 10, "method": "shutdown"})
+            response = await self.receive(reader)
+            self.assertEqual(response["id"], 10)
+            self.assertIn("error", response)
+            self.assertNotIn("result", response)
+            self.assertNotIn("private", json.dumps(response))
+            self.assertEqual(await self.result(), 1)
+            self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
+            self.assertEqual(self.output.messages()[-1]["event"], "error")
+            self.assertNotIn("private", self.output.getvalue())
+            self.assertEqual(remove_signal_handler.call_count, 2)
+            self.assertTrue(transports[0].is_closing())
+            self.assert_cleaned()

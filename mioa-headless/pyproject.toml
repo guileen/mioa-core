@@ -1,0 +1,31 @@
+[project]
+name = "mioa-headless"
+version = "0.1.0"
+description = "Standalone local Mioa session service for pixel-based desktop clients"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12,<3.13"
+dependencies = ["mioa-core==0.1.0"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: MacOS",
+]
+
+[project.scripts]
+mioa-headless = "mioa_headless.__main__:main"
+
+[tool.uv.sources]
+mioa-core = { path = "../mioa-core" }
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mioa_headless*"]
+
+[tool.setuptools.package-data]
+mioa_headless = ["frame_atomic.c"]
