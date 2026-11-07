@@ -1,0 +1,399 @@
+const std = @import("std");
+
+pub const Version = enum {
+    @"2024-11-05",
+    @"2025-03-26",
+    @"2025-06-18",
+    @"2025-11-25",
+
+    pub const latest: Version = .@"2025-11-25";
+
+    /// The client's version when we support it, else the newest we do.
+    pub fn negotiate(params: ?std.json.Value) Version {
+        const obj = switch (params orelse return .latest) {
+            .object => |o| o,
+            else => return .latest,
+        };
+        const requested = switch (obj.get("protocolVersion") orelse return .latest) {
+            .string => |s| s,
+            else => return .latest,
+        };
+        return std.meta.stringToEnum(Version, requested) orelse .latest;
+    }
+};
+
+pub const Request = struct {
+    jsonrpc: []const u8 = "2.0",
+    id: ?std.json.Value = null,
+    method: []const u8,
+    params: ?std.json.Value = null,
+};
+
+pub const Response = struct {
+    jsonrpc: []const u8 = "2.0",
+    id: std.json.Value,
+    result: ?std.json.Value = null,
+    @"error": ?Error = null,
+};
+
+pub const Error = struct {
+    code: i64,
+    message: []const u8,
+    data: ?std.json.Value = null,
+};
+
+pub const ErrorCode = enum(i64) {
+    ParseError = -32700,
+    InvalidRequest = -32600,
+    MethodNotFound = -32601,
+    InvalidParams = -32602,
+    InternalError = -32603,
+    FrameNotLoaded = -32604,
+    NotFound = -32605,
+    /// Application-range code: tool call was aborted by the caller (SIGINT,
+    /// session shutdown). Distinct from InternalError so MCP clients don't
+    /// retry into a loop on intentional cancellation.
+    Cancelled = -32001,
+    /// Application-range code: tool call exceeded its deadline. Distinct
+    /// from Cancelled — Timeout is a tool-state outcome, not a caller signal.
+    Timeout = -32002,
+};
+
+// Core MCP Types mapping to official specification
+const InitializeParams = struct {
+    protocolVersion: []const u8,
+    capabilities: Capabilities,
+    clientInfo: Implementation,
+};
+
+/// `clientInfo.name` from `initialize` params, or null when absent or malformed.
+pub fn clientName(params: ?std.json.Value) ?[]const u8 {
+    const obj = switch (params orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    const info = switch (obj.get("clientInfo") orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    return switch (info.get("name") orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+const Capabilities = struct {
+    experimental: ?std.json.Value = null,
+    roots: ?RootsCapability = null,
+    sampling: ?SamplingCapability = null,
+};
+
+const RootsCapability = struct {
+    listChanged: ?bool = null,
+};
+
+const SamplingCapability = struct {};
+
+const Implementation = struct {
+    name: []const u8,
+    version: []const u8,
+};
+
+pub const InitializeResult = struct {
+    protocolVersion: []const u8,
+    capabilities: ServerCapabilities,
+    serverInfo: Implementation,
+    /// Free-form guidance the client should fold into its system prompt.
+    /// Per the MCP spec, this is how a server tells a driver "here is how
+    /// to use me correctly" without requiring a separate tool call.
+    instructions: ?[]const u8 = null,
+};
+
+const ServerCapabilities = struct {
+    experimental: ?std.json.Value = null,
+    logging: ?LoggingCapability = null,
+    prompts: ?PromptsCapability = null,
+    resources: ?ResourcesCapability = null,
+    tools: ?ToolsCapability = null,
+};
+
+const LoggingCapability = struct {};
+const PromptsCapability = struct {
+    listChanged: ?bool = null,
+};
+const ResourcesCapability = struct {
+    subscribe: ?bool = null,
+    listChanged: ?bool = null,
+};
+const ToolsCapability = struct {
+    listChanged: ?bool = null,
+};
+
+/// Advisory hints for clients (e.g. auto-approving read-only calls).
+/// Defaults are the spec's: assume the worst when unset.
+pub const ToolAnnotations = struct {
+    readOnlyHint: bool = false,
+    destructiveHint: bool = true,
+    idempotentHint: bool = false,
+    openWorldHint: bool = true,
+};
+
+pub const Tool = struct {
+    name: []const u8,
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    inputSchema: []const u8,
+    /// Declaring one obliges every call to answer with a conforming
+    /// `structuredContent`, so only the tools that always can carry it.
+    outputSchema: ?[]const u8 = null,
+    annotations: ?ToolAnnotations = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.title) |t| {
+            try jw.objectField("title");
+            try jw.write(t);
+        }
+        if (self.description) |d| {
+            try jw.objectField("description");
+            try jw.write(d);
+        }
+        try jw.objectField("inputSchema");
+        _ = try jw.beginWriteRaw();
+        try jw.writer.writeAll(self.inputSchema);
+        jw.endWriteRaw();
+        if (self.outputSchema) |s| {
+            try jw.objectField("outputSchema");
+            _ = try jw.beginWriteRaw();
+            try jw.writer.writeAll(s);
+            jw.endWriteRaw();
+        }
+        if (self.annotations) |a| {
+            try jw.objectField("annotations");
+            try jw.write(a);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const minify = @import("../browser/tools.zig").minify;
+
+pub const Resource = struct {
+    uri: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
+    mimeType: ?[]const u8 = null,
+};
+
+pub const CallParams = struct {
+    name: []const u8,
+    arguments: ?std.json.Value = null,
+};
+
+pub fn TextContent(comptime T: type) type {
+    return struct {
+        type: []const u8 = "text",
+        text: T,
+    };
+}
+
+/// `T` serializes as the base64 payload.
+pub fn ImageContent(comptime T: type) type {
+    return struct {
+        type: []const u8 = "image",
+        data: T,
+        mimeType: []const u8,
+    };
+}
+
+/// `Content` is the content array: a slice or tuple of `TextContent`/`ImageContent`.
+pub fn CallToolResult(comptime Content: type) type {
+    return struct {
+        content: Content,
+        isError: bool = false,
+    };
+}
+
+/// The text block stays alongside `structuredContent`: it is what the model
+/// reads, and the spec asks for the serialized form next to it anyway.
+pub fn StructuredCallToolResult(comptime Content: type, comptime Structured: type) type {
+    return struct {
+        content: Content,
+        structuredContent: Structured,
+        isError: bool = false,
+    };
+}
+
+pub const JsonEscapingWriter = struct {
+    inner_writer: *std.Io.Writer,
+    writer: std.Io.Writer,
+
+    pub fn init(inner_writer: *std.Io.Writer) JsonEscapingWriter {
+        return .{
+            .inner_writer = inner_writer,
+            .writer = .{
+                .vtable = &vtable,
+                .buffer = &.{},
+            },
+        };
+    }
+
+    const vtable = std.Io.Writer.VTable{
+        .drain = drain,
+    };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *JsonEscapingWriter = @alignCast(@fieldParentPtr("writer", w));
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            std.json.Stringify.encodeJsonStringChars(slice, .{}, self.inner_writer) catch return error.WriteFailed;
+            total += slice.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            std.json.Stringify.encodeJsonStringChars(pattern, .{}, self.inner_writer) catch return error.WriteFailed;
+            total += pattern.len;
+        }
+        return total;
+    }
+};
+
+const testing = @import("../testing.zig");
+
+test "MCP.protocol - request parsing" {
+    const raw_json =
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": 1,
+        \\  "method": "initialize",
+        \\  "params": {
+        \\    "protocolVersion": "2024-11-05",
+        \\    "capabilities": {},
+        \\    "clientInfo": {
+        \\      "name": "test-client",
+        \\      "version": "1.0.0"
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const parsed = try std.json.parseFromSlice(Request, testing.arena_allocator, raw_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const req = parsed.value;
+    try testing.expectString("2.0", req.jsonrpc);
+    try testing.expectString("initialize", req.method);
+    try testing.expect(req.id.? == .integer);
+    try testing.expectEqual(@as(i64, 1), req.id.?.integer);
+    try testing.expect(req.params != null);
+
+    const init_params = try std.json.parseFromValue(InitializeParams, testing.arena_allocator, req.params.?, .{ .ignore_unknown_fields = true });
+    defer init_params.deinit();
+
+    try testing.expectString("2024-11-05", init_params.value.protocolVersion);
+    try testing.expectString("test-client", init_params.value.clientInfo.name);
+    try testing.expectString("1.0.0", init_params.value.clientInfo.version);
+    try testing.expectString("test-client", clientName(req.params).?);
+    try testing.expect(clientName(null) == null);
+}
+
+test "MCP.protocol - ping request parsing" {
+    const raw_json =
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "123",
+        \\  "method": "ping"
+        \\}
+    ;
+
+    const parsed = try std.json.parseFromSlice(Request, testing.arena_allocator, raw_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const req = parsed.value;
+    try testing.expectString("2.0", req.jsonrpc);
+    try testing.expectString("ping", req.method);
+    try testing.expect(req.id.? == .string);
+    try testing.expectString("123", req.id.?.string);
+    try testing.expectEqual(null, req.params);
+}
+
+test "MCP.protocol - response formatting" {
+    const response = Response{
+        .id = .{ .integer = 42 },
+        .result = .{ .string = "success" },
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(response, .{ .emit_null_optional_fields = false }, &aw.writer);
+
+    try testing.expectString("{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":\"success\"}", aw.written());
+}
+
+test "MCP.protocol - error formatting" {
+    const response = Response{
+        .id = .{ .string = "abc" },
+        .@"error" = .{
+            .code = @backingInt(ErrorCode.MethodNotFound),
+            .message = "Method not found",
+        },
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(response, .{ .emit_null_optional_fields = false }, &aw.writer);
+
+    try testing.expectString("{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}", aw.written());
+}
+
+test "MCP.protocol - JsonEscapingWriter" {
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    defer aw.deinit();
+
+    var escaping_writer = JsonEscapingWriter.init(&aw.writer);
+
+    // test newlines and quotes
+    try escaping_writer.writer.writeAll("hello\n\"world\"");
+
+    // the writer outputs escaped string chars without surrounding quotes
+    try testing.expectString("hello\\n\\\"world\\\"", aw.written());
+}
+
+test "MCP.protocol - Tool serialization" {
+    const t = Tool{
+        .name = "test",
+        .inputSchema = minify(
+            \\{
+            \\  "type": "object",
+            \\  "properties": {
+            \\    "foo": { "type": "string" }
+            \\  }
+            \\}
+        ),
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    defer aw.deinit();
+
+    try std.json.Stringify.value(t, .{}, &aw.writer);
+
+    try testing.expectString("{\"name\":\"test\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"foo\":{\"type\":\"string\"}}}}", aw.written());
+}
+
+test "MCP.protocol - Tool serialization with title and annotations" {
+    const t = Tool{
+        .name = "test",
+        .title = "Test",
+        .inputSchema = "{}",
+        .annotations = .{ .readOnlyHint = true, .destructiveHint = false },
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    defer aw.deinit();
+
+    try std.json.Stringify.value(t, .{}, &aw.writer);
+
+    try testing.expectString("{\"name\":\"test\",\"title\":\"Test\",\"inputSchema\":{},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":false,\"openWorldHint\":true}}", aw.written());
+}

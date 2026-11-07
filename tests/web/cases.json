@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "cases": [
+    {"id":"layout-relative-units","kind":"assertion","test":"fixtures/relative-box-edges.html","script":"scripts/layout.js","assertions":["relative units map to viewport and font geometry","style mutation recomputes geometry and hit testing"]},
+    {"id":"scroll-hit-test","kind":"assertion","test":"fixtures/scroll-into-view.html","script":"scripts/scroll.js","assertions":["nested scrollIntoView exposes target","hit testing follows scrolled geometry"]},
+    {"id":"input-focus","kind":"assertion","test":"fixtures/input.html","input":true,"script":"scripts/input.js","assertions":["native pointer and text input update focused control","focus transfer follows the active element"]},
+    {"id":"canvas-pixels","kind":"assertion","test":"fixtures/canvas.html","script":"scripts/canvas.js","assertions":["Canvas fill and clear change exact backing pixels","Canvas state restore preserves the previous fill"]},
+    {"id":"flex-solid-paint","kind":"reftest","test":"fixtures/flex.html","reference":"references/two-boxes.html","probes":[[25,25,"ff0000ff"],[70,25,"0000ffff"],[110,25,"ffffffff"]]},
+    {"id":"overflow-clip-paint","kind":"reftest","test":"fixtures/clip.html","reference":"references/clipped-box.html","probes":[[25,25,"00ff00ff"],[80,25,"ffffffff"]]},
+    {"id":"canvas-solid-paint","kind":"reftest","test":"fixtures/canvas.html","reference":"references/canvas-box.html","probes":[[25,25,"ff0000ff"],[80,25,"ffffffff"]]},
+    {"id":"native-frame-contract","kind":"native","test":"fixtures/native.html","timeout":20}
+  ],
+  "controls": [
+    {"id":"control-assertion-failure","kind":"assertion","test":"fixtures/empty.html","script":"scripts/failure.js","assertions":["deliberately false assertion"]},
+    {"id":"control-visual-mismatch","kind":"reftest","test":"fixtures/flex.html","reference":"references/clipped-box.html","probes":[[25,25,"ff0000ff"]]},
+    {"id":"control-timeout","kind":"assertion","test":"fixtures/never-ready.html","script":"scripts/failure.js","assertions":["deliberately false assertion"],"timeout":1},
+    {"id":"control-script-error","kind":"assertion","test":"fixtures/empty.html","script":"scripts/error.js","assertions":["unreachable"]}
+  ]
+}

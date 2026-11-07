@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<script id=fetch_basic type=module>
+  {
+    const state = await testing.async()
+    const response = await fetch('http://127.0.0.1:9582/xhr');
+    const text = await response.text();
+
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual(true, response.ok);
+      testing.expectEqual('basic', response.type);
+      testing.expectEqual('http://127.0.0.1:9582/xhr', response.url);
+      testing.expectEqual(false, response.redirected);
+
+      // Check headers
+      const headers = response.headers;
+      testing.expectEqual('text/html; charset=utf-8', headers.get('Content-Type'));
+      testing.expectEqual('100', headers.get('content-length'));
+
+      // Check text response
+
+      testing.expectEqual(100, text.length);
+    });
+  }
+</script>
+
+<script id=fetch_json type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/xhr/json');
+    const json = await response.json();
+    state.resolve();
+
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual(true, response.ok);
+      testing.expectEqual('basic', response.type);
+      testing.expectEqual(false, response.redirected);
+
+      testing.expectEqual('9000!!!', json.over);
+      testing.expectEqual("number", typeof json.updated_at);
+      testing.expectEqual(1765867200000, json.updated_at);
+      testing.expectEqual({over: '9000!!!',updated_at:1765867200000}, json);
+    });
+  }
+</script>
+
+<script id=fetch_post type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/xhr', {
+      method: 'POST',
+      body: 'foo'
+    });
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual(true, response.ok);
+      testing.expectEqual(true, text.length > 64);
+    });
+  }
+</script>
+
+<script id=fetch_no_cors_method type=module>
+  {
+    const state = await testing.async();
+    let error;
+    try {
+      await fetch('http://127.0.0.1:9582/xhr', { mode: 'no-cors', method: 'PUT' });
+    } catch (e) {
+      error = e.toString();
+    }
+
+    // A bad init rejects the promise; fetch() itself doesn't throw.
+    const pending = fetch('http://127.0.0.1:9582/xhr', { headers: { 'bad name': 'x' } });
+    const header_error = await pending.catch((e) => e.toString());
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual("TypeError: 'PUT' is unsupported in no-cors mode", error);
+      testing.expectEqual(true, pending instanceof Promise);
+      testing.expectEqual('TypeError: Invalid header name', header_error);
+    });
+  }
+</script>
+
+<script id=fetch_redirect type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/xhr/redirect');
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual(true, response.ok);
+      testing.expectEqual('http://127.0.0.1:9582/xhr', response.url);
+      testing.expectEqual(true, response.redirected);
+
+      testing.expectEqual(100, text.length);
+    });
+  }
+</script>
+
+<script id=fetch_redirect_manual type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/xhr/redirect', { redirect: 'manual' });
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(0, response.status);
+      testing.expectEqual('opaqueredirect', response.type);
+      testing.expectEqual(false, response.redirected);
+      testing.expectEqual('', response.url);
+      testing.expectEqual('', text);
+    });
+  }
+</script>
+
+<script id=fetch_redirect_error type=module>
+  {
+    const state = await testing.async();
+    let rejected = false;
+    try {
+      await fetch('http://127.0.0.1:9582/xhr/redirect', { redirect: 'error' });
+    } catch (e) {
+      rejected = e instanceof TypeError;
+    }
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(true, rejected);
+    });
+  }
+</script>
+
+<script id=fetch_404 type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/xhr/404');
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(404, response.status);
+      testing.expectEqual(false, response.ok);
+
+      testing.expectEqual('Not Found', text);
+    });
+  }
+</script>
+
+<script id=fetch_500 type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/xhr/500');
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(500, response.status);
+      testing.expectEqual(false, response.ok);
+      testing.expectEqual('Internal Server Error', text);
+    });
+  }
+</script>
+
+<script id=fetch_request_object type=module>
+  {
+    const state = await testing.async();
+    const request = new Request('http://127.0.0.1:9582/xhr', {
+      method: 'GET'
+    });
+
+    testing.expectEqual('http://127.0.0.1:9582/xhr', request.url);
+    testing.expectEqual('GET', request.method);
+
+    const response = await fetch(request);
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual(true, response.ok);
+      testing.expectEqual(100, text.length);
+    });
+  }
+</script>
+
+<script id=fetch_request_with_headers type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/xhr', {
+      method: 'GET',
+      headers: {
+        'X-Custom-Header': 'test-value'
+      }
+    });
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual(true, response.ok);
+    });
+  }
+</script>
+
+<script id=fetch_request_with_method_variations>
+  for (const method of ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']) {
+    const request = new Request('http://127.0.0.1:9582/xhr', {
+      method: method
+    });
+    testing.expectEqual(method, request.method);
+  }
+</script>
+
+<script id=fetch_cache_credentials>
+  {
+    const request = new Request('http://127.0.0.1:9582/xhr', {
+      cache: 'no-cache',
+      credentials: 'same-origin'
+    });
+
+    testing.expectEqual('no-cache', request.cache);
+    testing.expectEqual('same-origin', request.credentials);
+  }
+</script>
+
+<script id=response_constructor type=module>
+  {
+    const response1 = new Response(null);
+    testing.expectEqual(200, response1.status);
+    testing.expectEqual(true, response1.ok);
+
+    const response2 = new Response('Hello', {
+      status: 201,
+    });
+
+    const state = await testing.async();
+    const text = await response2.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(201, response2.status);
+      testing.expectEqual(true, response2.ok);
+      testing.expectEqual('Hello', text);
+    });
+  }
+</script>
+
+<script id=response_body_stream type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/xhr');
+    state.resolve();
+
+    const buf = await response.arrayBuffer()
+
+    await state.done(() => {
+      testing.expectEqual(true, response.body !== null);
+      testing.expectEqual(true, response.body instanceof ReadableStream);
+
+
+      const uint8array = new Uint8Array(buf);
+      const decoder = new TextDecoder('utf-8');
+      testing.expectEqual('1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890', decoder.decode(uint8array));
+    })
+  };
+</script>
+
+<script id=response_empty_body type=module>
+  {
+    const state = await testing.async();
+    const response = new Response('');
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+
+      testing.expectEqual('', text);
+      // Empty body should still create a valid stream
+      testing.expectEqual(true, response.body !== null);
+    });
+  }
+</script>
+
+<script id=fetch_blob_url type=module>
+  {
+    const state = await testing.async();
+    // Create a blob and get its URL
+    const blob = new Blob(['Hello from blob!'], { type: 'text/plain' });
+    const blobUrl = URL.createObjectURL(blob);
+    const response = await fetch(blobUrl);
+    const text = await response.text();
+
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual(true, response.ok);
+      testing.expectEqual(blobUrl, response.url);
+      testing.expectEqual('text/plain', response.headers.get('Content-Type'));
+
+      testing.expectEqual('Hello from blob!', text);
+
+      // Clean up
+      URL.revokeObjectURL(blobUrl);
+    });
+  }
+</script>
+
+<script id=abort type=module>
+  {
+    const state = await testing.async();
+    const controller = new AbortController();
+    controller.abort();
+    try {
+      await fetch('http://127.0.0.1:9582/xhr', { signal: controller.signal });
+      state.resolve();
+      await state.done(() => {
+        testing.fail('fetch should have been aborted');
+      });
+    } catch (e) {
+      state.resolve();
+      await state.done(() => {
+        testing.expectEqual("AbortError", e.name);
+      });
+    }
+  }
+</script>
+
+<script id=abort_reasons type=module>
+  {
+    const state = await testing.async();
+
+    async function rejection(promise) {
+      try {
+        await promise;
+        return 'resolved';
+      } catch (e) {
+        return e;
+      }
+    }
+
+    // /xhr/hang takes 2s: the abort must not wait for it
+    const c1 = new AbortController();
+    setTimeout(() => c1.abort(), 10);
+    const start = Date.now();
+    const inflight = await rejection(fetch('http://127.0.0.1:9582/xhr/hang', { signal: c1.signal }));
+    const elapsed = Date.now() - start;
+
+    const c2 = new AbortController();
+    const custom = new Error('mine');
+    setTimeout(() => c2.abort(custom), 10);
+    const custom_reason = await rejection(fetch('http://127.0.0.1:9582/xhr/slow', { signal: c2.signal }));
+
+    const timeout = await rejection(fetch('http://127.0.0.1:9582/xhr/slow', { signal: AbortSignal.timeout(10) }));
+
+    const c3 = new AbortController();
+    setTimeout(() => c3.abort('any'), 10);
+    const any = await rejection(fetch('http://127.0.0.1:9582/xhr/slow', {
+      signal: AbortSignal.any([new AbortController().signal, c3.signal]),
+    }));
+
+    const pre_aborted = await rejection(fetch('http://127.0.0.1:9582/xhr', { signal: AbortSignal.abort(custom) }));
+
+    // aborting after the body was read is a no-op
+    const c4 = new AbortController();
+    const response = await fetch('http://127.0.0.1:9582/xhr', { signal: c4.signal });
+    const text = await response.text();
+    c4.abort();
+
+    // aborting after resolve errors an unread body, with the signal's reason
+    const c5 = new AbortController();
+    const unread = await fetch('http://127.0.0.1:9582/xhr', { signal: c5.signal });
+    const unread_clone = unread.clone();
+    c5.abort(custom);
+    const unread_text = await rejection(unread.text());
+    const unread_clone_json = await rejection(unread_clone.json());
+
+    const c6 = new AbortController();
+    const streamed = await fetch('http://127.0.0.1:9582/xhr', { signal: c6.signal });
+    c6.abort();
+    const stream_read = await rejection(streamed.body.getReader().read());
+
+    const c7 = new AbortController();
+    const streamed_custom = await fetch('http://127.0.0.1:9582/xhr', { signal: c7.signal });
+    c7.abort(custom);
+    const stream_read_custom = await rejection(streamed_custom.body.getReader().read());
+
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual('AbortError', inflight.name);
+      testing.expectTrue(elapsed < 1000, 'abort waited for the response: ' + elapsed);
+      testing.expectEqual(custom, custom_reason);
+      testing.expectEqual('TimeoutError', timeout.name);
+      testing.expectEqual('any', any);
+      testing.expectEqual(custom, pre_aborted);
+      testing.expectEqual(100, text.length);
+      testing.expectEqual(custom, unread_text);
+      testing.expectEqual(custom, unread_clone_json);
+      testing.expectEqual('AbortError', stream_read.name);
+      testing.expectEqual(custom, stream_read_custom);
+    });
+  }
+</script>
+
+<script id=fetch_in_worker type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./fetch-worker.js');
+    worker.onmessage = (e) => state.resolve(e.data);
+    worker.postMessage({ kind: 'basic' });
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker fetch error: ' + data.err);
+      testing.expectEqual(200, data.status);
+      testing.expectEqual('http://127.0.0.1:9582/xhr', data.url);
+      testing.expectEqual('basic', data.type);
+      testing.expectEqual('text/html; charset=utf-8', data.content_type);
+      testing.expectEqual(100, data.length);
+    });
+  }
+</script>
+
+<script id=fetch_post_in_worker type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./fetch-worker.js');
+    worker.onmessage = (e) => state.resolve(e.data);
+    worker.postMessage({ kind: 'post' });
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker fetch error: ' + data.err);
+      testing.expectEqual(200, data.status);
+      testing.expectEqual(true, data.length > 64);
+    });
+  }
+</script>
+
+<script id=fetch_readablestream_body type=module>
+  {
+    const state = await testing.async();
+    const payload = "name=Streamed&count=9";
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc.encode("name=Streamed&"));
+        controller.enqueue(enc.encode("count=9"));
+        controller.close();
+      },
+    });
+
+    const response = await fetch("http://127.0.0.1:9582/echo_body", {
+      method: "POST",
+      body: stream,
+      duplex: "half",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual(payload, text);
+    });
+  }
+</script>
+
+<script id=fetch_readablestream_body_reject type=module>
+  {
+    const state = await testing.async();
+    const url = "http://127.0.0.1:9582/echo_body";
+    const opts = { method: "POST", duplex: "half" };
+
+    let openRejected = false;
+    try {
+      const open = new ReadableStream({
+        start(c) { c.enqueue(new TextEncoder().encode("x")); },
+      });
+      await fetch(url, { ...opts, body: open });
+    } catch (e) {
+      openRejected = e instanceof TypeError;
+    }
+
+    let lockedRejected = false;
+    try {
+      const locked = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode("x"));
+          c.close();
+        },
+      });
+      locked.getReader();
+      await fetch(url, { ...opts, body: locked });
+    } catch (e) {
+      lockedRejected = e instanceof TypeError;
+    }
+
+    // A stream is single-use: draining it for one body must not leave it
+    // looking like a valid (empty) body for the next request.
+    const once = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("x"));
+        c.close();
+      },
+    });
+    const first = await fetch(url, { ...opts, body: once });
+    const firstText = await first.text();
+
+    let reuseRejected = false;
+    try {
+      await fetch(url, { ...opts, body: once });
+    } catch (e) {
+      reuseRejected = e instanceof TypeError;
+    }
+
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual(true, openRejected);
+      testing.expectEqual(true, lockedRejected);
+      testing.expectEqual("x", firstText);
+      testing.expectEqual(true, reuseRejected);
+    });
+  }
+</script>
+
+<script id=fetch_blob_url_in_worker type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./fetch-worker.js');
+    worker.onmessage = (e) => state.resolve(e.data);
+    worker.postMessage({ kind: 'blob' });
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker fetch error: ' + data.err);
+      testing.expectEqual(200, data.status);
+      testing.expectEqual(true, data.url_matches);
+      testing.expectEqual('text/plain', data.content_type);
+      testing.expectEqual('Hello from worker blob!', data.text);
+    });
+  }
+</script>
+
+<script id=fetch_header_layers type=module>
+  {
+    const state = await testing.async();
+    const headers = new Headers();
+    headers.set('Accept-Language', 'fr');
+    headers.append('X-Multi', 'a');
+    headers.append('X-Multi', 'b');
+    // Cookie and anything sec-* are forbidden request headers: the Request
+    // guard drops them, so our own Sec-Ch-Ua survives.
+    headers.append('Cookie', 'a=1');
+    headers.append('Cookie', 'b=2');
+    headers.set('Sec-Ch-Ua', '"Chromium";v="140"');
+    headers.set('User-Agent', 'Mozilla/5.0 (X11; Linux x86_64)');
+    const response = await fetch('http://127.0.0.1:9582/echo_headers', { headers });
+    const text = await response.text();
+    state.resolve();
+
+    await state.done(() => {
+      const got = {};
+      for (const line of text.trim().split('\n')) {
+        const sep = line.indexOf(': ');
+        got[line.slice(0, sep).toLowerCase()] = line.slice(sep + 2);
+      }
+      testing.expectEqual('fr', got['accept-language']);
+      testing.expectEqual('a, b', got['x-multi']);
+      testing.expectEqual(undefined, got['cookie']);
+      testing.expectEqual(true, got['user-agent'].includes('Lightpanda'));
+      testing.expectEqual(false, got['user-agent'].includes('Mozilla'));
+      testing.expectEqual(true, got['sec-ch-ua'].includes('Lightpanda'));
+      testing.expectEqual(false, got['sec-ch-ua'].includes('Chromium'));
+    });
+  }
+</script>
+
+<script id=fetch_redirect_authorization type=module>
+  {
+    // Authorization must not follow a cross-origin redirect. Custom headers
+    // are not stripped by the redirect itself (that is a CORS job).
+    const state = await testing.async();
+    const headers = { Authorization: 'Bearer secret', 'X-Hop': 'keep' };
+    const same = await (await fetch('/redirect_same_echo_headers', { headers })).text();
+    const cross = await (await fetch('/redirect_cross_echo_headers', { headers })).text();
+    state.resolve();
+
+    await state.done(() => {
+      const s = same.toLowerCase();
+      const c = cross.toLowerCase();
+      testing.expectEqual(true, s.includes('authorization: bearer secret'));
+      testing.expectEqual(true, s.includes('x-hop: keep'));
+      testing.expectEqual(false, c.includes('authorization'));
+      testing.expectEqual(true, c.includes('x-hop: keep'));
+    });
+  }
+</script>
+
+<script id=fetch_metadata_headers type=module>
+  {
+    // The test server is loopback, so potentially trustworthy.
+    const state = await testing.async();
+    const parse = (text) => {
+      const got = {};
+      for (const line of text.trim().split('\n')) {
+        const sep = line.indexOf(': ');
+        got[line.slice(0, sep).toLowerCase()] = line.slice(sep + 2);
+      }
+      return got;
+    };
+    const same = parse(await (await fetch('/echo_headers')).text());
+    const same_origin_mode = parse(await (await fetch('/echo_headers', { mode: 'same-origin' })).text());
+    // 127.0.0.1 -> localhost is cross-site, and the chain keeps it.
+    const cross = parse(await (await fetch('/redirect_cross_echo_headers')).text());
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual('same-origin', same['sec-fetch-site']);
+      testing.expectEqual('cors', same['sec-fetch-mode']);
+      testing.expectEqual('empty', same['sec-fetch-dest']);
+      testing.expectEqual(undefined, same['sec-fetch-user']);
+      testing.expectEqual('same-origin', same_origin_mode['sec-fetch-mode']);
+      testing.expectEqual('cross-site', cross['sec-fetch-site']);
+    });
+  }
+</script>
+
+<script id=fetch_redirect_referer type=module>
+  {
+    const state = await testing.async();
+    const same = await (await fetch('/redirect_same_echo_referer')).text();
+    const cross = await (await fetch('/redirect_cross_echo_referer')).text();
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(`<html><body>referer=${location.href}</body></html>`, same);
+      testing.expectEqual('<html><body>referer=http://127.0.0.1:9582/</body></html>', cross);
+    });
+  }
+</script>
+
+<script id=fetch_forbidden_response_header type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch('http://127.0.0.1:9582/set_cookie');
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual('yes', response.headers.get('x-visible'));
+      testing.expectEqual(null, response.headers.get('set-cookie'));
+      testing.expectEqual(0, response.headers.getSetCookie().length);
+      testing.expectEqual(false, [...response.headers.keys()].includes('set-cookie'));
+    });
+  }
+</script>
+
+<script id=fetch_null_body type=module>
+  {
+    const state = await testing.async();
+    const results = [];
+    for (const [url, method] of [
+      ['http://127.0.0.1:9582/status/204', 'GET'],
+      ['http://127.0.0.1:9582/status/205', 'POST'],
+      ['http://127.0.0.1:9582/status/304', 'GET'],
+      ['http://127.0.0.1:9582/xhr', 'HEAD'],
+    ]) {
+      const response = await fetch(url, { method });
+      results.push([response.body, response.bodyUsed, await response.text()]);
+    }
+    const ok = await fetch('http://127.0.0.1:9582/xhr');
+    state.resolve();
+
+    await state.done(() => {
+      for (const [body, bodyUsed, text] of results) {
+        testing.expectEqual(null, body);
+        testing.expectEqual(false, bodyUsed);
+        testing.expectEqual('', text);
+      }
+      testing.expectEqual(true, ok.body !== null);
+    });
+  }
+</script>
+
+<script id=fetch_bad_content_encoding type=module>
+  {
+    const state = await testing.async();
+    const url = 'http://127.0.0.1:9582/xhr/bad_gzip';
+    const response = await fetch(url);
+    const errors = [];
+    for (const method of ['arrayBuffer', 'blob', 'bytes', 'formData', 'json', 'text']) {
+      const res = await fetch(url);
+      try {
+        await res[method]();
+        errors.push(null);
+      } catch (e) {
+        errors.push([e instanceof TypeError, res.bodyUsed]);
+      }
+    }
+    let stream_error = null;
+    try {
+      await response.body.getReader().read();
+    } catch (e) {
+      stream_error = e;
+    }
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      for (const err of errors) {
+        testing.expectEqual([true, true], err);
+      }
+      testing.expectEqual(true, stream_error !== null);
+    });
+  }
+</script>

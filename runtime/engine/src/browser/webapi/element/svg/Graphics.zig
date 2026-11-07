@@ -1,0 +1,302 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("../../../js/js.zig");
+const Frame = @import("../../../Frame.zig");
+const Node = @import("../../Node.zig");
+const Element = @import("../../Element.zig");
+const Factory = @import("../../../Factory.zig");
+const DOMRect = @import("../../DOMRect.zig");
+const DOMMatrix = @import("../../DOMMatrix.zig");
+const DOMMatrixReadOnly = @import("../../DOMMatrixReadOnly.zig");
+const SvgElement = @import("../Svg.zig");
+const AnimatedTransformList = @import("../../svg/AnimatedTransformList.zig");
+const PathData = @import("../../svg/PathData.zig");
+const StringList = @import("../../svg/StringList.zig");
+
+pub const Svg = @import("Svg.zig");
+pub const G = @import("G.zig");
+pub const A = @import("A.zig");
+pub const Use = @import("Use.zig");
+pub const Image = @import("Image.zig");
+pub const Defs = @import("Defs.zig");
+pub const Symbol = @import("Symbol.zig");
+pub const Switch = @import("Switch.zig");
+pub const ForeignObject = @import("ForeignObject.zig");
+pub const TextContent = @import("TextContent.zig");
+pub const Geometry = @import("Geometry.zig");
+
+const Graphics = @This();
+
+pub const Proto = SvgElement;
+_type: Type,
+_proto_canary: if (lp.IS_DEBUG) *SvgElement else void = undefined,
+
+pub const Type = enum(u8) {
+    svg,
+    g,
+    a,
+    use,
+    image,
+    defs,
+    symbol,
+    switch_element,
+    foreign_object,
+    text_content,
+    geometry,
+};
+
+pub fn Subtype(comptime tag: Type) type {
+    return switch (tag) {
+        .svg => Svg,
+        .g => G,
+        .a => A,
+        .use => Use,
+        .image => Image,
+        .defs => Defs,
+        .symbol => Symbol,
+        .switch_element => Switch,
+        .foreign_object => ForeignObject,
+        .text_content => TextContent,
+        .geometry => Geometry,
+    };
+}
+
+pub fn subtype(self: *const Graphics, comptime T: type) *T {
+    const offset = comptime Factory.chainOffsetOf(T, T) - Factory.chainOffsetOf(T, Graphics);
+    const sub: *T = @ptrFromInt(@intFromPtr(self) + offset);
+    if (comptime lp.IS_DEBUG) {
+        // This pointer dance only works because the factory allocates the chain
+        // in a contiguous block of memory. In debug, we assert this holds via
+        // the _proto_canary back pointer.
+        std.debug.assert(Factory.protoOf(sub) == self);
+    }
+    return sub;
+}
+
+pub fn is(self: *Graphics, comptime T: type) ?*T {
+    switch (self._type) {
+        inline else => |tag| {
+            if (Subtype(tag) == T) {
+                return self.subtype(T);
+            }
+        },
+    }
+    if (self._type == .geometry) {
+        return self.subtype(Geometry).is(T);
+    }
+    if (self._type == .text_content) {
+        return self.subtype(TextContent).is(T);
+    }
+    return null;
+}
+
+pub fn asElement(self: *Graphics) *Element {
+    return Factory.protoOf(self).asElement();
+}
+pub fn asNode(self: *Graphics) *Node {
+    return self.asElement().asNode();
+}
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(Graphics);
+
+    pub const Meta = struct {
+        pub const name = "SVGGraphicsElement";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const transform = bridge.accessor(Graphics.getTransform, null, .{});
+    pub const requiredExtensions = bridge.accessor(Graphics.getRequiredExtensions, null, .{});
+    pub const systemLanguage = bridge.accessor(Graphics.getSystemLanguage, null, .{});
+    pub const getBBox = bridge.function(Graphics.getBBox, .{});
+    pub const getCTM = bridge.function(Graphics.getCTM, .{});
+    pub const getScreenCTM = bridge.function(Graphics.getScreenCTM, .{});
+};
+
+// SVGBoundingBoxOptions is not modelled: Chrome declares no parameter at all
+// and Firefox's flags degenerate to the fill geometry, so both engines answer
+// every call with the fill box.
+fn getBBox(self: *Graphics, frame: *Frame) !*DOMRect {
+    var bounds: PathData.Bounds = .{};
+    switch (self._type) {
+        .geometry => {
+            var path = try self.subtype(Geometry).buildPath(frame);
+            defer path.deinit(frame.local_arena);
+            bounds = path.bounds(.{});
+        },
+        .foreign_object => bounds = try self.subtype(ForeignObject).getBounds(frame),
+        .g, .a, .svg => try accumulateChildren(self, .{}, &bounds, frame),
+        .defs, .symbol, .switch_element, .use, .image, .text_content => {},
+    }
+    if (bounds.isEmpty()) {
+        return DOMRect.create(.{}, frame._factory);
+    }
+
+    return DOMRect.create(.{
+        .x = bounds.min_x,
+        .y = bounds.min_y,
+        .width = bounds.width(),
+        .height = bounds.height(),
+    }, frame._factory);
+}
+
+fn accumulateChildren(parent: *Graphics, matrix: PathData.Matrix, bounds: *PathData.Bounds, frame: *Frame) !void {
+    const Cursor = struct {
+        next: ?*Node,
+        matrix: PathData.Matrix,
+    };
+    var cursors: std.ArrayList(Cursor) = .empty;
+    try cursors.append(frame.local_arena, .{
+        .next = parent.asNode().firstChild(),
+        .matrix = matrix,
+    });
+
+    while (cursors.items.len != 0) {
+        const top = cursors.items.len - 1;
+        const node = cursors.items[top].next orelse {
+            _ = cursors.pop();
+            continue;
+        };
+        cursors.items[top].next = node.nextSibling();
+        const parent_matrix = cursors.items[top].matrix;
+
+        const element = node.is(Element) orelse continue;
+        if (element._namespace != .svg) continue;
+        const svg = element.as(SvgElement);
+        const graphics = svg.is(Graphics) orelse continue;
+        const child_matrix = parent_matrix.multiply(transformMatrix(element));
+
+        switch (graphics._type) {
+            .geometry => {
+                var path = try graphics.subtype(Geometry).buildPath(frame);
+                defer path.deinit(frame.local_arena);
+                bounds.merge(path.bounds(child_matrix));
+            },
+            .foreign_object => {
+                const child_bounds = try graphics.subtype(ForeignObject).getBounds(frame);
+                if (!child_bounds.isEmpty()) {
+                    var foreign_path: PathData.Path = .{};
+                    defer foreign_path.deinit(frame.local_arena);
+                    const top_left = PathData.Point{ .x = child_bounds.min_x, .y = child_bounds.min_y };
+                    const top_right = PathData.Point{ .x = child_bounds.max_x, .y = child_bounds.min_y };
+                    const bottom_right = PathData.Point{ .x = child_bounds.max_x, .y = child_bounds.max_y };
+                    const bottom_left = PathData.Point{ .x = child_bounds.min_x, .y = child_bounds.max_y };
+                    try foreign_path.appendLine(top_left, top_right, frame.local_arena);
+                    try foreign_path.appendLine(top_right, bottom_right, frame.local_arena);
+                    try foreign_path.appendLine(bottom_right, bottom_left, frame.local_arena);
+                    try foreign_path.appendLine(bottom_left, top_left, frame.local_arena);
+                    bounds.merge(foreign_path.bounds(child_matrix));
+                }
+            },
+            .g, .a => try cursors.append(frame.local_arena, .{
+                .next = graphics.asNode().firstChild(),
+                .matrix = child_matrix,
+            }),
+            // <defs> and <symbol> never render. Nested viewports, <switch>,
+            // <use>, <image> and text have geometry we cannot resolve yet, so
+            // they contribute nothing rather than making the whole box
+            // unavailable.
+            .defs, .symbol, .svg, .switch_element, .use, .image, .text_content => {},
+        }
+    }
+}
+
+/// Composes `transform` attributes from the element up to, excluding, its
+/// nearest <svg>. Null when the element isn't in a document.
+fn getCTM(self: *Graphics, frame: *Frame) !?*DOMMatrix {
+    return currentTransformMatrix(self, .viewport, frame);
+}
+
+/// Like getCTM through every enclosing <svg>, offset by where the outermost
+/// one sits on the page. Nested viewport x/y are not applied.
+fn getScreenCTM(self: *Graphics, frame: *Frame) !?*DOMMatrix {
+    return currentTransformMatrix(self, .screen, frame);
+}
+
+fn currentTransformMatrix(self: *Graphics, space: enum { viewport, screen }, frame: *Frame) !?*DOMMatrix {
+    if (!self.asNode().isConnected()) {
+        return null;
+    }
+
+    var matrix = transformMatrix(self.asElement());
+    var outermost: ?*Element = if (self._type == .svg) self.asElement() else null;
+    var node = self.asNode().parentNode();
+    while (node) |n| : (node = n.parentNode()) {
+        const element = n.is(Element) orelse break;
+        if (element._namespace != .svg) break;
+        const graphics = element.as(SvgElement).is(Graphics) orelse continue;
+        if (graphics._type == .svg) {
+            if (space == .viewport) break;
+            outermost = element;
+        }
+        matrix = transformMatrix(element).multiply(matrix);
+    }
+
+    if (space == .screen) {
+        if (outermost) |svg| {
+            const rect = svg.boundingClientRectValues(frame);
+            matrix = (PathData.Matrix{ .e = rect.x, .f = rect.y }).multiply(matrix);
+        }
+    }
+
+    return try DOMMatrix.create(.{
+        matrix.a, matrix.b, 0, 0,
+        matrix.c, matrix.d, 0, 0,
+        0,        0,        1, 0,
+        matrix.e, matrix.f, 0, 1,
+    }, true, frame.page);
+}
+
+fn transformMatrix(element: *Element) PathData.Matrix {
+    const raw = element.getAttributeSafe(comptime .wrap("transform")) orelse return .{};
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "none")) {
+        return .{};
+    }
+
+    var matrix = DOMMatrixReadOnly.identity();
+    var iterator = DOMMatrixReadOnly.TransformFunctionIterator{ .input = trimmed, .allow_comma = true };
+    while (iterator.next() catch return .{}) |function| {
+        const parsed = DOMMatrixReadOnly.parseTransformFunction(function, .svg) catch return .{};
+        matrix = DOMMatrixReadOnly.multiplyMatrix(matrix, parsed.matrix);
+    }
+    return .{
+        .a = matrix[0],
+        .b = matrix[1],
+        .c = matrix[4],
+        .d = matrix[5],
+        .e = matrix[12],
+        .f = matrix[13],
+    };
+}
+
+fn getTransform(self: *Graphics, frame: *Frame) !*AnimatedTransformList {
+    return AnimatedTransformList.getOrCreate(self.asElement(), .transform, frame);
+}
+
+fn getRequiredExtensions(self: *Graphics, frame: *Frame) !*StringList {
+    return StringList.getOrCreate(self.asElement(), .required_extensions, frame);
+}
+
+fn getSystemLanguage(self: *Graphics, frame: *Frame) !*StringList {
+    return StringList.getOrCreate(self.asElement(), .system_language, frame);
+}

@@ -1,0 +1,189 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const posix = std.posix;
+const sys_net = @import("sys/net.zig");
+const URL = @import("browser/URL.zig");
+
+const TestHTTPServer = @This();
+
+shutdown: std.atomic.Value(bool),
+listener: ?std.Io.net.Server,
+handler: Handler,
+
+const Handler = *const fn (req: *std.http.Server.Request) anyerror!void;
+
+pub fn init(handler: Handler) TestHTTPServer {
+    return .{
+        .shutdown = .init(true),
+        .listener = null,
+        .handler = handler,
+    };
+}
+
+pub fn deinit(self: *TestHTTPServer) void {
+    self.listener = null;
+}
+
+pub fn stop(self: *TestHTTPServer) void {
+    self.shutdown.store(true, .release);
+    if (self.listener) |*listener| {
+        switch (@import("builtin").target.os.tag) {
+            .linux => sys_net.shutdown(listener.socket.handle, .recv) catch {},
+            else => _ = std.c.close(listener.socket.handle),
+        }
+    }
+}
+
+pub fn run(self: *TestHTTPServer, wg: *lp.WaitGroup) !void {
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+
+    self.listener = try address.listen(lp.io, .{ .reuse_address = true });
+    var listener = &self.listener.?;
+    self.shutdown.store(false, .release);
+
+    wg.finish();
+
+    while (true) {
+        const conn = listener.accept(lp.io) catch |err| {
+            if (self.shutdown.load(.acquire) or err == error.SocketNotListening) {
+                return;
+            }
+            return err;
+        };
+        const thrd = try std.Thread.spawn(.{}, handleConnection, .{ self, conn });
+        thrd.detach();
+    }
+}
+
+fn handleConnection(self: *TestHTTPServer, conn: std.Io.net.Stream) !void {
+    defer conn.close(lp.io);
+
+    if (@hasDecl(posix.TCP, "NODELAY")) {
+        posix.setsockopt(conn.socket.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    }
+
+    var req_buf: [2048]u8 = undefined;
+    var conn_reader = conn.reader(lp.io, &req_buf);
+    var conn_writer = conn.writer(lp.io, &req_buf);
+
+    var http_server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
+
+    while (true) {
+        var req = http_server.receiveHead() catch |err| switch (err) {
+            error.ReadFailed, error.HttpConnectionClosing => return,
+            else => {
+                std.debug.print("Test HTTP Server error: {}\n", .{err});
+                return err;
+            },
+        };
+
+        self.handler(&req) catch |err| {
+            switch (err) {
+                error.BrokenPipe, error.WriteFailed => {},
+                else => {
+                    std.debug.print("test http error '{s}': {}\n", .{ req.head.target, err });
+                    req.respond("server error", .{ .status = .internal_server_error }) catch {};
+                },
+            }
+            return;
+        };
+    }
+}
+
+pub fn sendFile(req: *std.http.Server.Request, file_path: []const u8) !void {
+    var url_buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&url_buf);
+    var unescaped_file_path = try URL.unescape(fba.allocator(), file_path);
+    if (std.mem.findScalarPos(u8, unescaped_file_path, 0, '?')) |pos| {
+        unescaped_file_path = unescaped_file_path[0..pos];
+    }
+    const file = std.Io.Dir.cwd().openFile(lp.io, unescaped_file_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return req.respond("server error", .{ .status = .not_found }),
+        else => return err,
+    };
+    defer file.close(lp.io);
+
+    const stat = try file.stat(lp.io);
+    var send_buffer: [4096]u8 = undefined;
+
+    var res = try req.respondStreaming(&send_buffer, .{
+        .content_length = stat.size,
+        .respond_options = .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = getContentType(unescaped_file_path) },
+            },
+        },
+    });
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(lp.io, &read_buffer);
+    _ = try res.writer.sendFileAll(&reader, .unlimited);
+    try res.writer.flush();
+    try res.end();
+}
+
+fn getContentType(file_path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, file_path, ".js")) {
+        return "application/json";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".GB2312.html")) {
+        return "text/html; charset=GB2312";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".html")) {
+        return "text/html";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".htm")) {
+        return "text/html";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".txt")) {
+        return "text/plain";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".xhtml")) {
+        return "application/xhtml+xml";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".md")) {
+        return "text/markdown";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".xml")) {
+        // some wpt tests do this
+        return "text/xml";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".wasm")) {
+        return "application/wasm";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".mjs")) {
+        // mjs are ECMAScript modules
+        return "application/json";
+    }
+
+    std.debug.print("TestHTTPServer asked to serve an unknown file type: {s}\n", .{file_path});
+    return "text/html";
+}

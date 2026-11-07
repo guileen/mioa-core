@@ -1,0 +1,168 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const js = @import("../../js/js.zig");
+
+const WritableStreamDefaultWriter = @import("WritableStreamDefaultWriter.zig");
+const WritableStreamDefaultController = @import("WritableStreamDefaultController.zig");
+const TransformStream = @import("TransformStream.zig");
+
+const Execution = js.Execution;
+
+const WritableStream = @This();
+
+pub const State = enum {
+    writable,
+    closed,
+    errored,
+};
+
+_state: State,
+_writer: ?*WritableStreamDefaultWriter,
+_controller: *WritableStreamDefaultController,
+/// What the stream errored with, e.g. the `e` of controller.error(e).
+_stored_error: ?js.Value.Global,
+_write_fn: ?js.Function.Global,
+_close_fn: ?js.Function.Global,
+_transform_stream: ?*TransformStream,
+
+const UnderlyingSink = struct {
+    abort: ?js.Function.Global = null,
+    close: ?js.Function.Global = null,
+    start: ?js.Function = null,
+    type: ?[]const u8 = null,
+    write: ?js.Function.Global = null,
+};
+
+pub fn init(sink_: ?UnderlyingSink, exec: *const Execution) !*WritableStream {
+    const self = try exec._factory.create(WritableStream{
+        ._state = .writable,
+        ._writer = null,
+        ._controller = undefined,
+        ._stored_error = null,
+        ._write_fn = null,
+        ._close_fn = null,
+        ._transform_stream = null,
+    });
+
+    self._controller = try WritableStreamDefaultController.init(self, exec);
+
+    if (sink_) |sink| {
+        if (sink.start) |start| {
+            try start.call(void, .{self._controller});
+        }
+        self._write_fn = sink.write;
+        self._close_fn = sink.close;
+    }
+
+    return self;
+}
+
+pub fn initForTransform(transform_stream: *TransformStream, exec: *const Execution) !*WritableStream {
+    const self = try exec._factory.create(WritableStream{
+        ._state = .writable,
+        ._writer = null,
+        ._controller = undefined,
+        ._stored_error = null,
+        ._write_fn = null,
+        ._close_fn = null,
+        ._transform_stream = transform_stream,
+    });
+
+    self._controller = try WritableStreamDefaultController.init(self, exec);
+    return self;
+}
+
+fn getWriter(self: *WritableStream, exec: *const Execution) !*WritableStreamDefaultWriter {
+    if (self.getLocked()) {
+        return error.WriterLocked;
+    }
+
+    const writer = try WritableStreamDefaultWriter.init(self, exec);
+    self._writer = writer;
+    return writer;
+}
+
+pub fn getLocked(self: *const WritableStream) bool {
+    return self._writer != null;
+}
+
+pub fn writeChunk(self: *WritableStream, chunk: js.Value, exec: *const Execution) !void {
+    if (self._state != .writable) return;
+
+    if (self._transform_stream) |ts| {
+        try ts.transformWrite(chunk, exec);
+        return;
+    }
+
+    if (self._write_fn) |write_fn| {
+        var ls: js.Local.Scope = undefined;
+        exec.js.localScope(&ls);
+        defer ls.deinit();
+
+        try ls.toLocal(write_fn).call(void, .{ chunk, self._controller });
+    }
+}
+
+pub fn closeStream(self: *WritableStream, exec: *const Execution) !void {
+    if (self._state != .writable) return;
+    self._state = .closed;
+
+    if (self._transform_stream) |ts| {
+        return ts.transformClose(exec) catch |err| {
+            // The flush failed and errored the readable side. Like a failed
+            // close in the spec, this side ends up errored too. A cancelled
+            // readable has nothing stored, and this side stays closed.
+            if (err == error.StreamError) {
+                if (ts._readable._stored_error) |stored| {
+                    const local = exec.js.local.?;
+                    self._stored_error = try local.toLocal(stored).persist();
+                    self._state = .errored;
+                }
+            }
+            return err;
+        };
+    }
+
+    if (self._close_fn) |close_fn| {
+        var ls: js.Local.Scope = undefined;
+        exec.js.localScope(&ls);
+        defer ls.deinit();
+
+        try ls.toLocal(close_fn).call(void, .{self._controller});
+    }
+}
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(WritableStream);
+
+    pub const Meta = struct {
+        pub const name = "WritableStream";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const constructor = bridge.constructor(WritableStream.init, .{});
+    pub const getWriter = bridge.function(WritableStream.getWriter, .{});
+    pub const locked = bridge.accessor(WritableStream.getLocked, null, .{});
+};
+
+pub fn registerTypes() []const type {
+    return &.{
+        WritableStream,
+    };
+}

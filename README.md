@@ -1,25 +1,28 @@
-# Mioa shared core — release-candidate source tree
+# Mioa Core — Web execution and rendering
 
-Status: isolated release candidate. Not published, tagged, signed, uploaded or
-committed. This tree contains only the shared Python core and headless service.
+This repository owns the shared Web runtime: native execution, DOM/layout/paint,
+the Python control/profile APIs, and the standalone headless service. Desktop
+is an independently version-pinned consumer and graphical-system Host, not the
+owner of webpage rendering. Develop Core in its independent checkout, not in
+a consumer's vendored submodule.
 
-`mioa-core` is the shared library; `mioa-headless` is a local session service
-that owns one native runtime and speaks bounded NDJSON. Both are MIT-licensed
-(see `LICENSE` and `NOTICE`).
-
-This tree deliberately excludes the native browser runtime, fonts, desktop UI,
-product CLI, HTTP viewer, Camoufox/Playwright adapters, profiles, credentials,
-logs, caches, virtual environments and generated artifacts.
+The Python integration is MIT-licensed. Native engine, renderer, vendored
+dependencies and source fonts retain their own licenses; see `NOTICE` and
+[`runtime/README.md`](runtime/README.md). Desktop UI, product CLI, profiles,
+credentials, generated binaries, caches and local evidence are not included
+in the source release. This migration does not itself publish a new release.
 
 ## Layout
 
 ```
 mioa-core/          shared Python package (mioa_core)
 mioa-headless/      local session service (mioa_headless) + tests
-LICENSE             MIT license
-NOTICE              provenance, dependency and native-runtime attribution
-MANIFEST.sha256     SHA-256 of every tracked file except this manifest
-.gitignore          ignored build, cache, runtime and artifact paths
+runtime/            maintained native engine/renderer, source fonts and locked builder
+tests/              compact real-engine assertions, reftests and harness regressions
+LICENSE             MIT license for the integration, not native relicensing
+NOTICE              provenance and component licensing boundaries
+MANIFEST.sha256     SHA-256 source inventory; excludes itself and ignored outputs
+.gitignore          build, cache, environment and evidence exclusions
 ```
 
 ## Requirements
@@ -29,8 +32,9 @@ MANIFEST.sha256     SHA-256 of every tracked file except this manifest
   against the canonical Python Package Index (`pypi.org`).
 - macOS for real native sessions. `mioa_headless.run_service` refuses other
   platforms, and the pinned runtime is a macOS arm64 executable.
-- A separately obtained native runtime executable and font files for real
-  sessions. No engine, font or other native artifact is distributed here.
+- Native engine build requirements and explicit dependency inputs are documented
+  in [`runtime/README.md`](runtime/README.md). Maintained source and required
+  source fonts are included; executable artifacts are built, not checked in.
 
 ## Install and test
 
@@ -48,6 +52,21 @@ env -u PYTHONPATH mioa-headless/.venv/bin/python \
 source directories to `sys.path`; the other tests import the installed wheels.
 The suite covers the frame ring, icon assets, native lifecycle, guarded input,
 native transport, the service protocol, and the Agent `axtree` observation.
+
+Build and run the complete source-mode Core test system:
+
+```sh
+node runtime/build.mjs build --inputs runtime/.local/inputs.json
+mioa-headless/.venv/bin/python tests/run.py \
+  --binary runtime/.local/build/engine/zig-out/bin/lightpanda \
+  --output /tmp/mioa-core-tests
+```
+
+Create the private input configuration using `runtime/README.md`; no sibling
+checkout or executable is discovered. [`tests/README.md`](tests/README.md)
+defines assertion, exact reference-rendering and native-frame cases, filtering,
+failure diagnostics and the intentionally failing controls. The full entry
+fails if the native binary is absent; `--layer unit` is an explicit smaller run.
 
 ## Supported APIs
 
@@ -84,10 +103,11 @@ Pinned runtime configuration, schema 3.
   `native_font_families()`.
 - `NativeError` with stable `code` values.
 
-The development defaults resolve `PINS` relative to the source-tree root
-(`parents[2]`) and therefore expect a `browsers/engine-bench/...` layout. A
-standalone installation must pass an explicit binary (`--binary`, or
-`ANTI_TRACE_<RUNTIME>_BINARY`) or asset paths. The source bytes are unchanged.
+Development `PINS` resolve under this Core checkout's `runtime/.local/build/`.
+Installed consumers pass an explicit pinned binary (`--binary` or
+`ANTI_TRACE_<RUNTIME>_BINARY`) and asset paths. Existing profile artifact digests
+still require explicit migration when executable/font bytes change; source
+relocation is not permission to silently replace a running environment.
 
 ### `mioa_core.native`
 
@@ -187,23 +207,28 @@ Both projects carry `uv.lock` files resolved with uv 0.13.6 against
 `https://pypi.org/simple`. If `UV_DEFAULT_INDEX` points to a mirror, set it to
 `https://pypi.org/simple` when running `uv lock --check --project mioa-headless`
 or `uv lock --check --project mioa-core`.
-`MANIFEST.sha256` covers every tracked file except itself. No build, cache, log
-or native artifact is tracked.
+`MANIFEST.sha256` covers source inputs except itself. Native dependency pins are
+in `runtime/inputs.lock.json`; generated receipts bind compiler output to source
+and dependency identities. SDK settings and tool versions are pinned, not full
+SDK/compiler distributions. Compilation is not a bit-identical reproducibility,
+Web-conformance, Desktop, performance or release-acceptance claim.
 
 ## Licensing and attribution
 
-MIT for this tree. `NOTICE` records source provenance, the licenses of the
-declared Python dependencies, and the fact that the native runtime is not
-included and is licensed separately. The Lightpanda runtime is AGPL-3.0
-(upstream LICENSE is the GNU AGPL version 3 text); the alternate Obscura path
-declares Apache-2.0. This tree grants no rights to either program.
+The Python integration is MIT. `NOTICE` records Python provenance/dependencies;
+native and vendored sources retain component licenses. Lightpanda's
+AGPL-3.0-only / AGPL-3.0-or-later declaration discrepancy is preserved rather
+than resolved here. Obscura, font and vendored notices remain with their source.
+No root/package MIT label relicenses a native component or composite executable.
 
 ## Known limitations
 
-- No native runtime, font, desktop UI, product CLI or viewer is included or
-  distributed.
-- The headless service requires macOS for native execution and an explicitly
-  supplied pinned binary/font on first profile creation.
+- Native sources and required source fonts are included, not prebuilt browser
+  executables. Desktop UI, product CLI and viewer implementations stay outside.
+- The qualified native input/build path currently targets macOS arm64/CGL;
+  Linux/Windows and GPU-free server execution are not implied by "headless".
+- The compact test suite covers selected behavior and rendering boundaries,
+  not the full WPT corpus or browser compatibility matrix.
 - Package names and versions are not published to an index; wheel/sdist
   metadata is reproducible but unsigned.
 - The full desktop, Camoufox and trusted-script product matrices are outside

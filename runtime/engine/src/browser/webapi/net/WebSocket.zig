@@ -1,0 +1,1013 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const http = @import("../../../network/http.zig");
+
+const js = @import("../../js/js.zig");
+const Blob = @import("../Blob.zig");
+const URL = @import("../../URL.zig");
+
+const Page = @import("../../Page.zig");
+const HttpClient = @import("../../../network/HttpClient.zig");
+
+const Event = @import("../Event.zig");
+const EventTarget = @import("../EventTarget.zig");
+const CloseEvent = @import("../event/CloseEvent.zig");
+const MessageEvent = @import("../event/MessageEvent.zig");
+
+const log = lp.log;
+const Execution = js.Execution;
+
+const WebSocket = @This();
+
+pub const Proto = EventTarget;
+
+_rc: lp.RC = .{},
+_exec: *const Execution,
+_proto: *EventTarget,
+_arena: *lp.Arena,
+
+// Connection state
+_ready_state: ReadyState = .connecting,
+_url: [:0]const u8 = "",
+_binary_type: BinaryType = .blob,
+
+// Handshake tracking
+_got_101: bool = false,
+_got_upgrade: bool = false,
+
+_conn: ?*http.Connection,
+_http_client: *HttpClient,
+
+_owner_node: std.DoublyLinkedList.Node = .{},
+
+// buffered outgoing messages
+_send_queue: std.ArrayList(Message) = .empty,
+_send_offset: usize = 0,
+
+// buffered incoming frame
+_recv_buffer: std.ArrayList(u8) = .empty,
+
+// Incoming events, buffered and delivered by HttpClient's dispatcher. We never
+// run JS inside a libcurl callback. Too many things can go wrong.
+_events: std.ArrayList(RecvEvent) = .empty,
+
+// data is dupe'd by the _batch_arena and re-used after every delivery
+_batch_arena: ?*lp.Arena = null,
+_batch_bytes: usize = 0,
+
+// Linked into the client's ws_dispatch_queue while events await delivery.
+// Queue membership holds a self-reference (released by deliverEvents /
+// unlinkDispatch).
+_dispatch_node: std.DoublyLinkedList.Node = .{},
+_dispatch_queued: bool = false,
+
+// deliverEvents is running, events appended during delivery can be picked up
+// immediately without being queued.
+_delivering: bool = false,
+
+// Holds the base self-reference and the owner-list membership. Cleared
+// exactly once, by deactivate().
+_active: bool = true,
+
+// close info for event dispatch
+_close_code: u16 = 1000,
+_close_reason: []const u8 = "",
+
+// negotiated protocol
+_protocol: []const u8 = "",
+
+// Event handlers
+
+const ReadyState = enum(u8) {
+    connecting = 0,
+    open = 1,
+    closing = 2,
+    closed = 3,
+};
+
+// A buffered incoming event.
+const RecvEvent = union(enum) {
+    // handshake completed
+    open,
+
+    // a complete text/binary frame; data lives in _batch_arena
+    message: Incoming,
+
+    // code/reason stored on self
+    close_frame,
+
+    // close() before the handshake completed
+    local_close,
+
+    // the transport is gone (server closed, error, ...)
+    disconnected: ?anyerror,
+
+    const Incoming = struct {
+        data: []const u8,
+        frame_type: http.WsFrameType,
+    };
+};
+
+const BinaryType = enum {
+    blob,
+    arraybuffer,
+};
+
+// WebIDL: `optional (DOMString or sequence<DOMString>) protocols = []`
+const Protocols = union(enum) {
+    list: []const []const u8,
+    one: []const u8,
+};
+
+pub fn init(url: []const u8, protocols_: ?Protocols, exec: *const Execution) !*WebSocket {
+    var one: [1][]const u8 = undefined;
+    const protocols: []const []const u8 = if (protocols_) |p| switch (p) {
+        .list => |list| list,
+        .one => |protocol| blk: {
+            one[0] = protocol;
+            break :blk &one;
+        },
+    } else &.{};
+
+    {
+        if (std.mem.findScalar(u8, url, '#') != null) {
+            // Fragments are not allowed in WebSocket URLs.
+            return error.SyntaxError;
+        }
+        for (protocols) |protocol| {
+            if (!isValidProtocol(protocol)) {
+                return error.SyntaxError;
+            }
+        }
+    }
+
+    const arena = try exec.getArena(.medium, "WebSocket");
+    errdefer arena.release();
+
+    const resolved_url = blk: {
+        // Always UTF-8, never the document's charse
+        const resolved = URL.resolve(arena.allocator(), exec.base(), url, .{ .encoding = "UTF-8" }) catch |err| switch (err) {
+            error.TypeError => return error.SyntaxError,
+            else => return err,
+        };
+
+        const scheme = URL.getProtocol(resolved);
+        if (std.mem.eql(u8, scheme, "ws:") or std.mem.eql(u8, scheme, "wss:")) {
+            // normal case
+            break :blk resolved;
+        }
+
+        // yup, this is what we're supposed to do.
+        if (std.mem.eql(u8, scheme, "http:")) {
+            break :blk try arena.allocator().printSentinel("ws{s}", .{resolved["http".len..]}, 0);
+        }
+        if (std.mem.eql(u8, scheme, "https:")) {
+            break :blk try arena.allocator().printSentinel("wss{s}", .{resolved["https".len..]}, 0);
+        }
+
+        return error.SyntaxError;
+    };
+
+    const http_client = &exec.session.browser.http_client;
+
+    const self = try exec._factory.eventTargetWithAllocator(arena.allocator(), WebSocket{
+        ._exec = exec,
+        ._conn = null,
+        ._arena = arena,
+        ._proto = undefined,
+        ._url = resolved_url,
+        ._http_client = http_client,
+    });
+
+    // This ensures that if we fail to connect, we have at least 1 event slot
+    // to register the close+error
+    try self._events.ensureTotalCapacity(arena.allocator(), 1);
+
+    exec.httpOwner().addWS(self);
+
+    // Unlike an XHR object where we only selectively reference the instance
+    // while the request is actually inflight, WS connection is "inflight" from
+    // the moment it's created. deactivate() releases this reference.
+    self.acquireRef();
+
+    if (comptime lp.IS_DEBUG) {
+        log.info(.websocket, "connecting", .{ .url = url });
+    }
+
+    // "Establish a WebSocket connection" only ever fails the connection, it
+    // never throws: the object is returned in CONNECTING and the failure
+    // surfaces as an error event followed by close. That covers a blocked
+    // port as much as it covers running out of connections.
+    self.connect(protocols) catch |err| {
+        self.transportClosed(err);
+    };
+
+    return self;
+}
+
+fn connect(self: *WebSocket, protocols: []const []const u8) !void {
+    const exec = self._exec;
+    const arena = self._arena;
+    const resolved_url = self._url;
+    const http_client = self._http_client;
+
+    if (isBlockedPort(resolved_url)) {
+        return error.BlockedPort;
+    }
+
+    const conn = http_client.network.newConnection() orelse {
+        return error.NoFreeConnection;
+    };
+
+    errdefer http_client.network.releaseConnection(conn);
+
+    try conn.setURL(resolved_url);
+    try conn.setConnectOnly(false);
+
+    try conn.setReadCallback(sendDataCallback, true);
+    try conn.setWriteCallback(receivedDataCallback);
+    try conn.setHeaderCallback(receivedHeaderCallback);
+
+    const allocator = arena.allocator();
+    for (http_client.baselineHeaders()) |hdr| {
+        try conn.addHeader(allocator, hdr.name, hdr.value);
+    }
+    if (protocols.len > 0) {
+        try conn.addHeader(allocator, "Sec-WebSocket-Protocol", try std.mem.join(allocator, ", ", protocols));
+    }
+
+    {
+        // The upgrade is a browser-initiated HTTP request and must carry the
+        // document's origin (RFC 6455 §4.1). Origin-checking endpoints (CSRF
+        // protection on WS servers) reject upgrades that arrive without it.
+        // Non-tuple origins (about:blank, data:) serialize to "null", like
+        // Chrome sends for opaque origins.
+        const origin = (try URL.getOrigin(allocator, exec.url.*)) orelse "null";
+        try conn.addHeader(allocator, "Origin", origin);
+    }
+
+    {
+        var buf: std.Io.Writer.Allocating = .init(allocator);
+        try exec.session.cookie_jar.forRequest(resolved_url, &buf.writer, .{
+            .is_http = true,
+            .kind = .subresource,
+            .origin_url = exec.siteForCookies(),
+        });
+        if (buf.written().len > 0) {
+            try buf.writer.writeByte(0);
+            const written = buf.written();
+            try conn.setCookies(written.ptr[0 .. written.len - 1 :0]);
+        }
+    }
+
+    try conn.commitHeaders();
+
+    conn.transport = .{ .websocket = self };
+    try http_client.trackConn(conn);
+
+    self._conn = conn;
+}
+
+fn isBlockedPort(url: [:0]const u8) bool {
+    const port = URL.getPort(url);
+    if (port.len == 0) {
+        // the default port for ws/wss is never blocked
+        return false;
+    }
+    return http.isBadPort(std.fmt.parseInt(u16, port, 10) catch return false);
+}
+
+pub fn deinit(self: *WebSocket, page: *Page) void {
+    self.releaseTransport();
+
+    for (self._send_queue.items) |msg| {
+        msg.deinit(page);
+    }
+
+    if (self._batch_arena) |arena| {
+        arena.release();
+    }
+
+    page.removeTarget(self.asEventTarget());
+    self._arena.release();
+}
+
+pub fn releaseRef(self: *WebSocket, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *WebSocket) void {
+    self._rc.acquire();
+}
+
+pub fn asEventTarget(self: *WebSocket) *EventTarget {
+    return self._proto;
+}
+
+// we're being aborted internally (e.g. frame shutting down). Must not run
+// user JS: buffered events are dropped, not delivered.
+pub fn kill(self: *WebSocket) void {
+    self.unlinkDispatch();
+    self.clearEvents();
+    self.deactivate();
+}
+
+// The pump saw this connection complete (server closed, error, or the tail
+// of our close handshake). Release the transport now — the conn goes back
+// to the network layer immediately — and buffer the JS-facing close/error
+// events for the dispatcher.
+pub fn transportClosed(self: *WebSocket, err: ?anyerror) void {
+    self.releaseTransport();
+    self.bufferEvent(.{ .disconnected = err }) catch |err2| {
+        log.debug(.websocket, "close failure", .{ .err = err2 });
+        // Can't buffer. Drop the socket without running JS.
+        self.kill();
+    };
+}
+
+// Deliver buffered events. Called only by the client's dispatchCompleted at
+// a tick(.all) safe point — the only place WebSocket runs user JS. A
+// callback can close() us, kill us (navigation -> owner teardown), or make
+// us buffer more events (nested pump via a syncRequest); the index loop and
+// the _active check keep all of that safe.
+pub fn deliverEvents(self: *WebSocket) void {
+    // The dispatch queue's reference. Runs last (LIFO defers): keeps self
+    // alive even when a terminal event releases the base reference.
+    defer self.releaseRef(self._exec.page);
+
+    const page_scope = self._exec.page.logScope();
+    defer page_scope.exit();
+
+    self._delivering = true;
+    defer self._delivering = false;
+
+    var i: usize = 0;
+    while (i < self._events.items.len) : (i += 1) {
+        if (!self._active) {
+            // a terminal event or a re-entrant kill got us; drop the rest
+            break;
+        }
+        switch (self._events.items[i]) {
+            .open => {
+                self._ready_state = .open;
+                self.dispatchOpenEvent() catch |err| {
+                    log.debug(.websocket, "open event fail", .{ .err = err });
+                };
+            },
+            .message => |msg| {
+                // a close() mid-batch flips us to .closing; no message
+                // events after that
+                if (self._ready_state == .open) {
+                    self.dispatchMessageEvent(msg.data, msg.frame_type) catch |err| {
+                        log.debug(.websocket, "message event dispatch failed", .{ .err = err });
+                    };
+                }
+            },
+            .close_frame => self.handleCloseFrame(),
+            .local_close => {
+                self.dispatchCloseEvent(self._close_code, self._close_reason, false) catch |err| {
+                    log.debug(.websocket, "close event dispatch failed", .{ .err = err });
+                };
+                self.deactivate();
+            },
+            .disconnected => |err| self.disconnected(err),
+        }
+    }
+
+    self.clearEvents();
+}
+
+// The server's close frame, at delivery time.
+fn handleCloseFrame(self: *WebSocket) void {
+    if (self._ready_state == .closing) {
+        // We initiated the close; the server's close frame completes the
+        // handshake.
+        self.disconnected(null);
+        return;
+    }
+    // Server-initiated: send the reciprocal close frame per RFC 6455
+    // §5.5.1. The connection ends when the transport drains
+    // (.disconnected follows).
+    self._ready_state = .closing;
+    self.queueMessage(.close) catch |err| {
+        log.debug(.websocket, "reciprocal close", .{ .err = err, .url = self._url });
+    };
+}
+
+fn disconnected(self: *WebSocket, err_: ?anyerror) void {
+    const was_clean = self._ready_state == .closing and err_ == null;
+    self._ready_state = .closed;
+
+    if (err_) |err| {
+        log.debug(.websocket, "disconnected", .{ .err = err, .url = self._url });
+    } else {
+        log.info(.websocket, "disconnected", .{ .url = self._url, .reason = "closed" });
+    }
+
+    defer self.deactivate();
+
+    // Use 1006 (abnormal closure) if connection wasn't cleanly closed
+    const code = if (was_clean) self._close_code else 1006;
+    const reason = if (was_clean) self._close_reason else "";
+
+    // Spec requires error event before close on abnormal closure.
+    if (!was_clean) {
+        self.dispatchErrorEvent() catch |err| {
+            log.debug(.websocket, "error event dispatch failed", .{ .err = err });
+        };
+    }
+
+    self.dispatchCloseEvent(code, reason, was_clean) catch |err| {
+        log.debug(.websocket, "close event dispatch failed", .{ .err = err });
+    };
+}
+
+// Release the base self-reference and unlink from the owner. Idempotent.
+fn deactivate(self: *WebSocket) void {
+    if (!self._active) {
+        return;
+    }
+    self._active = false;
+    self.releaseTransport();
+    self._exec.httpOwner().removeWS(self);
+    self.releaseRef(self._exec.page);
+}
+
+// Unlink the connection from the http client. Queued outgoing messages are
+// kept: their arenas are released in deinit, and bufferedAmount keeps
+// reporting them, as the spec wants.
+fn releaseTransport(self: *WebSocket) void {
+    const conn = self._conn orelse return;
+    self._conn = null;
+    self._http_client.removeConn(conn);
+}
+
+// Pump-side: record an event for delivery. Errors propagate to libcurl's
+// callback return value — never tear down from here, the pump may still be
+// inside curl.
+fn bufferEvent(self: *WebSocket, event: RecvEvent) !void {
+    try self._events.append(self._arena.allocator(), event);
+    self.enqueueDispatch();
+}
+
+fn bufferMessage(self: *WebSocket, message: []const u8, frame_type: http.WsFrameType) !void {
+    // Cap the undelivered batch, not the stream: a blocking window can hold
+    // delivery across many frames, and these copies are what occupy memory.
+    const total_len = self._batch_bytes + message.len;
+    if (total_len > self._http_client.max_response_size) {
+        return error.MessageTooLarge;
+    }
+    const arena = self._batch_arena orelse blk: {
+        const arena = try self._exec.getArena(message.len, "WebSocket.recv");
+        self._batch_arena = arena;
+        break :blk arena;
+    };
+    self._batch_bytes = total_len;
+    try self.bufferEvent(.{ .message = .{
+        .data = try arena.dupe(u8, message),
+        .frame_type = frame_type,
+    } });
+}
+
+fn enqueueDispatch(self: *WebSocket) void {
+    if (self._dispatch_queued or self._delivering) {
+        // already queued, or deliverEvents' own loop will consume it
+        return;
+    }
+    self._dispatch_queued = true;
+    // the queue holds a reference until deliverEvents / unlinkDispatch
+    self.acquireRef();
+    self._http_client.wsEnqueue(&self._dispatch_node);
+}
+
+fn unlinkDispatch(self: *WebSocket) void {
+    if (!self._dispatch_queued) {
+        return;
+    }
+    self._dispatch_queued = false;
+    self._http_client.wsDequeue(&self._dispatch_node);
+    self.releaseRef(self._exec.page);
+}
+
+fn clearEvents(self: *WebSocket) void {
+    self._events.clearRetainingCapacity();
+    self._batch_bytes = 0;
+    if (self._batch_arena) |arena| {
+        self._batch_arena = null;
+        arena.release();
+    }
+}
+
+fn queueMessage(self: *WebSocket, msg: Message) !void {
+    const was_empty = self._send_queue.items.len == 0;
+    try self._send_queue.append(self._arena.allocator(), msg);
+
+    if (was_empty) {
+        // Unpause the send callback so libcurl will request data
+        if (self._conn) |conn| {
+            conn.pause(.{ .cont = true }) catch |err| {
+                // our caller is doing `errdefer errdefer arena.release();` which
+                // will free msg. So we have to pop it out.
+                _ = self._send_queue.pop();
+                return err;
+            };
+        }
+    }
+}
+
+fn isValidProtocol(protocol: []const u8) bool {
+    if (protocol.len == 0) return false;
+    for (protocol) |c| {
+        // Control characters and non-ASCII
+        if (c <= 31 or c >= 127) return false;
+        // Separators per RFC 2616
+        switch (c) {
+            '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}', ' ', '\t' => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// WebSocket send() accepts string, Blob, ArrayBuffer, or TypedArray
+const SendData = union(enum) {
+    blob: *Blob,
+    js_val: js.Value,
+};
+
+pub fn send(self: *WebSocket, data: SendData) !void {
+    if (self._ready_state != .open) {
+        return error.InvalidStateError;
+    }
+
+    switch (data) {
+        .blob => |blob| {
+            const arena = try self._exec.getArena(blob._slice.len, "WebSocket.message");
+            errdefer arena.release();
+            try self.queueMessage(.{ .binary = .{
+                .arena = arena,
+                .data = try arena.dupe(u8, blob._slice),
+            } });
+        },
+        .js_val => |js_val| {
+            if (js_val.isArrayBuffer() == false and js_val.isArrayBufferView() == false) {
+                // Anything that isn't a buffer is sent as its string, as in Chrome
+                const str = try js_val.toString();
+                const arena = try self._exec.getArena(str.len(), "WebSocket.message");
+                errdefer arena.release();
+                try self.queueMessage(.{ .text = .{
+                    .arena = arena,
+                    .data = try str.toSliceWithAlloc(arena.allocator()),
+                } });
+            } else {
+                const buffer = (try js_val.toZig(js.BufferSource)).bytes;
+
+                const arena = try self._exec.getArena(buffer.len, "WebSocket.message");
+                errdefer arena.release();
+                try self.queueMessage(.{ .binary = .{
+                    .arena = arena,
+                    .data = try arena.dupe(u8, buffer),
+                } });
+            }
+        },
+    }
+}
+
+pub fn close(self: *WebSocket, code_: ?u16, reason_: ?[]const u8) !void {
+    if (self._ready_state == .closing or self._ready_state == .closed) {
+        return;
+    }
+
+    // Validate close code per spec: must be 1000 or in range 3000-4999
+    if (code_) |code| {
+        if (code != 1000 and (code < 3000 or code > 4999)) {
+            return error.InvalidAccessError;
+        }
+    }
+
+    const code = code_ orelse 1000;
+    const reason = reason_ orelse "";
+
+    if (self._ready_state == .connecting) {
+        // Connection not yet established - fail it. The close event is
+        // buffered like everything else; anything already received but
+        // undelivered (open, messages) is dropped.
+        self._ready_state = .closed;
+        self._close_code = code;
+        self._close_reason = try self._arena.dupe(u8, reason);
+        self.releaseTransport();
+        self.clearEvents();
+        self.bufferEvent(.local_close) catch {
+            self.unlinkDispatch();
+            self.deactivate();
+        };
+        return;
+    }
+
+    self._ready_state = .closing;
+    self._close_code = code;
+    self._close_reason = try self._arena.dupe(u8, reason);
+    try self.queueMessage(.close);
+}
+
+pub fn getUrl(self: *const WebSocket) []const u8 {
+    return self._url;
+}
+
+fn getReadyState(self: *const WebSocket) u16 {
+    return @backingInt(self._ready_state);
+}
+
+fn getBufferedAmount(self: *const WebSocket) u32 {
+    var buffered: u32 = 0;
+    for (self._send_queue.items) |msg| {
+        switch (msg) {
+            .text, .binary => |byte_msg| buffered += @intCast(byte_msg.data.len),
+            .close => buffered += @intCast(2 + self._close_reason.len),
+        }
+    }
+    return buffered;
+}
+
+fn getBinaryType(self: *const WebSocket) []const u8 {
+    return @tagName(self._binary_type);
+}
+
+pub fn getProtocol(self: *const WebSocket) []const u8 {
+    return self._protocol;
+}
+
+fn setBinaryType(self: *WebSocket, value: []const u8) void {
+    if (std.meta.stringToEnum(BinaryType, value)) |bt| {
+        self._binary_type = bt;
+    }
+}
+
+fn dispatchOpenEvent(self: *WebSocket) !void {
+    const exec = self._exec;
+    const target = self.asEventTarget();
+
+    if (exec.hasDirectListeners(target, "open")) {
+        const event = try Event.initTrusted(comptime .wrap("open"), .{}, exec.page);
+        try exec.dispatch(target, event, .{ .context = "WebSocket open" });
+    }
+}
+
+fn dispatchMessageEvent(self: *WebSocket, data: []const u8, frame_type: http.WsFrameType) !void {
+    const exec = self._exec;
+    const target = self.asEventTarget();
+
+    if (exec.hasDirectListeners(target, "message")) {
+        const msg_data: MessageEvent.Data = if (frame_type == .binary)
+            switch (self._binary_type) {
+                .arraybuffer => .{ .arraybuffer = .{ .values = data } },
+                .blob => blk: {
+                    const blob = try Blob.initFromBytes(data, "", exec);
+                    blob.acquireRef();
+                    break :blk .{ .blob = blob };
+                },
+            }
+        else
+            .{ .string = data };
+
+        const event = try MessageEvent.initTrusted(comptime .wrap("message"), .{
+            .data = msg_data,
+            .origin = "",
+        }, exec.page);
+        try exec.dispatch(target, event.asEvent(), .{ .context = "WebSocket message" });
+    }
+}
+
+fn dispatchErrorEvent(self: *WebSocket) !void {
+    const exec = self._exec;
+    const target = self.asEventTarget();
+
+    if (exec.hasDirectListeners(target, "error")) {
+        const event = try Event.initTrusted(comptime .wrap("error"), .{}, exec.page);
+        try exec.dispatch(target, event, .{ .context = "WebSocket error" });
+    }
+}
+
+fn dispatchCloseEvent(self: *WebSocket, code: u16, reason: []const u8, was_clean: bool) !void {
+    const exec = self._exec;
+    const target = self.asEventTarget();
+
+    if (exec.hasDirectListeners(target, "close")) {
+        const event = try CloseEvent.initTrusted(comptime .wrap("close"), .{
+            .code = code,
+            .reason = reason,
+            .wasClean = was_clean,
+        }, exec.page);
+        try exec.dispatch(target, event.asEvent(), .{ .context = "WebSocket close" });
+    }
+}
+
+fn sendDataCallback(buffer: [*]u8, buf_count: usize, buf_len: usize, data: *anyopaque) callconv(.c) usize {
+    if (comptime lp.IS_DEBUG) {
+        std.debug.assert(buf_count == 1);
+    }
+    const conn: *http.Connection = @ptrCast(@alignCast(data));
+    return _sendDataCallback(conn, buffer[0..buf_len]) catch |err| {
+        log.debug(.websocket, "send callback", .{ .err = err });
+        return http.readfunc_pause;
+    };
+}
+
+fn _sendDataCallback(conn: *http.Connection, buf: []u8) !usize {
+    lp.assert(buf.len > 0, "WS short buffer", .{ .len = buf.len });
+
+    const self = conn.transport.websocket;
+
+    if (self._send_queue.items.len == 0) {
+        // No data to send - pause until queueMessage is called
+        return http.readfunc_pause;
+    }
+
+    const msg = &self._send_queue.items[0];
+
+    switch (msg.*) {
+        .close => {
+            const code = self._close_code;
+            const reason = self._close_reason;
+
+            // Close frame: 2 bytes for code (big-endian) + optional reason
+            // (max 123 bytes per spec)
+            const reason_len: usize = @min(reason.len, 123);
+            var close_payload: [125]u8 = undefined;
+            close_payload[0] = @intCast((code >> 8) & 0xFF);
+            close_payload[1] = @intCast(code & 0xFF);
+            if (reason_len > 0) {
+                @memcpy(close_payload[2..][0..reason_len], reason[0..reason_len]);
+            }
+            const payload = close_payload[0 .. 2 + reason_len];
+
+            if (self._send_offset == 0) {
+                try conn.wsStartFrame(.close, payload.len);
+            }
+
+            const remaining = payload[self._send_offset..];
+            const to_copy = @min(remaining.len, buf.len);
+            @memcpy(buf[0..to_copy], remaining[0..to_copy]);
+
+            self._send_offset += to_copy;
+            if (self._send_offset == payload.len) {
+                _ = self._send_queue.orderedRemove(0);
+                self._send_offset = 0;
+            }
+            return to_copy;
+        },
+        .text => |content| return self.writeContent(conn, buf, content, .text),
+        .binary => |content| return self.writeContent(conn, buf, content, .binary),
+    }
+}
+
+fn writeContent(self: *WebSocket, conn: *http.Connection, buf: []u8, byte_msg: Message.Content, frame_type: http.WsFrameType) !usize {
+    if (self._send_offset == 0) {
+        // start of the message
+        if (comptime lp.IS_DEBUG) {
+            log.debug(.websocket, "send start", .{ .url = self._url, .len = byte_msg.data.len });
+        }
+        try conn.wsStartFrame(frame_type, byte_msg.data.len);
+    }
+
+    const remaining = byte_msg.data[self._send_offset..];
+    const to_copy = @min(remaining.len, buf.len);
+    @memcpy(buf[0..to_copy], remaining[0..to_copy]);
+
+    self._send_offset += to_copy;
+
+    if (self._send_offset >= byte_msg.data.len) {
+        const removed = self._send_queue.orderedRemove(0);
+        removed.deinit(self._exec.page);
+        if (comptime lp.IS_DEBUG) {
+            log.debug(.websocket, "send complete", .{ .url = self._url, .len = byte_msg.data.len, .queue = self._send_queue.items.len });
+        }
+        self._send_offset = 0;
+    }
+
+    return to_copy;
+}
+
+fn receivedDataCallback(buffer: [*]const u8, buf_count: usize, buf_len: usize, data: *anyopaque) callconv(.c) usize {
+    if (comptime lp.IS_DEBUG) {
+        std.debug.assert(buf_count == 1);
+    }
+    const conn: *http.Connection = @ptrCast(@alignCast(data));
+    _receivedDataCallback(conn, buffer[0..buf_len]) catch |err| {
+        log.debug(.websocket, "receive callback", .{ .err = err });
+        // TODO: are there errors, like an invalid frame, that we shouldn't treat
+        // as an error?
+        return http.writefunc_error;
+    };
+
+    return buf_len;
+}
+
+fn _receivedDataCallback(conn: *http.Connection, data: []const u8) !void {
+    const self = conn.transport.websocket;
+    const meta = conn.wsMeta() orelse {
+        log.err(.websocket, "missing meta", .{ .url = self._url });
+        return error.NoFrameMeta;
+    };
+
+    if (meta.offset == 0) {
+        if (comptime lp.IS_DEBUG) {
+            log.debug(.websocket, "incoming message", .{ .url = self._url, .len = meta.len, .bytes_left = meta.bytes_left, .type = meta.frame_type });
+        }
+        // Start of new frame. Pre-allocate buffer
+        self._recv_buffer.clearRetainingCapacity();
+        if (meta.len > self._http_client.max_response_size) {
+            return error.MessageTooLarge;
+        }
+        try self._recv_buffer.ensureTotalCapacityPrecise(self._arena.allocator(), meta.len);
+    }
+
+    try self._recv_buffer.appendSlice(self._arena.allocator(), data);
+
+    if (meta.bytes_left > 0) {
+        // still more data waiting for this frame
+        return;
+    }
+
+    const message = self._recv_buffer.items;
+    switch (meta.frame_type) {
+        .text, .binary => try self.bufferMessage(message, meta.frame_type),
+        .close => {
+            // Parse close frame: 2-byte code (big-endian) + optional reason
+            const received_code = if (message.len >= 2)
+                @as(u16, message[0]) << 8 | message[1]
+            else
+                1005; // No status code received
+
+            if (self._ready_state != .closing) {
+                // Server-initiated: stash for the close event. (When we
+                // initiated, _close_code/_close_reason hold what close()
+                // sent, and handleCloseFrame completes the handshake.)
+                self._close_code = received_code;
+                if (message.len > 2) {
+                    self._close_reason = try self._arena.dupe(u8, message[2..]);
+                }
+            }
+            try self.bufferEvent(.close_frame);
+        },
+        .ping, .pong, .cont => {},
+    }
+}
+
+// libcurl has no mechanism to signal that the connection is established. The
+// best option I could come up with was looking for an upgrade header response.
+fn receivedHeaderCallback(buffer: [*]const u8, header_count: usize, buf_len: usize, data: *anyopaque) callconv(.c) usize {
+    if (comptime lp.IS_DEBUG) {
+        std.debug.assert(header_count == 1);
+    }
+    const conn: *http.Connection = @ptrCast(@alignCast(data));
+    const self = conn.transport.websocket;
+    const header = buffer[0..buf_len];
+
+    if (self._got_101 == false and std.mem.startsWith(u8, header, "HTTP/")) {
+        if (std.mem.find(u8, header, " 101 ")) |_| {
+            self._got_101 = true;
+        }
+        return buf_len;
+    }
+
+    // Empty line = end of headers
+    if (buf_len <= 2) {
+        if (!self._got_101 or !self._got_upgrade) {
+            return 0;
+        }
+
+        log.info(.websocket, "connected", .{ .url = self._url });
+
+        // readyState flips to .open and onopen fires at delivery
+        self.bufferEvent(.open) catch return 0;
+        return buf_len;
+    }
+
+    const colon = std.mem.findScalarPos(u8, header, 0, ':') orelse {
+        // weird, continue...
+        return buf_len;
+    };
+
+    const header_name = header[0..colon];
+    const value = std.mem.trim(u8, header[colon + 1 ..], " \t\r\n");
+
+    if (std.ascii.eqlIgnoreCase(header_name, "upgrade")) {
+        if (std.ascii.eqlIgnoreCase(value, "websocket")) {
+            self._got_upgrade = true;
+        }
+    } else if (std.ascii.eqlIgnoreCase(header_name, "sec-websocket-protocol")) {
+        // TODO, we should validate this against our sent list.
+        self._protocol = self._arena.dupe(u8, value) catch |err| {
+            log.err(.websocket, "dupe protocol", .{ .err = err });
+            return 0;
+        };
+    }
+
+    return buf_len;
+}
+
+const Message = union(enum) {
+    close,
+    text: Content,
+    binary: Content,
+
+    const Content = struct {
+        arena: *lp.Arena,
+        data: []const u8,
+    };
+    fn deinit(self: Message, _: *Page) void {
+        switch (self) {
+            .text, .binary => |msg| msg.arena.release(),
+            .close => {},
+        }
+    }
+};
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(WebSocket);
+
+    pub const Meta = struct {
+        pub const name = "WebSocket";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const constructor = bridge.constructor(WebSocket.init, .{});
+
+    pub const CONNECTING = bridge.property(@backingInt(ReadyState.connecting), .{ .template = true });
+    pub const OPEN = bridge.property(@backingInt(ReadyState.open), .{ .template = true });
+    pub const CLOSING = bridge.property(@backingInt(ReadyState.closing), .{ .template = true });
+    pub const CLOSED = bridge.property(@backingInt(ReadyState.closed), .{ .template = true });
+
+    pub const url = bridge.accessor(WebSocket.getUrl, null, .{});
+    pub const readyState = bridge.accessor(WebSocket.getReadyState, null, .{});
+    pub const bufferedAmount = bridge.accessor(WebSocket.getBufferedAmount, null, .{});
+    pub const binaryType = bridge.accessor(WebSocket.getBinaryType, WebSocket.setBinaryType, .{});
+
+    pub const protocol = bridge.accessor(WebSocket.getProtocol, null, .{});
+    pub const extensions = bridge.property("", .{ .template = false });
+
+    pub const onopen = EventTarget.handlerAccessor(WebSocket, "open");
+    pub const onmessage = EventTarget.handlerAccessor(WebSocket, "message");
+    pub const onerror = EventTarget.handlerAccessor(WebSocket, "error");
+    pub const onclose = EventTarget.handlerAccessor(WebSocket, "close");
+
+    pub const send = bridge.function(WebSocket.send, .{});
+    pub const close = bridge.function(WebSocket.close, .{});
+};
+
+const testing = @import("../../../testing.zig");
+test "WebApi: WebSocket" {
+    try testing.htmlRunner("net/websocket.html", .{});
+}
+
+test "WebApi: WebSocket in worker" {
+    try testing.htmlRunner("net/websocket_worker.html", .{});
+}
+
+// Production crash (release overflow on unrelated pooled objects): send()
+// released the message arena on a failed unpause while the message stayed in
+// _send_queue, which released it again later — a pooled-arena double release.
+test "WebApi: WebSocket send owns its message arena once when the unpause fails" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const ws = try WebSocket.init("ws://127.0.0.1:9582/ws", null, &frame.js.execution);
+    try testing.expect(ws._conn != null);
+
+    // connect() tracked the easy handle but no tick has performed it, so
+    // libcurl has no connection behind it and curl_easy_pause fails: the
+    // same state as a send() on a socket the peer already closed, before
+    // the close has been dispatched.
+    ws._ready_state = .open;
+
+    const message = try ls.local.exec("'hello'", null);
+    try testing.expectError(error.BadFunctionArgument, ws.send(.{ .js_val = message }));
+
+    // The queued message owns the arena. A failed send must not leave it
+    // queued with its arena already released.
+    try testing.expectEqual(0, ws._send_queue.items.len);
+}

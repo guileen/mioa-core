@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AX Tree Fixture</title>
+    <style>
+      .display-none { display: none; }
+      .visibility-hidden { visibility: hidden; }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>Visible</h1>
+
+        <div id="d-none" class="display-none">
+            <p id="p-under-display-none">under-display-none</p>
+        </div>
+
+        <div id="v-hidden" class="visibility-hidden">
+            <p id="p-under-visibility">under-visibility-hidden</p>
+            <div><a href="#x" id="visible-in-hidden" style="visibility: visible">visible-in-hidden</a></div>
+        </div>
+
+        <div id="has-hidden-attr" hidden>
+            <p id="p-under-hidden-attr">under-hidden-attr</p>
+        </div>
+
+        <div id="has-aria-hidden" aria-hidden="true">
+            <p id="p-under-aria-hidden">under-aria-hidden</p>
+        </div>
+
+        <div hidden style="display: block">
+            <p id="hidden-overridden">hidden-overridden</p>
+        </div>
+
+        <label for="inert-check" id="inert-check-label">Inert option</label>
+        <div inert>
+            <button id="under-inert">under-inert</button>
+            <input type="checkbox" id="inert-check">
+        </div>
+
+        <div id="inert-host" inert></div>
+        <script>
+            document.getElementById("inert-host").attachShadow({ mode: "open" }).innerHTML =
+                '<button id="in-inert-shadow">in-inert-shadow</button>';
+        </script>
+
+        <p id="visible-para">visible-para</p>
+
+        <label for="search-input">Search</label>
+        <input type="search" id="search-input">
+
+        <label id="wrap-label">
+            Wrap
+            <input type="text" id="wrapped-input">
+        </label>
+
+        <!-- CSS-hidden checkbox with visible styled label (toggle switch pattern) -->
+        <input type="checkbox" id="toggle-switch" class="display-none" checked>
+        <label for="toggle-switch" id="toggle-label">Enable feature</label>
+
+        <!-- CSS-hidden radio group with visible labels -->
+        <input type="radio" name="opt" id="opt-a" class="display-none" checked>
+        <label for="opt-a" id="opt-a-label">Option A</label>
+        <input type="radio" name="opt" id="opt-b" class="visibility-hidden">
+        <label for="opt-b" id="opt-b-label">Option B</label>
+
+        <!-- Wrapping label with CSS-hidden checkbox inside -->
+        <label id="wrap-toggle">
+            Accept terms
+            <input type="checkbox" class="display-none">
+        </label>
+    </main>
+</body>
+</html>

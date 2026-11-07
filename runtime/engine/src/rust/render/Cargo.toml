@@ -1,0 +1,26 @@
+[package]
+name = "lightpanda-render"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[lib]
+name = "lightpanda_render"
+path = "lib.rs"
+
+[dependencies]
+parley = { version = "0.11.1", default-features = false, features = ["std"] }
+fontique = { version = "0.11.1", default-features = false, features = ["std"] }
+skrifa = "0.44"
+tiny-skia = "0.12"
+png = "0.18"
+# Only to select `logging`: without it icu_provider prints missing-data notes
+# (e.g. no CJK line-break model) to stderr in debug builds.
+icu_provider = { version = "2", default-features = false, features = ["logging"] }
+obscura-render = { path = "../../../../renderer/crates/obscura-render", features = ["paint"] }
+obscura-dom = { path = "../../../../renderer/crates/obscura-dom" }
+html5ever = "0.39"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
+sha2 = "0.10"

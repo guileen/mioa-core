@@ -1,0 +1,7 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Canvas red square matches a CSS square</title>
+<link rel="match" href="../references/canvas-box.html">
+<style>html,body{margin:0;background:#fff}canvas{position:absolute;left:20px;top:20px;width:40px;height:40px}</style>
+<canvas id="canvas" width="40" height="40"></canvas>
+<script>const context=document.getElementById('canvas').getContext('2d');context.fillStyle='#ff0000';context.fillRect(0,0,40,40);window.caseReady=true;</script>

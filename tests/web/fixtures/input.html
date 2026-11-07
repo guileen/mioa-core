@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native input and focus semantics</title>
+<style>html,body{margin:0;background:#fff}input{position:absolute;box-sizing:border-box;left:20px;top:20px;width:120px;height:30px}#second{top:70px}</style>
+<input id="field"><input id="second">
+<script>
+window.inputEvents=0; window.lastFocus='';
+document.getElementById('field').addEventListener('input', () => window.inputEvents++);
+document.getElementById('second').addEventListener('focus', () => window.lastFocus='second');
+window.caseReady=true;
+</script>

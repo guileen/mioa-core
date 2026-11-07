@@ -22,9 +22,9 @@ GENERATOR_VERSION = "native-3.3"
 ADAPTER_VERSION = "native-cdp-1"
 ROOT = Path(__file__).resolve().parents[2]
 PINS = {
-    "obscura": ("7c751c5cd8833ac951d48320218c4fe91aa97ac8", "browsers/engine-bench/.local/obscura-cost/target/release/obscura"),
-    "lightpanda": ("c5f7bb29b127040c899d4e181b5709f76fc71a6f", "browsers/engine-bench/.local/lightpanda-cost/source/zig-out/bin/lightpanda"),
-    "mioa": ("c5f7bb29b127040c899d4e181b5709f76fc71a6f", "browsers/engine-bench/.local/lightpanda-cost/source/zig-out/bin/lightpanda"),
+    "obscura": ("7c751c5cd8833ac951d48320218c4fe91aa97ac8", "runtime/.local/build/renderer/target/release/obscura"),
+    "lightpanda": ("c5f7bb29b127040c899d4e181b5709f76fc71a6f", "runtime/.local/build/engine/zig-out/bin/lightpanda"),
+    "mioa": ("c5f7bb29b127040c899d4e181b5709f76fc71a6f", "runtime/.local/build/engine/zig-out/bin/lightpanda"),
 }
 _FILE_SHA_CACHE: dict[tuple[Any, ...], str] = {}
 _FONT_FAMILY_CACHE: dict[str, tuple[str, ...]] = {}
@@ -130,7 +130,7 @@ def resolve_binary(runtime: str, binary: str | Path | None = None) -> Path:
     configured = binary or os.environ.get(f"ANTI_TRACE_{runtime.upper()}_BINARY")
     path = Path(configured).expanduser() if configured else ROOT / PINS[runtime][1]
     path = path.resolve()
-    _require(path.is_file() and os.access(path, os.X_OK), f"native executable missing or not executable: {path}; build pinned candidate or set --native-binary", "capability_unavailable")
+    _require(path.is_file() and os.access(path, os.X_OK), f"native executable missing or not executable: {path}; build the Core runtime with runtime/build.mjs or set --native-binary", "capability_unavailable")
     return path
 
 

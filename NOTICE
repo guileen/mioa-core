@@ -1,10 +1,10 @@
-Mioa shared core and headless service
-=====================================
+Mioa Web runtime, shared core and headless service
+================================================
 
 Copyright (c) 2026 anti-trace contributors
 
-This distribution is licensed under the MIT License. See LICENSE in this
-directory for the full permission and warranty notice.
+The Python core/headless integration is licensed under the MIT License; see
+LICENSE. Native sources under runtime/ retain their component licenses.
 
 Provenance
 ----------
@@ -25,7 +25,7 @@ MANIFEST.sha256.
 Third-party Python dependencies
 -------------------------------
 
-No third-party source is vendored. The declared runtime dependencies are
+No third-party Python source is vendored. The declared Python dependencies are
 resolved by the package locks and remain under their own licenses:
 
   psutil 7.2.2                 BSD-3-Clause
@@ -38,21 +38,25 @@ resolved by the package locks and remain under their own licenses:
 Installing this project does not relicense those packages. Their notices are
 shipped with the packages installed from the Python Package Index.
 
-Native runtime (not included)
------------------------------
+Native engine, renderer and font sources
+---------------------------------------
 
-This tree contains no browser engine, renderer binary, font or other native
-runtime artifact. mioa_core can launch a separately obtained native runtime
-only at a caller-supplied path; that program is not part of this distribution
-and is licensed separately by its authors.
+runtime/ owns the maintained native Web engine, renderer, bridge, vendored
+source dependencies, build recipe and required font inputs. Compiled native
+executables, build caches and local build receipts are not source releases.
+See runtime/README.md and the component LICENSE/NOTICE files for provenance
+and build requirements.
 
-The development engine pinned by the source is Lightpanda Browser
-(https://github.com/lightpanda-io/browser). Its LICENSE file is the GNU Affero
-General Public License version 3 (AGPL-3.0) text. The alternate engine path
-named in the source, Obscura, declares Apache-2.0. Neither program is
-redistributed here,
-and nothing in this notice grants rights to them. Operators who obtain or run
-those programs are responsible for complying with their licenses.
+Lightpanda Browser (https://github.com/lightpanda-io/browser) carries the GNU
+Affero General Public License version 3 text. Its LICENSING.md declares
+AGPL-3.0-only while some source/package declarations say AGPL-3.0-or-later;
+both are preserved, not resolved or relicensed by this migration.
+The Obscura renderer and vendored dependencies retain their own notices.
+Bundled Liberation 1.07.4 fonts retain the original GPLv2 plus font-exception
+notice, not a substituted modern Liberation OFL license. DejaVu and Noto
+fonts retain their respective notices. Neither the root MIT license nor
+Python package metadata relicenses native components or a linked executable.
+Source migration is not a legal clearance for a composite binary release.
 
 Test fixture
 ------------

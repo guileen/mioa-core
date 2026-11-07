@@ -1,0 +1,294 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const js = @import("../../js/js.zig");
+const Sqlite = @import("../../../storage/sqlite/Sqlite.zig");
+const Persistence = @import("Persistence.zig");
+
+const Allocator = std.mem.Allocator;
+
+pub fn registerTypes() []const type {
+    return &.{Lookup};
+}
+
+pub const Cookie = @import("Cookie.zig");
+
+pub const Shed = struct {
+    _origins: std.StringHashMapUnmanaged(*Bucket) = .empty,
+    path: ?[]const u8 = null,
+
+    pub fn deinit(self: *Shed, allocator: Allocator) void {
+        var it = self._origins.iterator();
+        while (it.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            kv.value_ptr.*.deinit();
+            allocator.destroy(kv.value_ptr.*);
+        }
+        self._origins.deinit(allocator);
+    }
+
+    pub fn getOrPut(self: *Shed, allocator: Allocator, origin: []const u8) !*Bucket {
+        const gop = try self._origins.getOrPut(allocator, origin);
+        if (gop.found_existing) return gop.value_ptr.*;
+        errdefer std.debug.assert(self._origins.remove(origin));
+
+        const bucket = try allocator.create(Bucket);
+        errdefer allocator.destroy(bucket);
+        bucket.* = .init(allocator);
+        errdefer bucket.deinit();
+        if (self.path) |dir| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(origin, &digest, .{});
+            const path = try allocator.printSentinel("{s}/local-{s}.sqlite", .{ dir, std.fmt.bytesToHex(digest, .lower) }, 0);
+            defer allocator.free(path);
+            const opened = try Persistence.open(path);
+            const conn = opened.conn;
+            errdefer conn.close();
+            if (opened.existing) {
+                try Persistence.validateSchema(conn, .local);
+            } else {
+                try conn.exec("create table entries (key text primary key, value text not null)", .{});
+            }
+            var rows = try conn.rows("select key, value from entries", .{});
+            defer rows.deinit();
+            while (try rows.next()) |row| {
+                try bucket.local.setItem(row.get([]const u8, 0), row.get([]const u8, 1));
+            }
+            bucket.local._conn = conn;
+        }
+
+        gop.key_ptr.* = try allocator.dupe(u8, origin);
+        gop.value_ptr.* = bucket;
+        return bucket;
+    }
+};
+
+pub const Bucket = struct {
+    local: Lookup,
+
+    pub fn init(allocator: Allocator) Bucket {
+        return .{
+            .local = .{ ._allocator = allocator },
+        };
+    }
+
+    pub fn deinit(self: *Bucket) void {
+        self.local.deinit();
+    }
+};
+
+// One live top-level browsing context's sessionStorage, separated by origin.
+// Unlike Shed, this namespace has no persistence path or SQLite connection.
+// Session owns it across replacement Pages until the tab is closed.
+pub const SessionNamespace = struct {
+    _origins: std.StringHashMapUnmanaged(*Lookup) = .empty,
+
+    pub fn deinit(self: *SessionNamespace, allocator: Allocator) void {
+        var it = self._origins.iterator();
+        while (it.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            kv.value_ptr.*.deinit();
+            allocator.destroy(kv.value_ptr.*);
+        }
+        self._origins.deinit(allocator);
+    }
+
+    pub fn getOrPut(self: *SessionNamespace, allocator: Allocator, origin: []const u8) !*Lookup {
+        const gop = try self._origins.getOrPut(allocator, origin);
+        if (gop.found_existing) return gop.value_ptr.*;
+        errdefer std.debug.assert(self._origins.remove(origin));
+
+        const lookup = try allocator.create(Lookup);
+        errdefer allocator.destroy(lookup);
+        lookup.* = .{ ._allocator = allocator };
+        gop.key_ptr.* = try allocator.dupe(u8, origin);
+        gop.value_ptr.* = lookup;
+        return lookup;
+    }
+};
+
+pub const Lookup = struct {
+    _data: std.StringHashMapUnmanaged([]const u8) = .empty,
+    _size: usize = 0,
+    _allocator: Allocator,
+    _conn: ?Sqlite.Conn = null,
+
+    const max_size = 5 * 1024 * 1024;
+
+    pub fn deinit(self: *Lookup) void {
+        if (self._conn) |conn| conn.close();
+        var it = self._data.iterator();
+        while (it.next()) |entry| {
+            self._allocator.free(entry.key_ptr.*);
+            self._allocator.free(entry.value_ptr.*);
+        }
+        self._data.deinit(self._allocator);
+        self._size = 0;
+    }
+
+    pub fn getItem(self: *const Lookup, k: []const u8) ?[]const u8 {
+        return self._data.get(k);
+    }
+
+    pub fn setItem(self: *Lookup, k: []const u8, value: []const u8) !void {
+        const old_len = if (self._data.get(k)) |old| old.len else 0;
+        std.debug.assert(old_len <= self._size);
+        if (self._size - old_len + value.len > max_size) {
+            return error.QuotaExceeded;
+        }
+
+        if (self._data.getPtr(k)) |value_ptr| {
+            const value_owned = try self._allocator.dupe(u8, value);
+            errdefer self._allocator.free(value_owned);
+            if (self._conn) |conn| try conn.exec("insert into entries(key,value) values (?1,?2) on conflict(key) do update set value=excluded.value", .{ k, value });
+            self._size -= value_ptr.*.len;
+            self._allocator.free(value_ptr.*);
+            value_ptr.* = value_owned;
+            self._size += value.len;
+        } else {
+            const key_owned = try self._allocator.dupe(u8, k);
+            errdefer self._allocator.free(key_owned);
+            const value_owned = try self._allocator.dupe(u8, value);
+            errdefer self._allocator.free(value_owned);
+
+            try self._data.ensureUnusedCapacity(self._allocator, 1);
+            if (self._conn) |conn| try conn.exec("insert into entries(key,value) values (?1,?2) on conflict(key) do update set value=excluded.value", .{ k, value });
+            self._data.putAssumeCapacity(key_owned, value_owned);
+            self._size += value.len;
+        }
+    }
+
+    pub fn removeItem(self: *Lookup, k: []const u8) !void {
+        if (self._conn) |conn| try conn.exec("delete from entries where key=?1", .{k});
+        const kv = self._data.fetchRemove(k) orelse return;
+        self._size -= kv.value.len;
+        self._allocator.free(kv.key);
+        self._allocator.free(kv.value);
+    }
+
+    pub fn clear(self: *Lookup) !void {
+        if (self._conn) |conn| try conn.exec("delete from entries", .{});
+        var it = self._data.iterator();
+        while (it.next()) |entry| {
+            self._allocator.free(entry.key_ptr.*);
+            self._allocator.free(entry.value_ptr.*);
+        }
+        self._data.clearRetainingCapacity();
+        self._size = 0;
+    }
+
+    pub fn key(self: *const Lookup, index: u32) ?[]const u8 {
+        var it = self._data.keyIterator();
+        var i: u32 = 0;
+        while (it.next()) |k| {
+            if (i == index) {
+                return k.*;
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    pub fn getLength(self: *const Lookup) u32 {
+        return @intCast(self._data.count());
+    }
+
+    fn hasItem(self: *const Lookup, k: []const u8) bool {
+        return self._data.contains(k);
+    }
+
+    pub fn keys(self: *const Lookup, exec: *const js.Execution) !js.Array {
+        const local = exec.js.local.?;
+        var arr = local.newArray(self.getLength());
+        var it = self._data.keyIterator();
+        var i: u32 = 0;
+        while (it.next()) |k| : (i += 1) {
+            _ = try arr.set(i, k.*, .{});
+        }
+        return arr;
+    }
+
+    pub const JsApi = struct {
+        pub const bridge = js.Bridge(Lookup);
+
+        pub const Meta = struct {
+            pub const name = "Storage";
+            pub var class_id: bridge.ClassId = undefined;
+        };
+
+        pub const length = bridge.accessor(Lookup.getLength, null, .{});
+        pub const getItem = bridge.function(Lookup.getItem, .{});
+        pub const setItem = bridge.function(Lookup.setItem, .{});
+        pub const removeItem = bridge.function(Lookup.removeItem, .{});
+        pub const clear = bridge.function(Lookup.clear, .{});
+        pub const key = bridge.function(Lookup.key, .{});
+        pub const @"[str]" = bridge.namedIndexed(Lookup.getItem, Lookup.setItem, Lookup.removeItem, Lookup.keys, Lookup.hasItem, .{ .null_as_undefined = true });
+        pub const @"[int]" = bridge.indexedReadWrite(_getByIndex, _setByIndex, _removeByIndex, _indexHas, null, .{ .null_as_undefined = true });
+
+        // v8 routes storage[9] to the indexed interceptor, so we need to do the
+        // int -> string conversion
+        fn _getByIndex(self: *const Lookup, idx: u32) ?[]const u8 {
+            var buf: [10]u8 = undefined;
+            return self._data.get(std.mem.print(&buf, "{d}", .{idx}) catch unreachable);
+        }
+
+        fn _setByIndex(self: *Lookup, idx: u32, value: []const u8) !void {
+            var buf: [10]u8 = undefined;
+            return self.setItem(std.mem.print(&buf, "{d}", .{idx}) catch unreachable, value);
+        }
+
+        fn _removeByIndex(self: *Lookup, idx: u32) !void {
+            var buf: [10]u8 = undefined;
+            try self.removeItem(std.mem.print(&buf, "{d}", .{idx}) catch unreachable);
+        }
+
+        fn _indexHas(self: *const Lookup, idx: u32) bool {
+            var buf: [10]u8 = undefined;
+            return self._data.contains(std.mem.print(&buf, "{d}", .{idx}) catch unreachable);
+        }
+    };
+};
+
+const testing = @import("../../../testing.zig");
+test "WebApi: Storage" {
+    try testing.htmlRunner("storage.html", .{});
+}
+
+test "local storage commits live mutations and restores isolated origins" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    var shed = Shed{ .path = path };
+    defer shed.deinit(testing.allocator);
+    const a = try shed.getOrPut(testing.allocator, "https://a.example");
+    try a.local.setItem("key", "value");
+    try testing.expectEqual(@as(i64, 2), (try a.local._conn.?.scalar(i64, "pragma synchronous", .{})).?);
+    var restored = Shed{ .path = path };
+    defer restored.deinit(testing.allocator);
+    const a_again = try restored.getOrPut(testing.allocator, "https://a.example");
+    const b = try restored.getOrPut(testing.allocator, "https://b.example");
+    try testing.expectString("value", a_again.local.getItem("key").?);
+    try testing.expectEqual(null, b.local.getItem("key"));
+    try a.local.removeItem("key");
+    try testing.expectEqual(@as(i64, 0), (try a_again.local._conn.?.scalar(i64, "select count(*) from entries", .{})).?);
+    try a.local.setItem("other", "value");
+    try a.local.clear();
+    try testing.expectEqual(@as(i64, 0), (try a_again.local._conn.?.scalar(i64, "select count(*) from entries", .{})).?);
+}

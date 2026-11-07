@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<div id="test1">Test Element</div>
+<div id="test2">Another Element</div>
+
+<script id="clientDimensions">
+{
+  const test1 = $('#test1');
+
+  // clientWidth/Height - default is 5px in dummy layout
+  testing.expectEqual('number', typeof test1.clientWidth);
+  testing.expectEqual('number', typeof test1.clientHeight);
+  testing.expectTrue(test1.clientWidth >= 0);
+  testing.expectTrue(test1.clientHeight >= 0);
+
+  // clientTop/Left should be 0 (no borders in dummy layout)
+  testing.expectEqual(0, test1.clientTop);
+  testing.expectEqual(0, test1.clientLeft);
+}
+</script>
+
+<script id="scrollDimensions">
+{
+  const test1 = $('#test1');
+
+  // Both scroll dimensions are approximated from the content, so neither falls
+  // below the element's own box but either may exceed it.
+  testing.expectTrue(test1.scrollWidth >= test1.clientWidth);
+  testing.expectTrue(test1.scrollHeight >= test1.clientHeight);
+
+  // test1 holds only a text node, and text is not measured on either axis, so
+  // both still match the element's own box.
+  testing.expectEqual(test1.clientWidth, test1.scrollWidth);
+  testing.expectEqual(test1.clientHeight, test1.scrollHeight);
+}
+</script>
+
+<script id="scrollWidthFromContent">
+{
+  // An empty element has no content to overflow its box.
+  const empty = document.createElement('div');
+  document.body.appendChild(empty);
+  testing.expectEqual(empty.clientWidth, empty.scrollWidth);
+
+  // A block in normal flow is as wide as its container however little it
+  // holds; inline children share one line, so a few of them don't overflow.
+  const block = document.createElement('div');
+  document.body.appendChild(block);
+  block.appendChild(document.createElement('span'));
+  testing.expectEqual(document.body.clientWidth, block.clientWidth);
+  testing.expectEqual(block.clientWidth, block.scrollWidth);
+
+  // A shrink-to-fit box follows its content: each added child strictly
+  // increases scrollWidth, and clientWidth tracks the same sum.
+  const box = document.createElement('div');
+  box.style.display = 'inline-block';
+  document.body.appendChild(box);
+  box.appendChild(document.createElement('span'));
+  const oneChild = box.scrollWidth;
+  testing.expectTrue(oneChild >= box.clientWidth);
+
+  box.appendChild(document.createElement('span'));
+  testing.expectTrue(box.scrollWidth > oneChild);
+  testing.expectEqual(box.scrollWidth, box.clientWidth);
+
+  // Text contributes nothing, however long. Estimating a run from its length
+  // would need a per-character advance that tracks font-size, and would report
+  // overflow for practically every element containing text.
+  const short = document.createElement('div');
+  const long = document.createElement('div');
+  short.textContent = 'ab';
+  long.textContent = 'abcdefghijklmnop';
+  document.body.appendChild(short);
+  document.body.appendChild(long);
+  testing.expectEqual(short.clientWidth, short.scrollWidth);
+  testing.expectEqual(long.clientWidth, long.scrollWidth);
+  testing.expectEqual(short.scrollWidth, long.scrollWidth);
+
+  // Comments are not rendered, so they contribute nothing.
+  const commented = document.createElement('div');
+  commented.innerHTML = '<!-- a very long comment that renders as nothing -->';
+  document.body.appendChild(commented);
+  testing.expectEqual(commented.clientWidth, commented.scrollWidth);
+
+  // A display:none child takes up no space.
+  const withHidden = document.createElement('div');
+  const hiddenChild = document.createElement('span');
+  hiddenChild.style.display = 'none';
+  withHidden.appendChild(hiddenChild);
+  document.body.appendChild(withHidden);
+  testing.expectEqual(withHidden.clientWidth, withHidden.scrollWidth);
+
+  // A hidden element reports 0, matching clientWidth/offsetWidth.
+  const hidden = document.createElement('div');
+  hidden.style.display = 'none';
+  hidden.appendChild(document.createElement('span'));
+  document.body.appendChild(hidden);
+  testing.expectEqual(0, hidden.scrollWidth);
+
+  // A visible width:0 box (an off-screen measurement container) is not
+  // hidden: its content still overflows it.
+  const zeroWidth = document.createElement('div');
+  zeroWidth.style.width = '0';
+  zeroWidth.appendChild(document.createElement('span'));
+  document.body.appendChild(zeroWidth);
+  testing.expectEqual(0, zeroWidth.clientWidth);
+  testing.expectTrue(zeroWidth.scrollWidth > 0);
+
+  // The root containers keep their synthetic size rather than summing
+  // children, so horizontal page-overflow checks stay stable. In standards
+  // mode the root element's clientWidth is the viewport (CSSOM View), not
+  // its box; offsetWidth and scrollWidth still report the box.
+  testing.expectEqual(document.body.clientWidth, document.body.scrollWidth);
+  testing.expectEqual(window.innerWidth, document.documentElement.clientWidth);
+  testing.expectEqual(
+    document.documentElement.offsetWidth,
+    document.documentElement.scrollWidth,
+  );
+}
+</script>
+
+<script id="scrollWidthMarqueeLoop">
+{
+  // Regression: the infinite-marquee idiom duplicates content until it is
+  // twice the width of its container. scrollWidth has to respond to the
+  // insertion or the loop never terminates. The lane is a non-wrapping strip,
+  // as on the sites: a block lane would wrap its items and never outgrow the
+  // track in a real browser either.
+  const track = document.createElement('div');
+  const lane = document.createElement('div');
+  lane.style.cssText = 'display: inline-block; white-space: nowrap';
+  lane.innerHTML = '<span>item</span>';
+  track.appendChild(lane);
+  document.body.appendChild(track);
+
+  // Doubling the markup doubles the measured content width.
+  const before = lane.scrollWidth;
+  lane.innerHTML += lane.innerHTML;
+  testing.expectEqual(before * 2, lane.scrollWidth);
+
+  let guard = 0;
+  while (lane.scrollWidth < track.offsetWidth * 2 && guard < 50) {
+    lane.innerHTML += lane.innerHTML;
+    guard++;
+  }
+  testing.expectTrue(guard < 50);
+}
+</script>
+
+<script id="clientWidthMarqueeLoop">
+{
+  // The clientWidth variant of the marquee idiom (amivoice.com): clone items
+  // into a shrink-to-fit wrap until it is twice the width of its container.
+  // clientWidth of the wrap has to respond to the insertion, while the
+  // container — whose direct child is the wrap, not the items — must not
+  // grow in lockstep or the loop still never terminates. The container is
+  // narrow so the guard stays small: an item without text measures 5px.
+  const container = document.createElement('div');
+  container.style.width = '100px';
+  const wrap = document.createElement('div');
+  wrap.style.display = 'inline-block';
+  const item = document.createElement('span');
+  wrap.appendChild(item);
+  container.appendChild(wrap);
+  document.body.appendChild(container);
+
+  const containerBefore = container.clientWidth;
+  let guard = 0;
+  while (wrap.clientWidth < container.clientWidth * 2 && guard < 50) {
+    wrap.appendChild(item.cloneNode(true));
+    guard++;
+  }
+  testing.expectTrue(guard < 50);
+  testing.expectEqual(containerBefore, container.clientWidth);
+
+  // An explicit inline size pins the box regardless of content.
+  const pinned = document.createElement('div');
+  pinned.style.width = '40px';
+  pinned.appendChild(document.createElement('span'));
+  pinned.appendChild(document.createElement('span'));
+  pinned.appendChild(document.createElement('span'));
+  document.body.appendChild(pinned);
+  testing.expectEqual(40, pinned.clientWidth);
+}
+</script>
+
+<script id="recycleTickerLoop">
+{
+  // The recycle variant of the marquee idiom (lseo.com): slide the track with
+  // translateX and, whenever the last card has left the shell on one side,
+  // move it to the other end of the track and offset the translation by its
+  // width so the remaining cards stay put. The loop is bounded only because
+  // the translation is honored: ignore it and each rotation pushes the cards
+  // further out of the shell.
+  const shell = document.createElement('div');
+  const track = document.createElement('div');
+  for (let i = 0; i < 4; i++) {
+    track.appendChild(document.createElement('div'));
+  }
+  shell.appendChild(track);
+  document.body.appendChild(shell);
+
+  const sRect = shell.getBoundingClientRect();
+  const recycle = (x, reverse) => {
+    let guard = 0;
+    while (guard < 50) {
+      const el = reverse ? track.lastElementChild : track.firstElementChild;
+      const r = el.getBoundingClientRect();
+      if (reverse ? r.left < sRect.right : r.right > sRect.left) break;
+      const w = el.offsetWidth;
+      if (reverse) {
+        track.insertBefore(el, track.firstElementChild);
+        x -= w;
+      } else {
+        track.appendChild(el);
+        x += w;
+      }
+      track.style.transform = `translateX(${x}px)`;
+      guard++;
+    }
+    return guard;
+  };
+
+  // Right-to-left: the track has slid 60px; every card is out on the right.
+  track.style.transform = 'translateX(60px)';
+  testing.expectTrue(recycle(60, true) < 50);
+  testing.expectTrue(track.firstElementChild.getBoundingClientRect().left < sRect.right);
+
+  // Left-to-right, from the same shifted state.
+  track.style.transform = 'translateX(-60px)';
+  testing.expectTrue(recycle(-60, false) < 50);
+  testing.expectTrue(track.lastElementChild.getBoundingClientRect().right > sRect.left);
+}
+</script>
+
+<script id="translateX">
+{
+  const shell = document.createElement('div');
+  const track = document.createElement('div');
+  const card = document.createElement('div');
+  track.appendChild(card);
+  shell.appendChild(track);
+  document.body.appendChild(shell);
+
+  // A row starts at its parent's left edge.
+  const base = shell.getBoundingClientRect().x;
+  testing.expectEqual(base, card.getBoundingClientRect().x);
+  testing.expectEqual(base, card.offsetLeft);
+
+  // The X translation of the element and of its ancestors moves it.
+  track.style.transform = 'translateX(-12.5px)';
+  testing.expectEqual(base - 12.5, card.getBoundingClientRect().x);
+  testing.expectEqual(base - 12.5, card.offsetLeft);
+  card.style.transform = 'translate3d(2px, 100px, 0) rotate(45deg) matrix(1, 0, 0, 1, 3, 9)';
+  testing.expectEqual(base - 7.5, card.getBoundingClientRect().x);
+  testing.expectEqual(base - 7.5, card.offsetLeft);
+
+  // Percentages and other units are not resolved.
+  track.style.transform = 'translateX(-100%)';
+  testing.expectEqual(base + 5, card.getBoundingClientRect().x);
+}
+</script>
+
+<script id="computedWidthMarqueeLoop">
+{
+  // The getComputedStyle variant of the marquee idiom (inchurch.com.br's
+  // dynamic-marquee-widget via jQuery .width()): the computed value must
+  // carry the same content fallback as clientWidth or the loop never
+  // terminates.
+  const container = document.createElement('div');
+  container.style.width = '100px';
+  const wrap = document.createElement('div');
+  wrap.style.display = 'inline-block';
+  const item = document.createElement('span');
+  wrap.appendChild(item);
+  container.appendChild(wrap);
+  document.body.appendChild(container);
+
+  const width = (el) => parseFloat(getComputedStyle(el).width);
+  const containerWidth = width(container);
+  let guard = 0;
+  while (width(wrap) < containerWidth * 2 && guard < 50) {
+    wrap.appendChild(item.cloneNode(true));
+    guard++;
+  }
+  testing.expectTrue(guard < 50);
+
+  // An explicit inline size still wins over the content sum.
+  const pinned = document.createElement('div');
+  pinned.style.width = '40px';
+  pinned.appendChild(document.createElement('span'));
+  pinned.appendChild(document.createElement('span'));
+  document.body.appendChild(pinned);
+  testing.expectEqual('40px', getComputedStyle(pinned).width);
+}
+</script>
+
+<style>
+  .flex-row { display: flex; }
+</style>
+
+<script id="flexContainerMarqueeLoop">
+{
+  // A marquee clones its item into a block-level flex container until there
+  // are ceil(container / item) + 2 of them, re-reading both widths after each
+  // clone. The container must not grow with its items. It is narrow so the
+  // guard stays small: an item without a declared width measures 5px.
+  const width = (el) => el.getBoundingClientRect().width;
+  const container = document.createElement('div');
+  container.className = 'flex-row';
+  container.style.width = '100px';
+  const item = document.createElement('div');
+  item.textContent = 'item';
+  container.appendChild(item);
+  document.body.appendChild(container);
+
+  let clones = 0;
+  for (let i = 0; i < Math.ceil(width(container) / width(item)) + 2 && clones < 50; i++) {
+    container.appendChild(item.cloneNode(true));
+    clones++;
+  }
+  testing.expectTrue(clones < 50);
+  testing.expectTrue(container.scrollWidth > container.clientWidth);
+}
+</script>
+
+<script id="widthFlowsDown">
+{
+  // A block in normal flow is as wide as its containing block, whatever it
+  // holds; the width flows down from the root rather than up from the
+  // children. A carousel shell holding a flex track of fixed slides reports
+  // the page width, so slides-per-page is never 0 (and pages never Infinity).
+  const section = document.createElement('div');
+  const shell = document.createElement('div');
+  shell.style.overflow = 'hidden';
+  const track = document.createElement('div');
+  track.className = 'flex-row';
+  for (let i = 0; i < 24; i++) {
+    const slide = document.createElement('div');
+    slide.style.cssText = 'width: 300px; flex-shrink: 0';
+    track.appendChild(slide);
+  }
+  shell.appendChild(track);
+  section.appendChild(shell);
+  document.body.appendChild(section);
+
+  testing.expectEqual(document.body.offsetWidth, shell.offsetWidth);
+  testing.expectEqual(document.body.offsetWidth, track.offsetWidth);
+  testing.expectEqual(7200, track.scrollWidth);
+  // The track doesn't clip, so its overflow is the shell's scrollable area
+  testing.expectEqual(7200, shell.scrollWidth);
+  track.style.overflowX = 'auto';
+  testing.expectEqual(shell.offsetWidth, shell.scrollWidth);
+
+  const perPage = Math.floor(shell.offsetWidth / 320);
+  testing.expectTrue(perPage >= 1);
+  testing.expectEqual(Math.ceil(24 / perPage), 4);
+
+  // Percentages and intermediate auto blocks resolve against the ancestor
+  section.style.width = '700px';
+  testing.expectEqual(700, shell.offsetWidth);
+  shell.style.width = '50%';
+  testing.expectEqual(350, shell.offsetWidth);
+  testing.expectEqual(350, track.offsetWidth);
+  section.remove();
+}
+</script>
+
+<script id="shrinkToFitBoxes">
+{
+  // Inline-level, floated, absolutely positioned, intrinsically sized and
+  // replaced boxes follow their content instead of filling the container.
+  const section = document.createElement('div');
+  section.style.width = '700px';
+  document.body.appendChild(section);
+  for (const css of ['display: inline-block', 'display: inline-flex', 'display: inline-grid', 'display: table', 'position: absolute', 'position: fixed', 'float: left', 'width: max-content', 'width: min-content', 'width: fit-content']) {
+    const box = document.createElement('div');
+    box.style.cssText = css;
+    const child = document.createElement('div');
+    child.style.width = '40px';
+    box.appendChild(child);
+    section.appendChild(box);
+    testing.expectEqual(40, box.offsetWidth, css);
+    box.remove();
+  }
+  // Custom elements are inline by default; a declared display: block fills
+  const custom = document.createElement('my-widget');
+  section.appendChild(custom);
+  testing.expectEqual(5, custom.offsetWidth);
+  custom.style.display = 'block';
+  testing.expectEqual(700, custom.offsetWidth);
+  section.remove();
+}
+</script>
+
+<script id="flexAndGridItemWidths">
+{
+  // Row-flex items shrink to their content unless they grow, in which case
+  // they share the row's free space (#3921: a flex:1 pane beside a 40px menu
+  // in an 800px row is 760px, not 5). Column-flex and grid items stretch.
+  const row = document.createElement('div');
+  row.style.cssText = 'display: flex; width: 800px';
+  const menu = document.createElement('div');
+  menu.style.cssText = 'width: 40px; flex-shrink: 0';
+  const pane = document.createElement('div');
+  pane.style.cssText = 'flex: 1; min-width: 0';
+  row.append(menu, pane);
+  document.body.appendChild(row);
+  testing.expectEqual(760, pane.offsetWidth);
+  testing.expectEqual(760, pane.getBoundingClientRect().width);
+
+  const second = document.createElement('div');
+  second.style.flexGrow = '1';
+  row.appendChild(second);
+  testing.expectEqual(380, pane.offsetWidth);
+  testing.expectEqual(380, second.offsetWidth);
+
+  const fixedItem = document.createElement('div');
+  fixedItem.appendChild(document.createElement('span'));
+  row.appendChild(fixedItem);
+  testing.expectEqual(5, fixedItem.offsetWidth);
+  row.remove();
+
+  const column = document.createElement('div');
+  column.style.cssText = 'display: flex; flex-direction: column; width: 600px';
+  const item = document.createElement('div');
+  column.appendChild(item);
+  document.body.appendChild(column);
+  testing.expectEqual(600, item.offsetWidth);
+  column.style.flexFlow = 'column wrap';
+  testing.expectEqual(600, item.offsetWidth);
+  column.remove();
+
+  const grid = document.createElement('div');
+  grid.style.cssText = 'display: grid; width: 600px';
+  const cell = document.createElement('div');
+  grid.appendChild(cell);
+  document.body.appendChild(grid);
+  testing.expectEqual(600, cell.offsetWidth);
+  grid.remove();
+}
+</script>
+
+<script id="displayContentsIsTransparent">
+{
+  // display: contents generates no box: it reports no size, and its children
+  // resolve against the nearest ancestor that does.
+  const section = document.createElement('div');
+  section.style.width = '700px';
+  const contents = document.createElement('div');
+  contents.style.display = 'contents';
+  const child = document.createElement('div');
+  contents.appendChild(child);
+  section.appendChild(contents);
+  document.body.appendChild(section);
+  testing.expectEqual(0, contents.offsetWidth);
+  testing.expectEqual(700, child.offsetWidth);
+  section.remove();
+}
+</script>
+
+<script id="growShareAfterPercentSiblings">
+{
+  // A percentage sibling takes its share of the row before the growers
+  // split what's left, and its percentage limits count too.
+  const row = document.createElement('div');
+  row.style.cssText = 'display: flex; width: 800px';
+  const sidebar = document.createElement('div');
+  sidebar.style.cssText = 'width: 25%; flex-shrink: 0';
+  const pane = document.createElement('div');
+  pane.style.flex = '1';
+  row.append(sidebar, pane);
+  document.body.appendChild(row);
+  testing.expectEqual(200, sidebar.offsetWidth);
+  testing.expectEqual(600, pane.offsetWidth);
+
+  sidebar.style.cssText = 'min-width: 50%; flex-shrink: 0';
+  testing.expectEqual(400, pane.offsetWidth);
+
+  // display: contents lends its children to the row
+  sidebar.style.cssText = 'display: contents';
+  const fixed = document.createElement('div');
+  fixed.style.cssText = 'width: 100px; flex-shrink: 0';
+  sidebar.appendChild(fixed);
+  testing.expectEqual(700, pane.offsetWidth);
+  row.remove();
+}
+</script>
+
+<script id="growingItemInShrinkToFitRow">
+{
+  // The row sizes from its items and a growing item from the row: the row
+  // takes the item's content, the item fills what's left of the row.
+  const row = document.createElement('span');
+  row.style.display = 'inline-flex';
+  const item = document.createElement('div');
+  item.style.flexGrow = '1';
+  const child = document.createElement('div');
+  child.style.width = '40px';
+  item.appendChild(child);
+  row.appendChild(item);
+  document.body.appendChild(row);
+  testing.expectEqual(40, row.offsetWidth);
+  testing.expectEqual(40, item.offsetWidth);
+  row.remove();
+}
+</script>
+
+<script id="minAndMaxWidth">
+{
+  const section = document.createElement('div');
+  section.style.width = '1000px';
+  const box = document.createElement('div');
+  section.appendChild(box);
+  document.body.appendChild(section);
+
+  // A filling block is capped, in px or against the containing block
+  box.style.maxWidth = '600px';
+  testing.expectEqual(600, box.offsetWidth);
+  testing.expectEqual(600, box.clientWidth);
+  testing.expectEqual(600, box.getBoundingClientRect().width);
+  box.style.maxWidth = '50%';
+  testing.expectEqual(500, box.offsetWidth);
+  box.style.maxWidth = 'none';
+  testing.expectEqual(1000, box.offsetWidth);
+
+  // An explicit width is clamped too; min-width wins over max-width
+  box.style.width = '2000px';
+  box.style.maxWidth = '100%';
+  testing.expectEqual(1000, box.offsetWidth);
+  box.style.minWidth = '1200px';
+  testing.expectEqual(1200, box.offsetWidth);
+
+  // A shrink-to-fit box grows to its min-width
+  box.style.cssText = 'display: inline-block; min-width: 300px';
+  testing.expectEqual(300, box.offsetWidth);
+
+  // A capped child caps what it adds to a shrink-to-fit parent
+  const parent = document.createElement('div');
+  parent.style.display = 'inline-block';
+  const wide = document.createElement('div');
+  wide.style.cssText = 'width: 800px; max-width: 200px';
+  parent.appendChild(wide);
+  section.appendChild(parent);
+  testing.expectEqual(200, parent.offsetWidth);
+
+  // A percentage limit inside a shrink-to-fit parent doesn't limit what
+  // the child adds: there is no width yet to take a percentage of
+  wide.style.maxWidth = '10%';
+  testing.expectEqual(800, parent.offsetWidth);
+  testing.expectEqual(80, wide.offsetWidth);
+
+  // The rule a carousel uses: slides capped by the viewport
+  const style = document.createElement('style');
+  style.textContent = '.capped { max-width: 320px }';
+  document.head.appendChild(style);
+  box.style.cssText = '';
+  box.className = 'capped';
+  testing.expectEqual(320, box.offsetWidth);
+  style.remove();
+  testing.expectEqual(1000, box.offsetWidth);
+  section.remove();
+}
+</script>
+
+<script id="widthsAcrossFrames">
+{
+  // Read from the parent, an iframe's elements size within their own document
+  const iframe = document.createElement('iframe');
+  document.body.appendChild(iframe);
+  const doc = iframe.contentDocument;
+  const section = doc.createElement('div');
+  section.style.width = '300px';
+  const block = doc.createElement('div');
+  block.style.maxWidth = '50%';
+  const inline = doc.createElement('span');
+  inline.style.display = 'inline-block';
+  const child = doc.createElement('div');
+  child.style.width = '40px';
+  inline.appendChild(child);
+  section.append(block, inline);
+  doc.body.appendChild(section);
+  testing.expectEqual(300, section.offsetWidth);
+  testing.expectEqual(150, block.offsetWidth);
+  testing.expectEqual(40, inline.offsetWidth);
+  testing.expectEqual(300, section.scrollWidth);
+  iframe.remove();
+}
+</script>
+
+<script id="boxesSizedByTheirItems">
+{
+  const grows = (setup) => {
+    const box = document.createElement('div');
+    box.appendChild(document.createElement('span'));
+    (setup(box) ?? document.body).appendChild(box);
+    const before = box.clientWidth;
+    box.appendChild(document.createElement('span'));
+    box.appendChild(document.createElement('span'));
+    return box.clientWidth > before;
+  };
+
+  testing.expectTrue(grows((box) => { box.style.display = 'inline-flex'; }));
+  testing.expectTrue(grows((box) => { box.style.cssText = 'display: flex; width: max-content'; }));
+  testing.expectTrue(grows((box) => { box.style.cssText = 'display: grid; position: absolute'; }));
+  testing.expectTrue(grows((box) => { box.style.cssText = 'display: flex; float: left'; }));
+  testing.expectTrue(grows((box) => {
+    box.style.display = 'flex';
+    const row = document.createElement('div');
+    row.className = 'flex-row';
+    document.body.appendChild(row);
+    return row;
+  }));
+}
+</script>
+
+<script id="scrollHeightFromContent">
+{
+  // An empty element has no content to overflow its box.
+  const empty = document.createElement('div');
+  document.body.appendChild(empty);
+  testing.expectEqual(empty.clientHeight, empty.scrollHeight);
+
+  // Children stack, so each one strictly increases scrollHeight.
+  const box = document.createElement('div');
+  document.body.appendChild(box);
+  box.appendChild(document.createElement('div'));
+  const oneChild = box.scrollHeight;
+  testing.expectTrue(oneChild >= box.clientHeight);
+
+  box.appendChild(document.createElement('div'));
+  testing.expectTrue(box.scrollHeight > oneChild);
+  // An unsized box shrink-wraps: clientHeight tracks the same content sum.
+  testing.expectEqual(box.scrollHeight, box.clientHeight);
+
+  // Text contributes no height, as it contributes no width: a text child's
+  // line box is what the element's own size already stands in for.
+  const short = document.createElement('div');
+  const long = document.createElement('div');
+  short.textContent = 'ab';
+  long.textContent = 'abcdefghijklmnop';
+  document.body.appendChild(short);
+  document.body.appendChild(long);
+  testing.expectEqual(short.clientHeight, short.scrollHeight);
+  testing.expectEqual(long.clientHeight, long.scrollHeight);
+  testing.expectEqual(short.scrollHeight, long.scrollHeight);
+
+  // A display:none child takes up no space.
+  const withHidden = document.createElement('div');
+  const hiddenChild = document.createElement('div');
+  hiddenChild.style.display = 'none';
+  withHidden.appendChild(hiddenChild);
+  document.body.appendChild(withHidden);
+  testing.expectEqual(withHidden.clientHeight, withHidden.scrollHeight);
+
+  // A hidden element reports 0, matching clientHeight/offsetHeight.
+  const hidden = document.createElement('div');
+  hidden.style.display = 'none';
+  hidden.appendChild(document.createElement('div'));
+  document.body.appendChild(hidden);
+  testing.expectEqual(0, hidden.scrollHeight);
+
+  // The collapse/expand idiom: scrollHeight is read while the panel is
+  // collapsed at height:0 to know how far to open it. A zero-height box is
+  // not hidden; its content is still measured.
+  const panel = document.createElement('div');
+  panel.style.height = '0';
+  panel.appendChild(document.createElement('div'));
+  panel.appendChild(document.createElement('div'));
+  document.body.appendChild(panel);
+  testing.expectEqual(0, panel.clientHeight);
+  testing.expectTrue(panel.scrollHeight > 0);
+
+  // The root element's clientHeight is the viewport (CSSOM View); jstracker
+  // tiles it with elementFromPoint calls.
+  testing.expectEqual(document.body.clientHeight, document.body.scrollHeight);
+  testing.expectEqual(window.innerHeight, document.documentElement.clientHeight);
+  testing.expectEqual(
+    Math.max(document.documentElement.offsetHeight, document.documentElement.clientHeight),
+    document.documentElement.scrollHeight,
+  );
+}
+</script>
+
+<script id="scrollHeightMarqueeLoop">
+{
+  // The vertical counterpart of scrollWidthMarqueeLoop: a ticker that grows
+  // its lane until it is twice the height of its container.
+  const track = document.createElement('div');
+  const lane = document.createElement('div');
+  lane.innerHTML = '<div>item</div>';
+  track.appendChild(lane);
+  document.body.appendChild(track);
+
+  // Doubling the markup doubles the measured content height.
+  const before = lane.scrollHeight;
+  lane.innerHTML += lane.innerHTML;
+  testing.expectEqual(before * 2, lane.scrollHeight);
+
+  let guard = 0;
+  while (lane.scrollHeight < track.offsetHeight * 2 && guard < 50) {
+    lane.innerHTML += lane.innerHTML;
+    guard++;
+  }
+  testing.expectTrue(guard < 50);
+}
+</script>
+<script id="scrollPosition">
+{
+  const test1 = $('#test1');
+
+  // Initial scroll position should be 0
+  testing.expectEqual(0, test1.scrollTop);
+  testing.expectEqual(0, test1.scrollLeft);
+
+  // Setting scroll position
+  test1.scrollTop = 50;
+  testing.expectEqual(50, test1.scrollTop);
+
+  test1.scrollLeft = 25;
+  testing.expectEqual(25, test1.scrollLeft);
+
+  // Negative values should be clamped to 0
+  test1.scrollTop = -10;
+  testing.expectEqual(0, test1.scrollTop);
+
+  test1.scrollLeft = -5;
+  testing.expectEqual(0, test1.scrollLeft);
+
+  // Each element has independent scroll position
+  const test2 = $('#test2');
+  testing.expectEqual(0, test2.scrollTop);
+  testing.expectEqual(0, test2.scrollLeft);
+
+  test2.scrollTop = 100;
+  testing.expectEqual(100, test2.scrollTop);
+  testing.expectEqual(0, test1.scrollTop); // test1 should still be 0
+}
+</script>
+
+<script id="scrollMethods">
+{
+  const test3 = $('#test2');
+  test3.scrollTop = 0;
+  test3.scrollLeft = 0;
+
+  // scroll()/scrollTo() with (x, y) positional args
+  test3.scrollTo(30, 40);
+  testing.expectEqual(30, test3.scrollLeft);
+  testing.expectEqual(40, test3.scrollTop);
+
+  test3.scroll(5, 6);
+  testing.expectEqual(5, test3.scrollLeft);
+  testing.expectEqual(6, test3.scrollTop);
+
+  // scrollTo() with an options dictionary; omitted axes are left unchanged
+  test3.scrollTo({left: 11, top: 22});
+  testing.expectEqual(11, test3.scrollLeft);
+  testing.expectEqual(22, test3.scrollTop);
+
+  test3.scrollTo({top: 99});
+  testing.expectEqual(11, test3.scrollLeft); // unchanged
+  testing.expectEqual(99, test3.scrollTop);
+
+  // Negative values clamp to 0
+  test3.scrollTo(-10, -10);
+  testing.expectEqual(0, test3.scrollLeft);
+  testing.expectEqual(0, test3.scrollTop);
+
+  // scrollBy() is relative to the current position
+  test3.scrollTo(10, 10);
+  test3.scrollBy(5, 7);
+  testing.expectEqual(15, test3.scrollLeft);
+  testing.expectEqual(17, test3.scrollTop);
+
+  test3.scrollBy({left: -3, top: -2});
+  testing.expectEqual(12, test3.scrollLeft);
+  testing.expectEqual(15, test3.scrollTop);
+
+  // scrollBy() clamps to 0 and never goes negative
+  test3.scrollBy(-1000, -1000);
+  testing.expectEqual(0, test3.scrollLeft);
+  testing.expectEqual(0, test3.scrollTop);
+}
+</script>
+
+<script id="offsetDimensions">
+{
+  const test1 = $('#test1');
+
+  // offsetWidth/Height should be numbers
+  testing.expectEqual('number', typeof test1.offsetWidth);
+  testing.expectEqual('number', typeof test1.offsetHeight);
+  testing.expectTrue(test1.offsetWidth >= 0);
+  testing.expectTrue(test1.offsetHeight >= 0);
+
+  // Should equal client dimensions
+  testing.expectEqual(test1.clientWidth, test1.offsetWidth);
+  testing.expectEqual(test1.clientHeight, test1.offsetHeight);
+}
+</script>
+
+<script id="offsetPosition">
+{
+  const test1 = $('#test1');
+  const test2 = $('#test2');
+
+  // offsetTop/Left should be calculated from tree position
+  // These values are based on the heuristic layout engine
+  const top1 = test1.offsetTop;
+  const left1 = test1.offsetLeft;
+  const top2 = test2.offsetTop;
+  const left2 = test2.offsetLeft;
+
+  // Position values should be numbers
+  testing.expectEqual('number', typeof top1);
+  testing.expectEqual('number', typeof left1);
+  testing.expectEqual('number', typeof top2);
+  testing.expectEqual('number', typeof left2);
+
+  // Siblings should have different positions (either different x or y)
+  testing.expectTrue(top1 !== top2 || left1 !== left2);
+}
+</script>
+
+<script id="offsetVsBounding">
+{
+  const test1 = $('#test1');
+
+  // offsetTop/Left should match getBoundingClientRect
+  const rect = test1.getBoundingClientRect();
+  testing.expectEqual(rect.y, test1.offsetTop);
+  testing.expectEqual(rect.x, test1.offsetLeft);
+  testing.expectEqual(rect.width, test1.offsetWidth);
+  testing.expectEqual(rect.height, test1.offsetHeight);
+}
+</script>
+
+<script id="offsetParent">
+{
+  const test1 = $('#test1');
+
+  // Default offset ancestor is the body.
+  testing.expectEqual(document.body, test1.offsetParent);
+
+  // The root and body elements have no offsetParent.
+  testing.expectEqual(null, document.documentElement.offsetParent);
+  testing.expectEqual(null, document.body.offsetParent);
+
+  // A positioned ancestor wins over the body.
+  const wrap = document.createElement('div');
+  wrap.style.position = 'relative';
+  const inner = document.createElement('span');
+  wrap.appendChild(inner);
+  document.body.appendChild(wrap);
+  testing.expectEqual(wrap, inner.offsetParent);
+
+  // A position:fixed element has no offsetParent.
+  inner.style.position = 'fixed';
+  testing.expectEqual(null, inner.offsetParent);
+  inner.style.position = '';
+
+  // Static elements offset from table machinery: content → cell, cell → table.
+  const table = document.createElement('table');
+  const tr = document.createElement('tr');
+  const td = document.createElement('td');
+  const cellContent = document.createElement('span');
+  td.appendChild(cellContent);
+  tr.appendChild(td);
+  table.appendChild(tr);
+  document.body.appendChild(table);
+  testing.expectEqual(td, cellContent.offsetParent);
+  testing.expectEqual(table, td.offsetParent);
+
+  // ...but a positioned element ignores the td/th/table rule.
+  cellContent.style.position = 'absolute';
+  testing.expectEqual(document.body, cellContent.offsetParent);
+
+  // display:none (own or inherited) → null.
+  const hidden = document.createElement('div');
+  hidden.style.display = 'none';
+  const hiddenChild = document.createElement('span');
+  hidden.appendChild(hiddenChild);
+  document.body.appendChild(hidden);
+  testing.expectEqual(null, hidden.offsetParent);
+  testing.expectEqual(null, hiddenChild.offsetParent);
+
+  // Detached elements → null.
+  testing.expectEqual(null, document.createElement('div').offsetParent);
+
+  // Shadow-tree elements hop the boundary to the host's offset ancestor.
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const shadow = host.attachShadow({mode: 'open'});
+  const shadowChild = document.createElement('div');
+  shadow.appendChild(shadowChild);
+  testing.expectEqual(document.body, shadowChild.offsetParent);
+
+  // A positioned host is itself the offsetParent.
+  host.style.position = 'relative';
+  testing.expectEqual(host, shadowChild.offsetParent);
+}
+</script>
+
+<script id="scrollIntoView">
+{
+  // Add an element deep in the document so its position is non-zero.
+  const deep = document.createElement('div');
+  deep.id = 'deep';
+  document.body.appendChild(deep);
+
+  const targetY = deep.getBoundingClientRect().y;
+  testing.expectTrue(targetY > 0);
+
+  // Room to scroll it to the top. The position counts every preceding node,
+  // the document height only body's children, so size the room to the target.
+  const room = document.createElement('div');
+  room.style.height = `${targetY + window.innerHeight}px`;
+  document.body.appendChild(room);
+
+  // scrollIntoView() always brings the element's top to the scroll offset.
+  window.scrollTo(0, 999999);
+  deep.scrollIntoView();
+  testing.expectEqual(targetY, window.scrollY);
+
+  // scrollIntoViewIfNeeded() is a no-op when the element is already within the
+  // viewport band [scrollY, scrollY + innerHeight]. Sit just below the
+  // element's top so a stray scroll would visibly move scrollY.
+  const inView = Math.max(0, targetY - 1);
+  window.scrollTo(0, inView);
+  deep.scrollIntoViewIfNeeded();
+  testing.expectEqual(inView, window.scrollY);
+
+  // ...but it does scroll when the element is outside the band.
+  window.scrollTo(0, targetY + window.innerHeight + 100);
+  deep.scrollIntoViewIfNeeded();
+  testing.expectEqual(targetY, window.scrollY);
+}
+</script>
+
+<div id="clampBox" style="width: 100px; height: 100px; overflow: scroll;">
+  <div style="width: 500px; height: 500px;">content</div>
+</div>
+
+<script id="scrollClampsToExtent">
+{
+  // The limit is scrollHeight - clientHeight, whatever those measure: a real
+  // browser reserves scrollbar space in clientHeight and lands a few px lower.
+  const box = $('#clampBox');
+  const maxTop = box.scrollHeight - box.clientHeight;
+  const maxLeft = box.scrollWidth - box.clientWidth;
+  testing.expectTrue(maxTop > 0);
+
+  box.scrollTop = 9999;
+  box.scrollLeft = 9999;
+  testing.expectEqual(maxTop, box.scrollTop);
+  testing.expectEqual(maxLeft, box.scrollLeft);
+
+  box.scrollTo(10, 10);
+  box.scrollBy(9999, 9999);
+  testing.expectEqual(maxTop, box.scrollTop);
+  testing.expectEqual(maxLeft, box.scrollLeft);
+
+  box.scrollBy(-9999, -9999);
+  testing.expectEqual(0, box.scrollTop);
+  testing.expectEqual(0, box.scrollLeft);
+}
+</script>
+
+<style>
+  .sheetBox { height: 100px; overflow: auto; }
+  #sheetAuto { height: auto; }
+  .sheetVh { height: 10vh; }
+</style>
+<div id="sheetBox" class="sheetBox"><div style="height: 500px;">content</div></div>
+<div id="sheetAuto" class="sheetBox"><div style="height: 500px;">content</div></div>
+<div id="inlineAuto" class="sheetBox" style="height: 50%"><div style="height: 500px;">content</div></div>
+<div id="sheetVh" class="sheetVh"></div>
+
+<script id="sheetSizedBox">
+{
+  // A sheet size is as explicit as an inline one
+  const box = $('#sheetBox');
+  testing.expectEqual(100, box.clientHeight);
+  testing.expectEqual(500, box.scrollHeight);
+  testing.expectEqual('100px', getComputedStyle(box).height);
+
+  box.scrollTop = 9999;
+  testing.expectEqual(400, box.scrollTop);
+
+  // A stronger rule's `auto` wins, leaving no size to clamp to. Chrome
+  // clamps to 0; we can't tell auto from max-height, so we don't clamp.
+  const auto = $('#sheetAuto');
+  testing.expectEqual(500, auto.clientHeight);
+  auto.scrollTop = 9999;
+  testing.expectEqual(9999, auto.scrollTop);
+
+  // So does an unresolvable inline value
+  testing.expectEqual(500, $('#inlineAuto').clientHeight);
+
+  testing.expectEqual(window.innerHeight / 10, $('#sheetVh').clientHeight);
+}
+</script>
+
+<div id="textBox" style="height: 100px; width: 200px; overflow: auto;">
+  one two three four five six seven eight nine ten eleven twelve thirteen
+  fourteen fifteen sixteen seventeen eighteen nineteen twenty twenty-one
+  twenty-two twenty-three twenty-four twenty-five twenty-six twenty-seven
+</div>
+<div id="textFree">one two three four five six seven eight nine ten eleven twelve</div>
+<div id="textSmall" style="width: 200px; font-size: 8px">one two three four five six seven eight nine ten eleven twelve</div>
+
+<script id="textWrapsAtExplicitWidth">
+{
+  // Text wraps at an explicit width
+  const box = $('#textBox');
+  testing.expectEqual(100, box.clientHeight);
+  testing.expectEqual(200, box.scrollWidth);
+  testing.expectTrue(box.scrollHeight > box.clientHeight);
+
+  box.scrollTop = 9999;
+  testing.expectTrue(box.scrollTop > 0);
+  testing.expectEqual(box.scrollHeight - box.clientHeight, box.scrollTop);
+
+  // Without one, it isn't measured
+  testing.expectEqual(5, $('#textFree').scrollHeight);
+
+  const small = $('#textSmall');
+  const before = small.clientHeight;
+  small.style.fontSize = '4px';
+  testing.expectTrue(small.clientHeight < before);
+}
+</script>

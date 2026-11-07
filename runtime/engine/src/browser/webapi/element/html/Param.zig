@@ -1,0 +1,61 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+
+const lp = @import("lightpanda");
+
+const js = @import("../../../js/js.zig");
+const Factory = @import("../../../Factory.zig");
+
+const Node = @import("../../Node.zig");
+const Element = @import("../../Element.zig");
+
+const HtmlElement = @import("../Html.zig");
+
+const Param = @This();
+
+pub const Proto = HtmlElement;
+
+_pad: bool = false,
+_proto_canary: if (lp.IS_DEBUG) *HtmlElement else void = undefined,
+
+pub fn asElement(self: *Param) *Element {
+    return Factory.protoOf(self).asElement();
+}
+pub fn asNode(self: *Param) *Node {
+    return self.asElement().asNode();
+}
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(Param);
+
+    pub const Meta = struct {
+        pub const name = "HTMLParamElement";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    const reflect = Element.Reflect(Param);
+    pub const valueType = reflect.string("valuetype");
+    pub const @"type" = reflect.string("type");
+
+    pub const name = reflect.string("name");
+    pub const value = reflect.string("value");
+};
+
+const testing = @import("../../../../testing.zig");
+test "WebApi: HTML.Param" {
+    try testing.htmlRunner("element/html/param.html", .{});
+}

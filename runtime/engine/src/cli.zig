@@ -1,0 +1,1065 @@
+// Copyright (C) 2023-2026 Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const lp = @import("lightpanda");
+const log = lp.log;
+const string = @import("string.zig");
+
+/// Comptime CLI builder that generates a tagged union parser from a
+/// declarative command recipe. Each command becomes a union variant whose
+/// payload is a struct with one field per option. A `help` variant is added
+/// automatically; do not include it in the recipe.
+///
+/// ## Parsing behavior
+///
+/// `parse` reads `std.process.args`, picks a command by the first non-exec
+/// argument, then walks the rest as `--flag value` pairs. Quirks:
+///
+///   - When no command is given, the parser defaults to `serve`.
+///   - `help`, `help <command>`, `<command> help`, and `<command> --help` all
+///     yield the `help` union variant. When a command is named (in either
+///     position), the variant carries that command's enum tag so callers can
+///     print command-specific help; bare `help` and `help help` carry the
+///     `.help` tag. An unknown name after `help` returns
+///     `error.UnknownCommand`.
+///   - Legacy fallback: if the first argument starts with `--` and matches a
+///     known fetch/serve flag, the parser sniffs the command from it and
+///     re-parses argv. Only exists for backwards compatibility.
+///   - An unknown `--flag` returns `error.UnknownOption`, and a bare first
+///     argument within two edits of a command name returns
+///     `error.UnknownCommand` instead of being fetched as a url. The fatal
+///     log line names the closest match as `did_you_mean`.
+///
+/// ## Command descriptor fields
+///
+///   - `name: []const u8` — canonical command name on the command line.
+///   - `options: tuple` — tuple of option descriptors (see below). Use `.{}`
+///     for none.
+///   - `shared_options: tuple` (optional) — extra options merged into this
+///     command. Useful for common flags shared across commands. An option
+///     that appears in both with the same field name and type is collapsed
+///     into one field (the command's own option wins); reusing a name with
+///     a different type is a compile error.
+///   - `before_parse: fn () void` (optional) — called once the command is
+///     known (by name or sniffed from a legacy flag), before any option is
+///     read. For mode-level process defaults that must already hold while
+///     the options themselves are parsed, e.g. log settings; an explicit
+///     option parsed later still wins.
+///   - `positional: struct` (optional) — a positional argument with `.name`
+///     and `.type` that may appear anywhere in argv. By default it holds a
+///     single value: `.type` must be an optional pointer-to-u8 slice (e.g.
+///     `?[:0]const u8`) or enum, it defaults to `null`, and passing it more
+///     than once returns `error.TooManyPositionalArguments`. With
+///     `.multiple = true`, `.type` is the (non-optional) element type (e.g.
+///     `[:0]const u8`), the field becomes a `std.ArrayList(type)`, and each
+///     occurrence appends.
+///
+/// ## Option descriptor fields
+///
+///   - `name: []const u8` — snake_case field name. Both `--snake_case` and
+///     `--kebab-case` are accepted on the command line.
+///   - `field_name: []const u8` (optional) — name of the struct field the
+///     value is written to, when it should differ from the flag name.
+///   - `type` — the Zig type of the parsed value (see supported types below).
+///     When the stored representation differs from the CLI-facing one, use
+///     `.{ .cli = T, .memory = T }`; a `validator` must then produce the
+///     memory type.
+///   - `default` (optional) — compile-time default when the flag is absent.
+///     Rules vary by type; see the defaults section below.
+///   - `multiple: bool` (optional) — when `true`, the field becomes a
+///     `std.ArrayList(type)` and each occurrence appends. Not supported for
+///     `bool` or packed-struct options.
+///   - `validator: fn` (optional) — custom parse function that replaces the
+///     built-in type switch. See the validator section below.
+///   - `variants: tuple` (optional) — alternate flag names that write into
+///     the same field. See the variants section below.
+///   - `deprecated: []const u8` (optional) — the option still parses, but
+///     each use logs a warning carrying this note.
+///   - `path: bool` (optional) — the value is a file or directory path, so
+///     shell completion offers files. Also allowed on a variant and on a
+///     positional.
+///
+/// ## Supported types and their defaults
+///
+///   - `bool` — presence flips the field to the opposite of its `default`
+///     (so a flag with `default = true` acts as a disable switch). Defaults
+///     to `false` when no `default` is given. `?bool` is not allowed.
+///   - Integers (`u8`, `u16`, `u31`, `usize`, etc.) — parsed with
+///     `std.fmt.parseInt`. Requires `default` unless wrapped in `?`.
+///   - `[]const u8`, `[:0]const u8` (and mutable variants) — string slices
+///     duped from argv. Sentinel is preserved. Requires `default` unless `?`.
+///   - Enums — parsed via `std.meta.stringToEnum`. Returns
+///     `error.InvalidArgument` on a bad value. Requires `default` unless `?`.
+///   - Packed structs of `bool` fields — parsed from a comma-separated list
+///     (e.g. `--strip-mode js,css`).
+///     Unknown names return `error.InvalidArgument`. Requires `default`.
+///     `multiple` is not supported.
+///   - Optional types default to `null` when `default` is omitted.
+///
+/// ## Validators
+///
+/// A `validator` is a custom parse function that takes over argument
+/// consumption for an option. It receives a pointer to the generated struct
+/// field and writes through it; the pointee depends on whether `multiple`
+/// is set:
+///
+///   - Single: `fn (Allocator, *ArgIterator, *T) !void` — writes the parsed
+///     value through the field pointer.
+///   - Multiple: `fn (Allocator, *ArgIterator, *std.ArrayList(T)) !void` —
+///     appends directly into the list.
+///
+/// When a validator is present, the built-in type switch is skipped entirely.
+/// The validator owns advancing the iterator and is free to peek ahead.
+/// Because the validator sees the field itself, a repeated flag can
+/// accumulate state in place (e.g. add each certificate to a store the
+/// field points at) instead of collecting values in a list.
+///
+/// ## Variants
+///
+/// A `variants` tuple lets multiple flag names write into the same field
+/// using different parse logic. Each variant has its own `.name` and an
+/// optional `.validator` (with the same signatures as above); the option's
+/// `type` and `multiple` are inherited. Useful for "value or file" pairs:
+/// e.g. `--wait-script "code"` vs `--wait-script-file path/to/script.js`,
+/// both populating the same `wait_script` field.
+///
+/// ## Example
+///
+/// ```zig
+/// const StripMode = packed struct(u2) {
+///     js: bool = false,
+///     css: bool = false,
+/// };
+///
+/// const WaitUntil = enum { load, domcontentloaded, networkidle };
+///
+/// const CommonOptions = .{
+///     .{ .name = "verbose", .type = bool },
+///     .{ .name = "log_level", .type = ?log.Level },
+///     .{ .name = "timeout", .type = u31, .default = 30 },
+/// };
+///
+/// const Cli = cli.Builder(.{
+///     .{
+///         .name = "serve",
+///         .options = .{
+///             .{ .name = "host", .type = []const u8, .default = "127.0.0.1" },
+///             .{ .name = "port", .type = u16, .default = 9222 },
+///         },
+///         .shared_options = CommonOptions,
+///     },
+///     .{
+///         .name = "fetch",
+///         .positional = .{ .name = "url", .type = ?[:0]const u8 },
+///         .options = .{
+///             .{ .name = "dump", .type = ?DumpFormat, .validator = dumpValidator },
+///             .{ .name = "strip_mode", .type = StripMode, .default = .{} },
+///             .{ .name = "wait_until", .type = ?WaitUntil },
+///             .{ .name = "extra_header", .type = []const u8, .multiple = true },
+///             .{
+///                 .name = "wait_script",
+///                 .type = ?[:0]const u8,
+///                 .variants = .{
+///                     .{ .name = "wait_script_file", .validator = readScriptFile },
+///                 },
+///             },
+///         },
+///         .shared_options = CommonOptions,
+///     },
+///     .{ .name = "version", .options = .{} },
+/// });
+///
+/// const _, const cmd = try Cli.parse(arena);
+/// switch (cmd) {
+///     .serve => |opts| listen(opts.host, opts.port),
+///     .fetch => |opts| fetch(opts.url orelse return error.UrlRequired, opts.dump),
+///     .version => printVersion(),
+///     .help => |tag| printHelp(tag),
+/// }
+/// ```
+/// Tag names of an enum, or field names of a (packed) struct option.
+pub fn tagNames(comptime E: type) []const []const u8 {
+    return comptime blk: {
+        const field_names = switch (@typeInfo(E)) {
+            inline .@"enum", .@"struct" => |info| info.field_names,
+            else => @compileError("expected an enum or struct"),
+        };
+        var names: [field_names.len][]const u8 = undefined;
+        for (field_names, &names) |field_name, *n| n.* = field_name;
+        const frozen = names;
+        break :blk &frozen;
+    };
+}
+
+pub const Completion = struct {
+    pub const Command = struct {
+        name: []const u8,
+        positional: ?Positional,
+        flags: []const Flag,
+    };
+
+    pub const Positional = struct {
+        name: []const u8,
+        values: Values,
+        multiple: bool,
+    };
+
+    pub const Flag = struct {
+        /// Long form, kebab-case, with the leading `--`.
+        name: []const u8,
+        short: ?u8 = null,
+        values: Values,
+    };
+
+    pub const Values = union(enum) {
+        /// A switch; takes no argument.
+        none,
+        any,
+        path,
+        one_of: []const []const u8,
+        /// A comma-separated list of these (packed-struct options).
+        list_of: []const []const u8,
+    };
+};
+
+/// No command or choice has a `.`, `/` or `:`, so `markdown.com` is a url
+/// however close it is to `markdown`.
+pub fn isUrlLike(arg: []const u8) bool {
+    return std.mem.findAny(u8, arg, ".:/") != null;
+}
+
+/// `prefix` was stripped from `value` before matching, like `--log-filter`'s sign.
+pub fn invalidChoice(arg: []const u8, prefix: []const u8, value: []const u8, choices: []const []const u8) error{InvalidArgument} {
+    var value_buf: [128]u8 = undefined;
+    const typed = std.mem.print(&value_buf, "{s}{s}", .{ prefix, value }) catch value;
+    if (string.closest(value, choices)) |near| {
+        var near_buf: [128]u8 = undefined;
+        const suggestion = std.mem.print(&near_buf, "{s}{s}", .{ prefix, near }) catch near;
+        log.fatal(.app, "invalid option choice", .{ .arg = arg, .value = log.red(typed), .did_you_mean = log.green(suggestion) });
+    } else {
+        log.fatal(.app, "invalid option choice", .{ .arg = arg, .value = log.red(typed) });
+    }
+    return error.InvalidArgument;
+}
+
+pub fn Builder(comptime commands: anytype) type {
+    return struct {
+        const Self = @This();
+
+        /// Enum type for provided commands.
+        pub const Enum = blk: {
+            const len = commands.len + 1;
+            const Tag = std.math.IntFittingRange(0, len);
+            var names: [len][:0]const u8 = undefined;
+
+            for (commands, 0..) |command, i| {
+                names[i] = command.name;
+            }
+
+            // Entry for help.
+            names[commands.len] = "help";
+
+            break :blk @Enum(Tag, .exhaustive, &names, &std.simd.iota(Tag, len));
+        };
+
+        pub const command_names = tagNames(Enum);
+
+        const Field = struct {
+            name: [:0]const u8,
+            type: type,
+            attrs: std.lang.Type.Struct.FieldAttributes,
+        };
+
+        /// Creates an array of `Field` out of given options.
+        fn optionsToFields(comptime options: anytype) [options.len]Field {
+            var fields: [options.len]Field = undefined;
+
+            inline for (options, 0..) |option, j| {
+                // Whether prefer `ArrayList` for the option.
+                const is_multiple = @hasField(@TypeOf(option), "multiple") and option.multiple;
+                // Whether option has a default value.
+                const has_default = @hasField(@TypeOf(option), "default");
+
+                const Type = blk: {
+                    if (@typeInfo(@TypeOf(option.type)) == .@"struct") {
+                        break :blk option.type.memory;
+                    }
+                    break :blk option.type;
+                };
+
+                const T = if (is_multiple) std.ArrayList(Type) else Type;
+
+                // Prefer `option.field_name` if memory representation will differ.
+                const name = blk: {
+                    if (@hasField(@TypeOf(option), "field_name")) {
+                        break :blk option.field_name;
+                    }
+                    break :blk option.name;
+                };
+
+                const default = blk: {
+                    if (is_multiple) {
+                        // We currently don't allow default values for lists.
+                        if (has_default) {
+                            @compileError("`default` is not allowed for lists");
+                        }
+                        // Multiples are always initialized the same.
+                        break :blk @as(*const anyopaque, @ptrCast(&@as(T, .empty)));
+                    }
+
+                    switch (@typeInfo(Type)) {
+                        .optional => |optional| {
+                            if (optional.child == bool) {
+                                @compileError("?bool is not supported, prefer enum");
+                            }
+
+                            // If type is an optional type without default value, prefer null.
+                            if (!has_default) {
+                                break :blk @as(*const anyopaque, @ptrCast(&@as(T, null)));
+                            }
+                            // We have default value for an optional.
+                            break :blk @as(*const anyopaque, @ptrCast(&@as(T, option.default)));
+                        },
+                        .bool => {
+                            // Prefer `false` if no default.
+                            const default = if (has_default) option.default else false;
+                            break :blk @as(*const anyopaque, @ptrCast(&@as(T, default)));
+                        },
+                        inline else => {
+                            if (!has_default) {
+                                @compileError("option `" ++ name ++ "` is not optional type and has no default value");
+                            }
+                            break :blk @as(*const anyopaque, @ptrCast(&@as(T, option.default)));
+                        },
+                    }
+                };
+
+                fields[j] = .{
+                    .name = name,
+                    .type = T,
+                    .attrs = .{ .default_value_ptr = default },
+                };
+            }
+
+            return fields;
+        }
+
+        /// Drops duplicate fields, keeping the first occurrence. Only an exact
+        /// duplicate (same name and type) is deduplicated; a name that
+        /// reappears with a different type is a conflict.
+        fn dedupeFields(comptime fields: []const Field) []const Field {
+            // The pairwise name comparisons blow the default 1000-branch quota.
+            @setEvalBranchQuota(1000 + fields.len * fields.len * 100);
+
+            var out: [fields.len]Field = undefined;
+            var len: usize = 0;
+
+            outer: for (fields) |field| {
+                for (out[0..len]) |existing| {
+                    if (!std.mem.eql(u8, existing.name, field.name)) continue;
+
+                    if (existing.type != field.type) {
+                        @compileError("field `" ++ field.name ++ "` is duplicated with a different type");
+                    }
+                    continue :outer;
+                }
+
+                out[len] = field;
+                len += 1;
+            }
+
+            const frozen = out;
+            return frozen[0..len];
+        }
+
+        /// Union type for provided commands.
+        pub const Union = blk: {
+            const len = commands.len + 1;
+            var names: [len][:0]const u8 = undefined;
+            var types: [len]type = undefined;
+
+            for (commands, 0..) |command, i| {
+                const Command = @TypeOf(command);
+                const options = command.options;
+
+                const all_fields = optionsToFields(options) ++
+                    (if (@hasField(Command, "shared_options"))
+                        optionsToFields(command.shared_options)
+                    else
+                        .{}) ++
+                    (if (@hasField(Command, "positional"))
+                        [1]Field{positionalField(command.positional)}
+                    else
+                        .{});
+
+                names[i] = command.name;
+                types[i] = StructFromFields(dedupeFields(&all_fields));
+            }
+
+            // Entry for help; just takes `Enum` itself.
+            names[commands.len] = "help";
+            types[commands.len] = Enum;
+
+            break :blk @Union(.auto, Enum, &names, &types, &@splat(.{}));
+        };
+
+        fn StructFromFields(comptime fields: []const Field) type {
+            var names: [fields.len][:0]const u8 = undefined;
+            var types: [fields.len]type = undefined;
+            var attrs: [fields.len]std.lang.Type.Struct.FieldAttributes = undefined;
+            for (fields, 0..) |f, i| {
+                names[i] = f.name;
+                types[i] = f.type;
+                attrs[i] = f.attrs;
+            }
+            return @Struct(.auto, null, &names, &types, &attrs);
+        }
+
+        /// Builds the `Field` for a command's positional argument. A plain
+        /// positional is an optional that defaults to `null`; a `multiple`
+        /// positional collects every occurrence into an `ArrayList` that
+        /// defaults to empty.
+        fn positionalField(comptime positional: anytype) Field {
+            const is_multiple = @hasField(@TypeOf(positional), "multiple") and positional.multiple;
+            const T = if (is_multiple) std.ArrayList(positional.type) else positional.type;
+            const default: *const anyopaque = if (is_multiple)
+                @ptrCast(&@as(T, .empty))
+            else
+                @ptrCast(&@as(T, null));
+            return .{
+                .name = positional.name,
+                .type = T,
+                .attrs = .{ .default_value_ptr = default },
+            };
+        }
+
+        /// Parses executable name, command and options via single call.
+        pub fn parse(allocator: Allocator, proc_args: std.process.Args) !struct { []const u8, Union } {
+            var args = std.process.Args.Iterator.init(proc_args);
+            defer args.deinit();
+
+            const exec_name = std.fs.path.basename(args.next().?);
+
+            const cmd_str: []const u8 = args.next() orelse "serve";
+            inline for (commands) |command| {
+                // Match a command.
+                if (std.mem.eql(u8, cmd_str, command.name)) {
+                    const cmd_parsed = try parseCommand(allocator, command, &args);
+                    return .{ exec_name, cmd_parsed };
+                }
+            }
+
+            // Help is not in `commands`; so, we have to special case it.
+            if (std.mem.eql(u8, cmd_str, "help")) {
+                // Check if we're followed by a command name.
+                const command_name: []const u8 = args.next() orelse {
+                    // "lightpanda help"; short-circuit.
+                    return .{ exec_name, @unionInit(Union, "help", .help) };
+                };
+
+                inline for (commands) |command| {
+                    if (std.mem.eql(u8, command_name, command.name)) {
+                        return .{
+                            exec_name,
+                            @unionInit(Union, "help", std.meta.stringToEnum(Enum, command.name).?),
+                        };
+                    }
+                }
+
+                // Treat `help help` as the full help.
+                if (std.mem.eql(u8, command_name, "help")) {
+                    return .{ exec_name, @unionInit(Union, "help", .help) };
+                }
+
+                return unknownCommand(command_name);
+            }
+
+            // A bare word close to a command name is a typo, not a fetch url.
+            if (std.mem.startsWith(u8, cmd_str, "--") == false and !isUrlLike(cmd_str) and string.closest(cmd_str, command_names) != null) {
+                return unknownCommand(cmd_str);
+            }
+
+            // Last resort, try sniffing.
+            const command_enum = try sniffCommand(cmd_str);
+
+            // Legacy `--help` situation.
+            if (command_enum == .help) {
+                return .{ exec_name, @unionInit(Union, "help", .help) };
+            }
+
+            // "cmd_str" wasn't a command but an option. We can't reset args, but
+            // we can create a new one. Not great, but this fallback is temporary
+            // as we transition to this command mode approach.
+            args.deinit();
+            args = std.process.Args.Iterator.init(proc_args);
+            // Skip the `exec_name`.
+            _ = args.skip();
+
+            inline for (commands) |command| {
+                if (std.mem.eql(u8, @tagName(command_enum), command.name)) {
+                    const cmd_parsed = try parseCommand(allocator, command, &args);
+                    return .{ exec_name, cmd_parsed };
+                }
+            }
+
+            unreachable;
+        }
+
+        fn unknownCommand(name: []const u8) error{UnknownCommand} {
+            const arg = log.red(name);
+            if (string.closest(name, command_names)) |near| {
+                log.fatal(.app, "unknown command", .{ .arg = arg, .did_you_mean = log.green(near) });
+            } else {
+                log.fatal(.app, "unknown command", .{ .arg = arg });
+            }
+            return error.UnknownCommand;
+        }
+
+        /// Try to sniff the command out of given option.
+        /// Only exists for legacy reasons; hence hardcoded.
+        fn sniffCommand(cmd_str: []const u8) error{UnknownCommand}!Enum {
+            if (std.mem.eql(u8, cmd_str, "--help") or std.mem.eql(u8, cmd_str, "-h")) {
+                return .help;
+            }
+
+            if (std.mem.startsWith(u8, cmd_str, "--") == false) {
+                return .fetch;
+            }
+
+            // Fetch heuristics.
+            inline for (.{
+                "--dump",
+                "--strip-mode",
+                "--strip_mode",
+                "--with-base",
+                "--with_base",
+                "--with-frames",
+                "--with_frames",
+            }) |heuristic| {
+                if (std.mem.eql(u8, cmd_str, heuristic)) {
+                    return .fetch;
+                }
+            }
+
+            // Serve heuristics.
+            inline for (.{
+                "--host",
+                "--port",
+            }) |heuristic| {
+                if (std.mem.eql(u8, cmd_str, heuristic)) {
+                    return .serve;
+                }
+            }
+
+            return unknownCommand(cmd_str);
+        }
+
+        /// Turns a snake_case string to kebab-case in comptime.
+        fn toKebabCase(comptime str: []const u8) [str.len]u8 {
+            var output: [str.len]u8 = str[0..str.len].*;
+            for (&output) |*c| if (c.* == '_') {
+                c.* = '-';
+            };
+            return output;
+        }
+
+        /// Every command's flags and their accepted values, for generating
+        /// shell completion scripts. Deprecated options are left out.
+        pub const completion_spec: []const Completion.Command = blk: {
+            var specs: [commands.len + 1]Completion.Command = undefined;
+            for (commands, specs[0..commands.len]) |command, *spec| {
+                const Command = @TypeOf(command);
+                spec.* = .{
+                    .name = command.name,
+                    .positional = if (@hasField(Command, "positional")) .{
+                        .name = command.positional.name,
+                        .values = completionValues(command.positional),
+                        .multiple = @hasField(@TypeOf(command.positional), "multiple") and command.positional.multiple,
+                    } else null,
+                    .flags = commandFlags(command),
+                };
+            }
+            specs[commands.len] = .{
+                .name = "help",
+                .positional = .{ .name = "command", .values = .{ .one_of = command_names }, .multiple = false },
+                .flags = &.{},
+            };
+            const frozen = specs;
+            break :blk &frozen;
+        };
+
+        /// The command's flags, for completion and "did you mean" suggestions.
+        /// Deprecated options are left out.
+        fn commandFlags(comptime command: anytype) []const Completion.Flag {
+            @setEvalBranchQuota(200_000);
+            const options = if (@hasField(@TypeOf(command), "shared_options"))
+                command.options ++ command.shared_options
+            else
+                command.options;
+
+            var flags: []const Completion.Flag = &.{};
+            outer: for (options) |option| {
+                if (@hasField(@TypeOf(option), "deprecated")) continue;
+                const name = "--" ++ toKebabCase(option.name);
+                // A shared option the command redefines is listed once.
+                for (flags) |flag| {
+                    if (std.mem.eql(u8, flag.name, name)) continue :outer;
+                }
+                const values = completionValues(option);
+                flags = flags ++ &[_]Completion.Flag{.{
+                    .name = name,
+                    .short = if (@hasField(@TypeOf(option), "short")) option.short else null,
+                    .values = values,
+                }};
+                if (@hasField(@TypeOf(option), "variants")) {
+                    for (option.variants) |variant| {
+                        flags = flags ++ &[_]Completion.Flag{.{
+                            .name = "--" ++ toKebabCase(variant.name),
+                            .values = if (@hasField(@TypeOf(variant), "path") and variant.path) .path else values,
+                        }};
+                    }
+                }
+            }
+            return flags;
+        }
+
+        /// Takes an option or a positional.
+        fn completionValues(comptime option: anytype) Completion.Values {
+            if (@hasField(@TypeOf(option), "path") and option.path) return .path;
+            const T = if (@typeInfo(@TypeOf(option.type)) == .@"struct") option.type.cli else option.type;
+            const Child = switch (@typeInfo(T)) {
+                .optional => |optional| optional.child,
+                else => T,
+            };
+            return switch (@typeInfo(Child)) {
+                .bool => .none,
+                .@"enum" => .{ .one_of = tagNames(Child) },
+                .@"struct" => |s| if (s.layout == .@"packed") .{ .list_of = tagNames(Child) } else .any,
+                else => .any,
+            };
+        }
+
+        fn parseEnum(comptime E: type, arg: []const u8, str: []const u8) error{InvalidArgument}!E {
+            return std.meta.stringToEnum(E, str) orelse invalidChoice(arg, "", str, tagNames(E));
+        }
+
+        fn parseValue(
+            allocator: Allocator,
+            args: *std.process.Args.Iterator,
+            /// Pointer to field; *T.
+            target: anytype,
+            /// `Option` doesn't have a concrete type; this field expects:
+            /// ```zig
+            /// Option{
+            ///     .name = "option_name",
+            ///     // If provided, names the struct field written to instead of `name`.
+            ///     .field_name = "struct_field_name",
+            ///     .type = T, // or .{ .cli = T, .memory = T }
+            ///     .multiple = ?bool,
+            ///     // *ArrayList(T) instead of *T when `.multiple`
+            ///     .validator = ?*const fn (Allocator, *std.process.Args.Iterator, *T) anyerror!void,
+            /// };
+            /// ```
+            option: anytype,
+        ) !void {
+            const kebab_cased = "--" ++ comptime toKebabCase(option.name);
+
+            const OptionType = @TypeOf(option);
+            const is_multiple = @hasField(OptionType, "multiple") and option.multiple;
+            const has_validator = @hasField(OptionType, "validator");
+            if (@hasField(OptionType, "deprecated")) {
+                log.warn(.app, "deprecated CLI parameter", .{ .name = option.name, .note = option.deprecated });
+            }
+
+            // Prefer validator for parsing if provided. The validator writes
+            // through the field pointer (the list itself for multiples).
+            if (has_validator) {
+                return @call(.auto, option.validator, .{ allocator, args, target });
+            }
+
+            // Extract type info. We need the type that's used in the CLI.
+            const T = blk: {
+                if (@typeInfo(@TypeOf(option.type)) == .@"struct") {
+                    break :blk option.type.cli;
+                }
+                break :blk option.type;
+            };
+            const option_info = blk: {
+                const info = @typeInfo(T);
+                // If wrapped in optional, prefer the child type.
+                if (info == .optional) break :blk @typeInfo(info.optional.child);
+                break :blk info;
+            };
+
+            // Parse by type.
+            return switch (option_info) {
+                .int => |int| {
+                    const Int = @Int(int.signedness, int.bits);
+
+                    const str = args.next() orelse return error.MissingArgument;
+                    const v = std.fmt.parseInt(Int, str, 10) catch |err| {
+                        switch (err) {
+                            error.Overflow => log.fatal(.app, "range overflow", .{ .arg = kebab_cased, .value = str }),
+                            error.InvalidCharacter => log.fatal(.app, "invalid character", .{ .arg = kebab_cased, .value = str }),
+                        }
+                        return error.InvalidArgument;
+                    };
+
+                    if (is_multiple) {
+                        // Push to ArrayList.
+                        try target.append(allocator, v);
+                    } else {
+                        target.* = v;
+                    }
+                },
+                .pointer => |pointer| {
+                    const not_u8_slice = pointer.child != u8 or pointer.size != .slice;
+                    if (not_u8_slice) {
+                        @compileError("Only []u8, []const u8, [:sentinel]u8 and [:sentinel]const u8 pointers are supported");
+                    }
+
+                    const v = blk: {
+                        const str = args.next() orelse return error.MissingArgument;
+
+                        // DupeZ branch.
+                        if (comptime pointer.sentinel()) |sentinel| {
+                            const buf = try allocator.alignedAlloc(u8, .fromByteUnits(pointer.attrs.@"align" orelse @alignOf(u8)), str.len + 1);
+                            @memcpy(buf[0..str.len], str);
+                            buf[str.len] = sentinel;
+                            break :blk buf[0..str.len :sentinel];
+                        }
+
+                        // Dupe branch.
+                        const buf = try allocator.alignedAlloc(u8, .fromByteUnits(pointer.attrs.@"align" orelse @alignOf(u8)), str.len);
+                        @memcpy(buf, str);
+                        break :blk buf;
+                    };
+
+                    if (is_multiple) {
+                        try target.append(allocator, v);
+                    } else {
+                        target.* = v;
+                    }
+                },
+                .@"struct" => |_struct| {
+                    // Don't support multiple for structs for now.
+                    if (is_multiple) {
+                        @compileError("multiple option is not supported for structs");
+                    }
+
+                    const not_packed = _struct.layout != .@"packed";
+                    if (not_packed) {
+                        @compileError("only packed structs are allowed");
+                    }
+
+                    const str = args.next() orelse return error.MissingArgument;
+
+                    var it = std.mem.tokenizeScalar(u8, str, ',');
+                    outer: while (it.next()) |part| {
+                        const trimmed = std.mem.trim(u8, part, &std.ascii.whitespace);
+
+                        inline for (_struct.field_names, _struct.field_types) |field_name, field_type| {
+                            lp.assert(field_type == bool, "all fields of packed struct must be boolean", .{
+                                .option = option.name,
+                                .field = field_name,
+                            });
+
+                            if (std.mem.eql(u8, trimmed, @as([]const u8, field_name))) {
+                                @field(target, field_name) = true;
+                                continue :outer;
+                            }
+                        }
+
+                        // Invalid option choice.
+                        log.fatal(.app, "invalid option choice", .{ .arg = kebab_cased, .value = trimmed });
+                        return error.InvalidArgument;
+                    }
+                },
+                .@"enum" => {
+                    const E = switch (@typeInfo(T)) {
+                        .optional => |optional| optional.child,
+                        inline else => T,
+                    };
+
+                    const str = args.next() orelse return error.MissingArgument;
+                    const v = try parseEnum(E, kebab_cased, str);
+
+                    if (is_multiple) {
+                        try target.append(allocator, v);
+                    } else {
+                        target.* = v;
+                    }
+                },
+                .bool => {
+                    if (is_multiple) {
+                        @compileError("multiple option is not supported for booleans");
+                    }
+
+                    const default = blk: {
+                        if (@hasField(@TypeOf(option), "default")) {
+                            break :blk option.default;
+                        }
+                        break :blk false;
+                    };
+
+                    // Set opposite of the default.
+                    target.* = !default;
+                },
+                else => unreachable,
+            };
+        }
+
+        fn helpHint(comptime command_name: []const u8) []const u8 {
+            return "see 'lightpanda help " ++ command_name ++ "'";
+        }
+
+        /// Validators return `error.MissingArgument` without logging when a
+        /// flag is the last argument, since only the parser knows its name.
+        fn logMissingValue(err: anyerror, arg: []const u8, comptime command_name: []const u8) void {
+            if (err == error.MissingArgument) {
+                log.fatal(.app, "missing argument value", .{ .arg = arg, .hint = helpHint(command_name) });
+            }
+        }
+
+        /// Parses the command with its options.
+        fn parseCommand(
+            allocator: Allocator,
+            command: anytype,
+            args: *std.process.Args.Iterator,
+        ) !Union {
+            const Command = @FieldType(Union, command.name);
+            if (@hasField(@TypeOf(command), "before_parse")) {
+                command.before_parse();
+            }
+            var c = Command{};
+
+            const options = blk: {
+                if (@hasField(@TypeOf(command), "shared_options")) {
+                    break :blk command.options ++ command.shared_options;
+                }
+
+                break :blk command.options;
+            };
+            // toKebabCase walks every byte of every name.
+            @setEvalBranchQuota(50_000);
+            iter_args: while (args.next()) |option_name| {
+                inline for (options) |option| {
+                    const name = option.name;
+                    const field_name = blk: {
+                        if (@hasField(@TypeOf(option), "field_name")) {
+                            break :blk option.field_name;
+                        }
+                        break :blk option.name;
+                    };
+
+                    // We allow both `--my-option` and `--my_option` variants;
+                    // assuming given `option` struct prefer snake_case for `name`.
+                    // Match an option.
+                    const matches_short = comptime @hasField(@TypeOf(option), "short");
+                    if (std.mem.eql(u8, option_name, "--" ++ name) or
+                        std.mem.eql(u8, option_name, "--" ++ comptime toKebabCase(name)) or
+                        (matches_short and std.mem.eql(u8, option_name, "-" ++ [_]u8{option.short})))
+                    {
+                        parseValue(allocator, args, &@field(c, field_name), option) catch |err| {
+                            logMissingValue(err, option_name, command.name);
+                            return err;
+                        };
+                        continue :iter_args;
+                    }
+
+                    const is_multiple = @hasField(@TypeOf(option), "multiple") and option.multiple;
+                    // Parse for variants if there are.
+                    const has_variants = @hasField(@TypeOf(option), "variants");
+                    if (has_variants) {
+                        inline for (option.variants) |variant| {
+                            if (std.mem.eql(u8, option_name, "--" ++ variant.name) or
+                                std.mem.eql(u8, option_name, "--" ++ comptime toKebabCase(variant.name)))
+                            {
+                                const opts = blk: {
+                                    if (@hasField(@TypeOf(variant), "validator")) {
+                                        break :blk .{
+                                            .name = variant.name,
+                                            .type = option.type,
+                                            .multiple = is_multiple,
+                                            .validator = variant.validator,
+                                        };
+                                    }
+
+                                    break :blk .{ .name = variant.name, .type = option.type, .multiple = is_multiple };
+                                };
+
+                                parseValue(allocator, args, &@field(c, field_name), opts) catch |err| {
+                                    logMissingValue(err, option_name, command.name);
+                                    return err;
+                                };
+                                continue :iter_args;
+                            }
+                        }
+                    }
+                }
+
+                // Subcommand help: `lightpanda fetch help` or `lightpanda fetch --help`.
+                if (std.mem.eql(u8, option_name, "help") or std.mem.eql(u8, option_name, "--help") or std.mem.eql(u8, option_name, "-h")) {
+                    return @unionInit(Union, "help", std.meta.stringToEnum(Enum, command.name).?);
+                }
+
+                // Encountered an option we don't know of.
+                if (std.mem.startsWith(u8, option_name, "--")) {
+                    // Short aliases are left out: a one-letter candidate sits
+                    // within two edits of nearly any typo.
+                    const names = comptime blk: {
+                        var names: []const []const u8 = &.{"--help"};
+                        for (commandFlags(command)) |flag| names = names ++ &[_][]const u8{flag.name};
+                        break :blk names;
+                    };
+                    const arg = log.red(option_name);
+                    if (string.closest(option_name, names)) |near| {
+                        log.fatal(.app, "unknown argument", .{ .mode = command.name, .arg = arg, .did_you_mean = log.green(near) });
+                    } else {
+                        log.fatal(.app, "unknown argument", .{ .mode = command.name, .arg = arg });
+                    }
+                    return error.UnknownOption;
+                }
+
+                // Parse positional arg if provided; can be given out of order:
+                //
+                // lightpanda fetch --wait-ms 2_000 "https://lightpanda.io" --dump "html"
+                // ---------------------------------^
+                if (comptime @hasField(@TypeOf(command), "positional")) {
+                    const positional = command.positional;
+                    const is_multiple = comptime @hasField(@TypeOf(positional), "multiple") and positional.multiple;
+
+                    // A single (non-multiple) positional may only be given once.
+                    if (!is_multiple and @field(c, positional.name) != null) {
+                        log.fatal(.app, "too many arguments", .{ .mode = command.name, .arg = option_name, .hint = helpHint(command.name) });
+                        return error.TooManyPositionalArguments;
+                    }
+
+                    // Element type: the optional's child for a single positional,
+                    // the slice element itself for a `multiple` one.
+                    const Child = if (is_multiple) positional.type else @typeInfo(positional.type).optional.child;
+                    const info = @typeInfo(Child);
+
+                    const str = @as([]const u8, option_name);
+                    switch (info) {
+                        .pointer => |pointer| {
+                            const not_u8_slice = pointer.child != u8 or pointer.size != .slice;
+                            if (not_u8_slice) {
+                                @compileError("Only []u8, []const u8, [:sentinel]u8 and [:sentinel]const u8 pointers are supported");
+                            }
+
+                            const v = blk: {
+                                // DupeZ branch.
+                                if (comptime pointer.sentinel()) |sentinel| {
+                                    const buf = try allocator.alignedAlloc(u8, .fromByteUnits(pointer.attrs.@"align" orelse @alignOf(u8)), str.len + 1);
+                                    @memcpy(buf[0..str.len], str);
+                                    buf[str.len] = sentinel;
+                                    break :blk buf[0..str.len :sentinel];
+                                }
+
+                                // Dupe branch.
+                                const buf = try allocator.alignedAlloc(u8, .fromByteUnits(pointer.attrs.@"align" orelse @alignOf(u8)), str.len);
+                                @memcpy(buf, str);
+                                break :blk buf;
+                            };
+
+                            if (is_multiple) {
+                                try @field(c, positional.name).append(allocator, v);
+                            } else {
+                                @field(c, positional.name) = v;
+                            }
+                        },
+                        .@"enum" => {
+                            const v = try parseEnum(Child, positional.name, str);
+                            if (is_multiple) {
+                                try @field(c, positional.name).append(allocator, v);
+                            } else {
+                                @field(c, positional.name) = v;
+                            }
+                        },
+                        inline else => @compileError("not supported"),
+                    }
+                } else {
+                    log.fatal(.app, "unknown argument", .{ .mode = command.name, .arg = option_name });
+                    return error.UnknownOption;
+                }
+            }
+
+            // A non-optional, single positional that is still null after parsing
+            // is missing. A `multiple` positional is never required here — the
+            // caller decides whether an empty list is acceptable.
+            if (comptime @hasField(@TypeOf(command), "positional")) {
+                const is_multiple = @hasField(@TypeOf(command.positional), "multiple") and command.positional.multiple;
+                const is_optional = @typeInfo(command.positional.type) == .optional;
+                if (!is_multiple and !is_optional and @field(c, command.positional.name) == null) {
+                    return error.MissingArgument;
+                }
+            }
+
+            return @unionInit(Union, command.name, c);
+        }
+    };
+}
+
+test "cli: completion_spec" {
+    const Strip = packed struct(u2) { js: bool = false, css: bool = false };
+    const Format = enum { html, markdown };
+    const shared = .{
+        .{ .name = "verbose", .type = bool },
+        .{ .name = "old", .type = bool, .deprecated = "gone" },
+        .{ .name = "host", .type = []const u8, .default = "0.0.0.0" },
+    };
+    const Cli = Builder(.{
+        .{
+            .name = "fetch",
+            .positional = .{ .name = "url", .type = [:0]const u8, .multiple = true },
+            .options = .{
+                .{ .name = "host", .type = []const u8, .default = "127.0.0.1" },
+                .{ .name = "dump", .type = ?Format },
+                .{ .name = "strip_mode", .type = Strip, .default = Strip{} },
+                .{ .name = "attach", .short = 'a', .type = []const u8, .multiple = true },
+                .{ .name = "wait_script", .type = ?[]const u8, .variants = .{.{ .name = "wait_script_file", .path = true }} },
+            },
+            .shared_options = shared,
+        },
+        .{ .name = "version", .options = .{} },
+    });
+
+    const spec = Cli.completion_spec;
+    try std.testing.expectEqual(3, spec.len);
+    try std.testing.expectEqualDeep(Completion.Positional{ .name = "url", .values = .any, .multiple = true }, spec[0].positional.?);
+    try std.testing.expectEqual(null, spec[1].positional);
+    try std.testing.expectEqual(0, spec[1].flags.len);
+    try std.testing.expectEqualStrings("help", spec[2].name);
+    try std.testing.expectEqualDeep(Completion.Values{ .one_of = &.{ "fetch", "version", "help" } }, spec[2].positional.?.values);
+
+    const flags = spec[0].flags;
+    const names = [_][]const u8{ "--host", "--dump", "--strip-mode", "--attach", "--wait-script", "--wait-script-file", "--verbose" };
+    try std.testing.expectEqual(names.len, flags.len);
+    for (names, flags) |name, flag| try std.testing.expectEqualStrings(name, flag.name);
+
+    try std.testing.expectEqual(.any, flags[0].values);
+    try std.testing.expectEqualDeep(Completion.Values{ .one_of = &.{ "html", "markdown" } }, flags[1].values);
+    try std.testing.expectEqualDeep(Completion.Values{ .list_of = &.{ "js", "css" } }, flags[2].values);
+    try std.testing.expectEqual('a', flags[3].short.?);
+    try std.testing.expectEqual(.any, flags[4].values);
+    try std.testing.expectEqual(.path, flags[5].values);
+    try std.testing.expectEqual(.none, flags[6].values);
+}

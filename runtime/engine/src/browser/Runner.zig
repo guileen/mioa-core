@@ -1,0 +1,751 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("js/js.zig");
+const Frame = @import("Frame.zig");
+const Browser = @import("Browser.zig");
+const Session = @import("Session.zig");
+const HttpClient = @import("../network/HttpClient.zig");
+
+const Node = @import("webapi/Node.zig");
+const Selector = @import("webapi/selector/Selector.zig");
+
+const log = lp.log;
+
+const Runner = @This();
+
+session: *Session,
+browser: *Browser,
+http_client: *HttpClient,
+
+const network_idle_hold_ms = 500;
+
+pub const Opts = struct {};
+
+pub fn init(session: *Session, _: Opts) Runner {
+    return .{
+        .session = session,
+        .browser = session.browser,
+        .http_client = &session.browser.http_client,
+    };
+}
+
+pub const WaitCondition = struct {
+    frame_id: u32,
+    until: lp.Config.WaitUntil = .done,
+    status: Status = .pending,
+
+    const Status = union(enum) {
+        pending,
+        complete,
+        err: anyerror,
+    };
+};
+
+const WaitForFrameOpts = struct {
+    until: lp.Config.WaitUntil = .done,
+};
+pub fn waitForFrame(self: *Runner, frame_id: u32, timeout_ms: u32, opts: WaitForFrameOpts) !void {
+    const condition = WaitCondition{ .frame_id = frame_id, .until = opts.until };
+    var conditions = [_]WaitCondition{condition};
+    _ = try self._wait(false, timeout_ms, &conditions);
+    try firstConditionError(&conditions);
+}
+
+pub fn waitForFrameCDP(self: *Runner, frame_id: u32, timeout_ms: u32, until: lp.Config.WaitUntil) !void {
+    const condition = WaitCondition{ .frame_id = frame_id, .until = until };
+    var conditions = [_]WaitCondition{condition};
+    // Unlike waitForFrame, we deliberately don't surface a per-frame error here.
+    // The frame we're waiting on can legitimately disappear mid-wait.
+    _ = try self._wait(true, timeout_ms, &conditions);
+}
+
+// Helper to wait for all currently loaded frames
+pub fn waitForAll(self: *Runner, timeout_ms: u32, opts: WaitForFrameOpts) !void {
+    const session = self.session;
+    const arena = try session.getArena(.tiny, "Runner.waitForAll");
+    defer arena.release();
+
+    var pages_to_wait: usize = 0;
+    for (session.pages.items) |page| {
+        if (page.replacement == null) {
+            pages_to_wait += 1;
+        }
+    }
+
+    const conditions = try arena.alloc(WaitCondition, pages_to_wait);
+    var i: usize = 0;
+    for (session.pages.items) |page| {
+        if (page.replacement == null) {
+            conditions[i] = .{ .frame_id = page.frame._frame_id, .until = opts.until };
+            i += 1;
+        }
+    }
+    _ = try self._wait(false, timeout_ms, conditions);
+    try firstConditionError(conditions);
+}
+
+pub fn wait(self: *Runner, timeout_ms: u32, conditions: []WaitCondition) !void {
+    try self._wait(false, timeout_ms, conditions);
+}
+
+pub const WaitResult = enum { completed, timeout };
+pub fn waitResult(self: *Runner, timeout_ms: u32, conditions: []WaitCondition) !WaitResult {
+    return self._wait(false, timeout_ms, conditions);
+}
+
+// Wait until either a parse-state / load goal is reached or `opts.ms`
+// elapses. Returns as soon as _tick reports .done.
+fn _wait(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []WaitCondition) !WaitResult {
+    const io = lp.io;
+    const browser = self.browser;
+
+    const timer: std.Io.Timestamp = .now(io, .boot);
+
+    // Periodic V8 GC hint during long waits. V8 is otherwise only nudged on
+    // session/page teardown (Session.zig, Page.zig), so a page that stays
+    // alive for seconds while running heavy JS accumulates wrappers and
+    // external-ref'd Zig allocations V8 has no reason to drop.
+    const gc_hint_period_ns: u64 = std.time.ns_per_s * 5;
+    var gc_hint_timer: std.Io.Timestamp = .now(io, .boot);
+
+    while (true) {
+        // The CDP path can have its session closed mid-wait: a command
+        // dispatched by the previous tick (e.g. disposeBrowserContext) can call
+        // browser.closeSession (see the `browser` field comment). So re-derive
+        // the live session each pass there and end the wait once it's gone.
+        // Non-CDP callers hold a stable session, so they skip the check.
+        const session = if (comptime is_cdp)
+            (if (browser.session) |*s| s else return .completed)
+        else
+            self.session;
+
+        // Cooperative cancellation. Set by the agent so SIGINT can break
+        // out of a long wait without the user sitting through the timeout.
+        if (session.isCancelled()) {
+            return error.Cancelled;
+        }
+
+        if (gc_hint_timer.untilNow(io, .boot).toNanoseconds() >= gc_hint_period_ns) {
+            gc_hint_timer = .now(io, .boot);
+            browser.env.memoryPressureNotification(.moderate);
+        }
+        session.processDestroyQueues();
+
+        const tick_result = self._tick(is_cdp, 200, conditions) catch |err| {
+            switch (err) {
+                error.JsError => {}, // already logged (with hopefully more context)
+                error.ClientDisconnected => {}, // CDP layer already logged this
+                else => log.err(.browser, "session wait", .{ .err = err }),
+            }
+            return err;
+        };
+
+        const next_ms = switch (tick_result) {
+            .ok => |next_ms| next_ms,
+            .done => done_blk: {
+                if (comptime is_cdp == false) {
+                    return .completed;
+                }
+
+                // is_cdp keeps the loop alive past .done so the worker
+                // can observe CDP commands. We have nothing useful to do here
+                // but we can ask the http_client to wait for CDP messages.
+                const elapsed: u32 = @intCast(timer.untilNow(io, .boot).toMilliseconds());
+                if (elapsed >= timeout_ms) {
+                    return .timeout;
+                }
+                _ = try self.http_client.tick(@min(timeout_ms - elapsed, 200));
+                break :done_blk 0;
+            },
+        };
+
+        const ms_elapsed: u32 = @intCast(timer.untilNow(io, .boot).toMilliseconds());
+        if (ms_elapsed >= timeout_ms) {
+            return .timeout;
+        }
+        if (next_ms > 0) {
+            io.sleep(.fromMilliseconds(@intCast(next_ms)), .awake) catch {};
+        }
+    }
+}
+
+const TickResult = union(enum) {
+    done,
+    ok: u32,
+};
+pub fn tickForFrame(self: *Runner, frame_id: u32, timeout_ms: u32, opts: WaitForFrameOpts) !TickResult {
+    const condition = WaitCondition{ .frame_id = frame_id, .until = opts.until };
+    var conditions = [_]WaitCondition{condition};
+    const result = try self.tick(timeout_ms, &conditions);
+    try firstConditionError(&conditions);
+    return result;
+}
+pub fn tick(self: *Runner, timeout_ms: u32, conditions: []WaitCondition) !TickResult {
+    return self._tick(false, timeout_ms, conditions);
+}
+
+fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []WaitCondition) !TickResult {
+    const session = self.session;
+    const browser = self.browser;
+    const http_client = self.http_client;
+    defer {
+        browser.flushArenaMemory();
+        browser.sampleJsHeap();
+        // A control command can dispose the session while HttpClient.tick runs.
+        // Re-resolve the live owner instead of dereferencing the old Runner lease.
+        if (browser.session) |*live_session| {
+            if (live_session.notification.hasListeners(.frame_rendering_changed)) {
+                for (live_session.pages.items) |page| {
+                    if (page.replacement != null) continue;
+                    const frame = &page.frame;
+                    switch (frame._parse_state) {
+                        .html, .complete => {},
+                        else => continue,
+                    }
+                    const revision = @import("native_layout.zig").revision(frame);
+                    if (frame._native_render_revision != revision) {
+                        frame._native_render_revision = revision;
+                        live_session.notification.dispatch(.frame_rendering_changed, frame);
+                    }
+                }
+            }
+        }
+    }
+
+    // Arms the watchdog (and proves liveness): a stall anywhere in this tick
+    // ages this stamp until the watchdog fires.
+    http_client.heartbeat.touch();
+
+    // Drain queued navigations across every live page (one page per call)
+    // A navigation can swap a frame pointer or the page set,
+    // so restart the tick to re-resolve cleanly.
+    if (try session.processQueuedNavigation()) {
+        return .{ .ok = 0 };
+    }
+
+    const has_runnable_page = hasRunnablePage(session);
+
+    if (has_runnable_page) {
+        try browser.runMacrotasks();
+    }
+
+    const activity = http_client.activity();
+    const total_http_activity = activity.http;
+
+    const network_idle = activity.idle();
+    const is_done = browser.hasMacrotasks() == false and network_idle;
+
+    // Not Frame._notified_network_idle: that latches for CDP's one-shot
+    // lifecycle event, so a frame idle once reads idle forever.
+    const network_idle_held, const network_almost_idle_held = blk: {
+        const http_idle, const http_almost_idle = http_client.idleMs();
+        break :blk .{ http_idle >= network_idle_hold_ms, http_almost_idle >= network_idle_hold_ms };
+    };
+
+    // Outside the condition loop: it skips resolved conditions, but an idle
+    // notification needs a check 500ms+ after the hold starts, and on a quiet
+    // page one tick both starts the hold and resolves the condition.
+    var page_index: usize = 0;
+    while (page_index < session.pages.items.len) : (page_index += 1) {
+        // Indexed: notifyNetworkIdle dispatches to listeners.
+        const page = session.pages.items[page_index];
+        if (page.replacement != null) continue; // frozen; the replacement is live
+        page.frame.checkIdleNotifications(total_http_activity);
+    }
+
+    // _we_ have nothing to run, but v8 is working on background tasks. We'll
+    // wait for them. Don't do this for CDP, since new CDP messages can always
+    // come in at any time.
+    if ((comptime is_cdp) == false and network_idle and browser.hasBackgroundTasks()) {
+        // We _are_ calling into v8, but these background tasks are v8-specific,
+        // meaning v8 is working, not stuck. We don't want the watchdog to kill this.
+        http_client.heartbeat.enterWait();
+        defer http_client.heartbeat.exitWait();
+        browser.waitForBackgroundTasks();
+        return .{ .ok = 0 };
+    }
+
+    var want_http_tick = false;
+
+    for (conditions) |*condition| {
+        if (condition.status != .pending) {
+            // this condition is at a terminal state
+            continue;
+        }
+
+        const page = session.pendingOrLivePage(condition.frame_id) orelse {
+            condition.status = .{ .err = error.FrameNotFound };
+            continue;
+        };
+
+        const frame = &page.frame;
+        switch (frame._parse_state) {
+            .err => |err| {
+                frame._parse_state = .{ .raw_done = @errorName(err) };
+                condition.status = .{ .err = err };
+            },
+            .raw_done => {
+                condition.status = .complete;
+            },
+            .pre, .raw, .text, .image, .download => {
+                // Includes pending: another client may hold every connection.
+                if (network_idle) {
+                    condition.status = .complete;
+                } else {
+                    want_http_tick = true;
+                }
+            },
+            .html, .complete => {
+                const met = switch (condition.until) {
+                    .done => is_done,
+                    .domcontentloaded => frame._load_state == .load or frame._load_state == .complete,
+                    .load => frame._load_state == .complete,
+                    .networkidle => network_idle_held,
+                    .networkalmostidle => network_almost_idle_held,
+                };
+
+                // `met` resolves the condition. Otherwise, as long as there's
+                // still work in flight (network or pending macrotasks), keep
+                // ticking. `is_done` means the page went fully idle without
+                // reaching the goal — there's nothing left to wait on, so
+                // resolve rather than spin forever.
+                if (met or is_done) {
+                    condition.status = .complete;
+                } else {
+                    want_http_tick = true;
+                }
+            },
+        }
+    }
+
+    // Always taken for is_cdp and every exit returns .ok, so _tick never yields
+    // .done to the CDP pump: _wait's .done/is_cdp arm is dormant.
+    if ((comptime is_cdp) or want_http_tick) {
+        const ms_to_next_task = blk: {
+            if (has_runnable_page == false) {
+                break :blk 200;
+            }
+            if (browser.foreground_task_posted.load(.acquire)) {
+                break :blk 0;
+            }
+            break :blk browser.msToNextTask() orelse 200;
+        };
+        const ms_to_wait = @min(timeout_ms, ms_to_next_task);
+
+        const waited = try http_client.tick(@intCast(ms_to_wait));
+
+        // If the HttpClient didn't wait/poll then it has nothing to do, and we
+        // should tell our callerto wait until the next task is ready.
+        if ((comptime is_cdp) == false and waited == false) {
+            return .{ .ok = @intCast(ms_to_wait) };
+        }
+        return .{ .ok = 0 };
+    }
+
+    // WebSocket often remain open forever. We can't wait for them to "complete".
+    // But, if we have web socket connections, we still want to make progress on
+    // them, so we tick with no delay.
+    if (activity.ws_conns > 0 or activity.ws_events > 0) {
+        _ = try http_client.tick(0);
+    }
+
+    return .done;
+}
+
+pub fn waitForSelector(self: *Runner, frame_id: u32, input: [:0]const u8, timeout_ms: u32) !*Node.Element {
+    const session = self.session;
+    const arena = try session.getArena(.small, "Runner.waitForSelector");
+    defer arena.release();
+
+    const timer: std.Io.Timestamp = .now(lp.io, .boot);
+    const selector = try Selector.parseLeaky(arena.allocator(), input);
+    for (selector) |s| {
+        if (!s.hasPseudoElement()) break;
+    } else return error.InvalidSelector;
+
+    while (true) {
+        if (session.isCancelled()) {
+            return error.Cancelled;
+        }
+
+        const page = session.pendingOrLivePage(frame_id) orelse {
+            return error.FrameNotFound;
+        };
+        const frame = &page.frame;
+
+        if (try Selector.query(selector, frame.document.asNode(), frame)) |el| {
+            return el;
+        }
+
+        const elapsed: u32 = @intCast(timer.untilNow(lp.io, .boot).toMilliseconds());
+        if (elapsed >= timeout_ms) {
+            return error.Timeout;
+        }
+        switch (try self.tickForFrame(frame_id, timeout_ms - elapsed, .{ .until = .done })) {
+            // Idle: poll so `timeout_ms` means "wait up to N ms", not "fail now".
+            .done => lp.io.sleep(.fromMilliseconds(@intCast(@min(timeout_ms - elapsed, 50))), .awake) catch {},
+            .ok => |recommended_sleep_ms| {
+                if (recommended_sleep_ms > 0) {
+                    lp.io.sleep(.fromMilliseconds(@intCast(recommended_sleep_ms)), .awake) catch {};
+                }
+            },
+        }
+    }
+}
+
+pub fn waitForScript(self: *Runner, frame_id: u32, src: [:0]const u8, timeout_ms: u32) !void {
+    const session = self.session;
+    const timer: std.Io.Timestamp = .now(lp.io, .boot);
+
+    // Compile the script once and re-use the compiled form. A tick can create a
+    // new context (an internal navigation), so we keep an unbound script (one
+    // not bound to a particular context) and bind it to the current context on
+    // each tick. Compilation is context-independent, so we can do it up front
+    // in whatever context the frame currently has.
+    var compiled: js.Script.Unbound.Global = blk: {
+        const page = session.pendingOrLivePage(frame_id) orelse {
+            return error.FrameNotFound;
+        };
+        const frame = &page.frame;
+
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(&ls.local);
+        defer try_catch.deinit();
+
+        const s = ls.local.compile(src, "wait_script") catch |err| {
+            const caught = try_catch.caughtOrError(frame.local_arena, err);
+            log.err(.app, "wait script error", .{ .err = caught });
+            return error.ScriptError;
+        };
+        break :blk s.getUnboundScript().persist(ls.local.isolate);
+    };
+    defer compiled.deinit();
+
+    while (true) {
+        if (session.isCancelled()) {
+            return error.Cancelled;
+        }
+
+        const page = session.pendingOrLivePage(frame_id) orelse {
+            return error.FrameNotFound;
+        };
+        const frame = &page.frame;
+
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(&ls.local);
+        defer try_catch.deinit();
+
+        const script = compiled.get(ls.local.isolate).bindToCurrentContext(&ls.local);
+        const value = script.run() catch |err| {
+            const caught = try_catch.caughtOrError(frame.local_arena, err);
+            log.err(.app, "wait script error", .{ .err = caught });
+            return error.ScriptError;
+        };
+
+        if (value.toBool()) {
+            return;
+        }
+
+        const elapsed: u32 = @intCast(timer.untilNow(lp.io, .boot).toMilliseconds());
+        if (elapsed >= timeout_ms) {
+            return error.Timeout;
+        }
+        switch (try self.tickForFrame(frame_id, timeout_ms - elapsed, .{ .until = .done })) {
+            // Idle: poll so `timeout_ms` means "wait up to N ms", not "fail now".
+            .done => lp.io.sleep(.fromMilliseconds(@intCast(@min(timeout_ms - elapsed, 50))), .awake) catch {},
+            .ok => |recommended_sleep_ms| {
+                if (recommended_sleep_ms > 0) {
+                    lp.io.sleep(.fromMilliseconds(@intCast(recommended_sleep_ms)), .awake) catch {};
+                }
+            },
+        }
+    }
+}
+
+fn firstConditionError(conditions: []const WaitCondition) !void {
+    for (conditions) |condition| {
+        switch (condition.status) {
+            .err => |err| return err,
+            else => {},
+        }
+    }
+}
+
+fn hasRunnablePage(session: *Session) bool {
+    for (session.pages.items) |page| {
+        switch (page.frame._parse_state) {
+            // An image or raw document has a JS context too: its timers and
+            // animation frames run like an HTML document's.
+            .html, .complete, .raw_done => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+const testing = @import("../testing.zig");
+test "Runner: waitForSelector timeout" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    try testing.expectError(error.Timeout, runner.waitForSelector(page.frame_id, "#nope", 10));
+}
+
+test "Runner: waitForSelector" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+
+    var runner = page.session.runner(.{});
+    const el = try runner.waitForSelector(page.frame_id, "#sel1", 10);
+    try testing.expectEqual("selector-1-content", try el.asNode().getTextContentAlloc(testing.arena_allocator));
+}
+
+test "Runner: waitForSelector pseudo-element" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    try testing.expectError(error.InvalidSelector, runner.waitForSelector(page.frame_id, "#sel1::before, ::after", 10));
+    const el = try runner.waitForSelector(page.frame_id, "#sel1::before, #sel1", 10);
+    try testing.expectEqual("selector-1-content", try el.asNode().getTextContentAlloc(testing.arena_allocator));
+}
+
+test "Runner: waitForScript timeout" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    try testing.expectError(error.Timeout, runner.waitForScript(page.frame_id, "document.querySelector('#nope')", 10));
+}
+
+test "Runner: waitForScript" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    try runner.waitForScript(page.frame_id, "document.querySelector('#sel1')", 10);
+}
+
+fn expectRunsLikeHtml(url: [:0]const u8) !void {
+    const page = try testing.test_session.createPage();
+    defer page.close();
+    try page.navigate(url, .{});
+
+    var runner = page.session.runner(.{});
+    try runner.waitForFrame(page.frame_id, 2000, .{ .until = .done });
+    {
+        var ls: js.Local.Scope = undefined;
+        page.frame().?.js.localScope(&ls);
+        defer ls.deinit();
+        try ls.local.eval(
+            \\window.__fired = [];
+            \\setTimeout(() => __fired.push('timeout'), 0);
+            \\requestAnimationFrame(() => __fired.push('raf'));
+        , null);
+    }
+    try runner.waitForScript(page.frame_id, "window.__fired.length === 2", 500);
+
+    // Seeded past the 500ms hold so the test doesn't spend it.
+    const frame = page.frame().?;
+    frame._notified_network_idle = .{ .triggered = lp.datetime.milliTimestamp(.boot) -| 600 };
+    var conditions = [_]WaitCondition{.{
+        .frame_id = page.frame_id,
+        .until = .done,
+        .status = .complete,
+    }};
+    _ = try runner._wait(true, 50, &conditions);
+    try testing.expectEqual(true, frame._notified_network_idle == .done);
+}
+
+test "Runner: text document runs timers and notifies idle" {
+    try expectRunsLikeHtml("http://127.0.0.1:9582/src/browser/tests/runner/plain.txt");
+}
+
+test "Runner: image document runs timers and notifies idle" {
+    try expectRunsLikeHtml("http://127.0.0.1:9582/images/ok.png");
+}
+
+test "Runner: networkidle notifies child frames" {
+    const page = try testing.pageTest("runner/iframe_idle.html", .{});
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    const frame = page.frame().?;
+    try testing.expectEqual(2, frame.child_frames.items.len);
+
+    // A `.networkidle` wait resolves via `is_done` once the page is fully
+    // idle, which can happen before the 500ms idle-notification hold. Keep
+    // ticking (like the CDP serve loop does) until the notifications fire,
+    // backdating each started hold so the test doesn't spend it.
+    const held_since = lp.datetime.milliTimestamp(.boot) -| 600;
+    var attempts: usize = 0;
+    while (frame._notified_network_idle != .done and attempts < 50) : (attempts += 1) {
+        const children = frame.child_frames.items;
+        for ([_]*Frame{ frame, children[0], children[1] }) |f| {
+            if (f._notified_network_idle == .triggered) f._notified_network_idle = .{ .triggered = held_since };
+            if (f._notified_network_almost_idle == .triggered) f._notified_network_almost_idle = .{ .triggered = held_since };
+        }
+        _ = try runner.tickForFrame(page.frame_id, 20, .{ .until = .networkidle });
+        lp.io.sleep(.fromMilliseconds(25), .awake) catch {};
+    }
+
+    try testing.expectEqual(true, frame._notified_network_idle == .done);
+    for (frame.child_frames.items) |child| {
+        try testing.expectEqual(true, child._notified_network_almost_idle == .done);
+        try testing.expectEqual(true, child._notified_network_idle == .done);
+    }
+}
+
+test "Runner: lazy iframe does not delay the load event" {
+    const page = try testing.pageTest("runner/iframe_lazy.html", .{ .wait_until_done = false });
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    try runner.waitForFrame(page.frame_id, 2000, .{ .until = .load });
+
+    const frame = page.frame().?;
+    try testing.expectEqual(true, frame._load_state == .complete);
+    try testing.expectEqual(2, frame.child_frames.items.len);
+
+    // The lazy child's delayed response is still in flight: the parent's
+    // load event fired without waiting for it.
+    const lazy_child = frame.child_frames.items[0];
+    try testing.expectEqual(false, lazy_child._delays_parent_load);
+    try testing.expectEqual(false, lazy_child._load_state == .complete);
+
+    // It still loads to completion and notifies the parent (which fires the
+    // iframe element's load event, but doesn't touch _pending_loads).
+    try runner.waitForFrame(page.frame_id, 3000, .{ .until = .done });
+    try testing.expectEqual(true, lazy_child._load_state == .complete);
+    try testing.expectEqual(true, lazy_child._parent_notified);
+}
+
+test "Runner: iframe that cancels its own navigation stops delaying the parent" {
+    const page = try testing.pageTest("runner/iframe_nav_cancel.html", .{ .wait_until_done = false });
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    try runner.waitForFrame(page.frame_id, 2000, .{ .until = .load });
+
+    const frame = page.frame().?;
+    try testing.expectEqual(true, frame._load_state == .complete);
+    try testing.expectEqual(0, frame._pending_loads);
+
+    // The child aborted its load for a navigation it then cancelled, so no
+    // replacement frame will ever notify the parent on its behalf.
+    const child = frame.child_frames.items[0];
+    try testing.expectEqual(true, child.document._load_aborted);
+    try testing.expectEqual(null, child._queued_navigation);
+    try testing.expectEqual(true, child._parent_notified);
+}
+
+test "Runner: idle notifications advance past a resolved condition" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+
+    // What a quiet page looks like one tick in: the hold has started, and the
+    // same tick resolved the wait condition. Seeded past the 500ms hold so the
+    // test doesn't spend it.
+    const held_since = lp.datetime.milliTimestamp(.boot) -| 600;
+    frame._notified_network_idle = .{ .triggered = held_since };
+    frame._notified_network_almost_idle = .{ .triggered = held_since };
+
+    var conditions = [_]WaitCondition{.{
+        .frame_id = page.frame_id,
+        .until = .done,
+        .status = .complete,
+    }};
+
+    // is_cdp mirrors CDP.pageWait, which keeps ticking after the condition
+    // resolves.
+    var runner = page.session.runner(.{});
+    _ = try runner._wait(true, 50, &conditions);
+
+    try testing.expectEqual(true, frame._notified_network_idle == .done);
+    try testing.expectEqual(true, frame._notified_network_almost_idle == .done);
+}
+
+test "Runner: waits out a throttled navigation" {
+    const session = testing.test_session;
+    const http_client = &session.browser.http_client;
+
+    // Enable the per-host navigation throttle for this test only, and spend
+    // 127.0.0.1's slot so the navigation below has to wait ~100ms.
+    const network = http_client.network;
+    network.rate_limiter = @import("../network/RateLimiter.zig").init(testing.allocator, 100, 1);
+    defer {
+        network.rate_limiter.?.deinit();
+        network.rate_limiter = null;
+    }
+
+    const page = try session.createPage();
+    defer page.close();
+
+    // Reserved after createPage: on a slow runner, creating the page can eat
+    // the whole interval and the navigation then goes out undelayed.
+    const start = lp.datetime.milliTimestamp(.boot);
+    _ = try network.rate_limiter.?.reserve("127.0.0.1", start);
+    try page.navigate("http://127.0.0.1:9582/src/browser/tests/runner/runner1.html", .{});
+    try testing.expectEqual(1, http_client.delayed_count);
+    // A delayed navigation is in-flight work: the wait must not resolve early.
+    try testing.expectEqual(false, http_client.activity().idle());
+
+    var runner = session.runner(.{});
+    try runner.waitForFrame(page.frame_id, 2000, .{ .until = .done });
+    const elapsed = lp.datetime.milliTimestamp(.boot) - start;
+    try testing.expectEqual(true, elapsed >= 80);
+    try testing.expectEqual(0, http_client.delayed_count);
+
+    const el = try runner.waitForSelector(page.frame_id, "#sel1", 10);
+    try testing.expectEqual("selector-1-content", try el.asNode().getTextContentAlloc(testing.arena_allocator));
+}
+
+test "Runner: networkidle waits out activity after the frame latched idle" {
+    const page = try testing.pageTest("runner/late_fetch.html", .{ .wait_until_done = false });
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    try runner.waitForFrame(page.frame_id, 2000, .{ .until = .load });
+
+    page.frame().?._notified_network_idle = .done;
+
+    const start = lp.datetime.milliTimestamp(.boot);
+    try runner.waitForFrame(page.frame_id, 3000, .{ .until = .networkidle });
+    try testing.expectEqual(true, lp.datetime.milliTimestamp(.boot) - start >= 500);
+    _ = try runner.waitForSelector(page.frame_id, "#fetched", 0);
+
+    // Already idle past the hold: a fresh wait doesn't serve it again.
+    var again = page.session.runner(.{});
+    const again_start = lp.datetime.milliTimestamp(.boot);
+    try again.waitForFrame(page.frame_id, 3000, .{ .until = .networkidle });
+    try testing.expectEqual(true, lp.datetime.milliTimestamp(.boot) - again_start < 250);
+}

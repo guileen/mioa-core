@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<!--
+  Observer callbacks are delivered from a task, so they run after the other
+  scripts have added their own marks too. Each test only looks at entries
+  with its own names.
+-->
+
+<script id="observe_performance_mark" type=module>
+{
+  const state = await testing.async();
+  const observer = new PerformanceObserver((list, observer) => {
+    observer.disconnect();
+    state.resolve({ list, observer, entries: list.getEntries() });
+  });
+
+  // Look for performance marks.
+  observer.observe({ type: "mark" });
+  performance.mark("operationStart", { startTime: 20.0 });
+  performance.mark("operationEnd", { startTime: 34.0 });
+
+  await state.done(({ list, observer: cb_observer, entries }) => {
+    testing.expectEqual(true, list instanceof PerformanceObserverEntryList);
+    testing.expectEqual(observer, cb_observer);
+    testing.expectEqual(true, entries instanceof Array);
+
+    const own = entries.filter((e) => e.name.startsWith("operation"));
+    testing.expectEqual(2, own.length);
+
+    {
+      const { name, startTime, duration, entryType } = own[0];
+      testing.expectEqual("operationStart", name);
+      testing.expectEqual(20, startTime);
+      testing.expectEqual(0, duration);
+      testing.expectEqual("mark", entryType);
+    }
+
+    {
+      const { name, startTime, duration, entryType } = own[1];
+      testing.expectEqual("operationEnd", name);
+      testing.expectEqual(34.0, startTime);
+      testing.expectEqual(0, duration);
+      testing.expectEqual("mark", entryType);
+    }
+  });
+}
+</script>
+
+<script id="microtask_access_to_list" type=module>
+  const state = await testing.async();
+
+  let savedList;
+  const promise = new Promise((resolve) => {
+    const observer = new PerformanceObserver((list, observer) => {
+      savedList = list;
+      resolve();
+      observer.disconnect();
+    });
+    observer.observe({ type: "mark" });
+    performance.mark("testMark");
+  });
+
+  await promise;
+  // force a call_depth reset, which will clear the call_arena
+  document.getElementsByTagName('*');
+
+  const entries = savedList.getEntries();
+  const entriesIsArray = entries instanceof Array;
+  const own = entries.filter((e) => e.name === "testMark");
+  const entriesLen = own.length;
+  const firstName = own[0].name;
+  const firstType = own[0].entryType;
+
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual(true, entriesIsArray);
+    testing.expectEqual(1, entriesLen);
+    testing.expectEqual("testMark", firstName);
+    testing.expectEqual("mark", firstType);
+  });
+</script>
+
+<script id="supported_entry_types">
+  // The types we implement (Chrome lists many more).
+  testing.expectEqual(['mark', 'measure', 'resource'], PerformanceObserver.supportedEntryTypes);
+</script>
+
+<script id="list_get_entries_by_type" type=module>
+{
+  const state = await testing.async();
+  const observer = new PerformanceObserver((list) => {
+    observer.disconnect();
+    const own = (type) => list.getEntriesByType(type).filter((e) => e.name.startsWith("lbt"));
+    state.resolve({
+      marks: own("mark"),
+      measures: own("measure"),
+      resources: list.getEntriesByType("resource"),
+    });
+  });
+
+  observer.observe({ entryTypes: ["mark", "measure"] });
+  performance.mark("lbt1");
+  performance.mark("lbt2");
+  performance.measure("lbtMeasure");
+
+  await state.done(({ marks, measures, resources }) => {
+    testing.expectEqual(2, marks.length);
+    testing.expectEqual("lbt1", marks[0].name);
+    testing.expectEqual("mark", marks[0].entryType);
+    testing.expectEqual("lbt2", marks[1].name);
+
+    testing.expectEqual(1, measures.length);
+    testing.expectEqual("lbtMeasure", measures[0].name);
+    testing.expectEqual("measure", measures[0].entryType);
+
+    // A type that's not observed returns an empty array.
+    testing.expectEqual(true, resources instanceof Array);
+    testing.expectEqual(0, resources.length);
+  });
+}
+</script>
+
+<script id="list_get_entries_by_name" type=module>
+{
+  const state = await testing.async();
+  const observer = new PerformanceObserver((list) => {
+    observer.disconnect();
+    state.resolve({
+      shared: list.getEntriesByName("lbnShared"),
+      sharedMark: list.getEntriesByName("lbnShared", "mark"),
+      sharedMeasure: list.getEntriesByName("lbnShared", "measure"),
+      missing: list.getEntriesByName("lbnMissing"),
+      wrongType: list.getEntriesByName("lbnOnlyMark", "measure"),
+    });
+  });
+
+  observer.observe({ entryTypes: ["mark", "measure"] });
+  performance.mark("lbnShared");
+  performance.measure("lbnShared");
+  performance.mark("lbnOnlyMark");
+
+  await state.done((r) => {
+    // Without entryType, any type matching the name is returned.
+    testing.expectEqual(true, r.shared instanceof Array);
+    testing.expectEqual(2, r.shared.length);
+
+    // With entryType, only entries of that type are returned.
+    testing.expectEqual(1, r.sharedMark.length);
+    testing.expectEqual("mark", r.sharedMark[0].entryType);
+    testing.expectEqual(1, r.sharedMeasure.length);
+    testing.expectEqual("measure", r.sharedMeasure[0].entryType);
+
+    // Name mismatch -> empty array.
+    testing.expectEqual(0, r.missing.length);
+
+    // Name matches but type doesn't -> empty array.
+    testing.expectEqual(0, r.wrongType.length);
+  });
+}
+</script>
+
+<script id="buffered_option">
+{
+  // Create marks BEFORE the observer
+  performance.mark("early1", { startTime: 1.0 });
+  performance.mark("early2", { startTime: 2.0 });
+
+  let receivedEntries = null;
+  const observer = new PerformanceObserver((list) => {
+    receivedEntries = list.getEntries().filter((e) => e.name.startsWith("early"));
+    observer.disconnect();
+  });
+
+  // With buffered: true, existing marks should be delivered
+  observer.observe({ type: "mark", buffered: true });
+
+  testing.onload(() => {
+    testing.expectEqual(true, receivedEntries !== null);
+    testing.expectEqual(2, receivedEntries.length);
+    testing.expectEqual("early1", receivedEntries[0].name);
+    testing.expectEqual("early2", receivedEntries[1].name);
+  });
+}
+</script>
+
+<script id="observe_mode_is_fixed">
+{
+  const observer = new PerformanceObserver(() => {});
+  observer.observe({ entryTypes: ["mark"] });
+  testing.expectError("InvalidModificationError", () => observer.observe({ type: "mark" }));
+  observer.disconnect();
+
+  const single = new PerformanceObserver(() => {});
+  single.observe({ type: "mark" });
+  testing.expectError("InvalidModificationError", () => single.observe({ entryTypes: ["mark"] }));
+  testing.expectError("TypeError", () => single.observe({ type: "mark", entryTypes: ["mark"] }));
+  testing.expectError("TypeError", () => single.observe({}));
+  single.disconnect();
+}
+</script>
+
+<script id="buffered_ignored_with_entry_types" type=module>
+{
+  const state = await testing.async();
+  performance.mark("before_observer");
+  // Like every engine (and unlike the spec's TypeError), buffered is
+  // ignored alongside entryTypes: no past entry is delivered.
+  let delivered = 0;
+  const observer = new PerformanceObserver((list) => { delivered += list.getEntries().length; });
+  observer.observe({ entryTypes: ["mark"], buffered: true });
+  setTimeout(() => state.resolve(), 20);
+  await state.done(() => {
+    observer.disconnect();
+    testing.expectEqual(0, delivered);
+  });
+}
+</script>

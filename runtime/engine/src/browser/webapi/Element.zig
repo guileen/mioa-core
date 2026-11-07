@@ -1,0 +1,2793 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("../js/js.zig");
+const dump = @import("../dump.zig");
+const Frame = @import("../Frame.zig");
+const Factory = @import("../Factory.zig");
+
+const Node = @import("Node.zig");
+const ShadowRoot = @import("ShadowRoot.zig");
+const TreeWalker = @import("TreeWalker.zig");
+const EventTarget = @import("EventTarget.zig");
+const collections = @import("collections.zig");
+const Sanitizer = @import("Sanitizer.zig");
+
+const Selector = @import("selector/Selector.zig");
+const Animation = @import("animation/Animation.zig");
+const CSSStyleProperties = @import("css/CSSStyleProperties.zig");
+
+const slotting = @import("element/slotting.zig");
+const DOMStringMap = @import("element/DOMStringMap.zig");
+
+pub const DOMRect = @import("DOMRect.zig");
+pub const Svg = @import("element/Svg.zig");
+pub const Html = @import("element/Html.zig");
+pub const Attribute = @import("element/Attribute.zig");
+pub const Reflect = @import("element/reflection.zig").Reflect;
+
+const log = lp.log;
+const String = lp.String;
+const Allocator = std.mem.Allocator;
+
+const Element = @This();
+
+pub const Proto = Node;
+
+pub const DatasetLookup = std.AutoHashMapUnmanaged(*Element, *DOMStringMap);
+pub const StyleLookup = std.AutoHashMapUnmanaged(*Element, *CSSStyleProperties);
+pub const ComputedStyleLookup = std.AutoHashMapUnmanaged(ComputedStyleKey, *CSSStyleProperties);
+
+pub const ComputedStyleKey = struct {
+    element: *Element,
+    pseudo: PseudoElement,
+};
+
+pub const PseudoElement = enum {
+    none,
+    before,
+    after,
+    other,
+
+    pub fn parse(pseudo: []const u8) PseudoElement {
+        if (pseudo.len == 0 or pseudo[0] != ':') {
+            return .none;
+        }
+        const name = if (std.mem.startsWith(u8, pseudo, "::")) pseudo[2..] else pseudo[1..];
+        if (std.ascii.eqlIgnoreCase(name, "before")) return .before;
+        if (std.ascii.eqlIgnoreCase(name, "after")) return .after;
+        return .other;
+    }
+};
+
+pub const ClassListLookup = std.AutoHashMapUnmanaged(*Element, *collections.DOMTokenList);
+pub const RelListLookup = std.AutoHashMapUnmanaged(*Element, *collections.DOMTokenList);
+pub const PartListLookup = std.AutoHashMapUnmanaged(*Element, *collections.DOMTokenList);
+pub const ShadowRootLookup = std.AutoHashMapUnmanaged(*Element, *ShadowRoot);
+pub const NamespaceUriLookup = std.AutoHashMapUnmanaged(*Element, []const u8);
+
+pub const ScrollPosition = struct {
+    x: u32 = 0,
+    y: u32 = 0,
+    // Throttle state for the async scroll/scrollend dispatch (mirrors
+    // Window._scroll_pos.state).
+    state: enum { scroll, end, done } = .done,
+};
+pub const ScrollPositionLookup = std.AutoHashMapUnmanaged(*Element, ScrollPosition);
+
+pub const Namespace = enum(u8) {
+    html,
+    svg,
+    mathml,
+    xml,
+    // We should keep the original value, but don't.  If this becomes important
+    // consider storing it in a frame lookup, like `_element_class_lists`, rather
+    // that adding a slice directly here (directly in every element).
+    unknown,
+    null,
+
+    pub fn toUri(self: Namespace) ?[]const u8 {
+        return switch (self) {
+            .html => "http://www.w3.org/1999/xhtml",
+            .svg => "http://www.w3.org/2000/svg",
+            .mathml => "http://www.w3.org/1998/Math/MathML",
+            .xml => "http://www.w3.org/XML/1998/namespace",
+            .unknown => "http://lightpanda.io/unsupported/namespace",
+            .null => null,
+        };
+    }
+
+    pub fn parse(namespace_: ?[]const u8) Namespace {
+        const namespace = namespace_ orelse return .null;
+        if (namespace.len == 0) {
+            return .null;
+        }
+        if (namespace.len == "http://www.w3.org/1999/xhtml".len) {
+            // Common case, avoid the string comparison. Recklessly
+            @branchHint(.likely);
+            return .html;
+        }
+        if (std.mem.eql(u8, namespace, "http://www.w3.org/XML/1998/namespace")) {
+            return .xml;
+        }
+        if (std.mem.eql(u8, namespace, "http://www.w3.org/2000/svg")) {
+            return .svg;
+        }
+        if (std.mem.eql(u8, namespace, "http://www.w3.org/1998/Math/MathML")) {
+            return .mathml;
+        }
+        return .unknown;
+    }
+};
+
+pub const Flags = packed struct(u8) {
+    shadow_host: bool = false,
+    customized_builtin: bool = false,
+
+    // Prevents nested clicks (which have a specific spec-compliant behavior
+    // compared to other events). If this bit can be more useful for something
+    // else, a stack in EventManager (for click-specifically) is an alterantive
+    // approach
+    click_in_progress: bool = false,
+
+    // The element may have inline style: a materialized entry in the frame's
+    // _element_styles, or a `style` attribute not yet materialized. Set once,
+    // never cleared. A clear bit lets the faux layout skip both the map probe
+    // and the attribute scan for the many elements that have neither.
+    has_inline_style: bool = false,
+
+    _unused: u4 = 0,
+};
+
+_type: Type,
+_namespace: Namespace = .html,
+// Presence hints for the frame's element-keyed side tables: a set bit means
+// "maybe in the map" (the map stays the authority), a clear bit skips the
+// lookup. Turns the per-element map probe in tree walks into a bit test on
+// memory the walk already touches. Fits in existing struct padding.
+_flags: Flags = .{},
+_attributes: Attribute.List = .{},
+// In debug, set so that we can check that we have a proper contiguous block
+// of memory for the entire chain (and thus, simple pointer arithmetics will
+// work to resolve the proto).
+_proto_canary: if (lp.IS_DEBUG) *Node else void = undefined,
+
+pub const Type = enum(u8) {
+    html,
+    svg,
+};
+
+pub fn Subtype(comptime tag: Type) type {
+    return switch (tag) {
+        .html => Html,
+        .svg => Svg,
+    };
+}
+
+pub fn subtype(self: *const Element, comptime T: type) *T {
+    const offset = comptime Factory.chainOffsetOf(T, T) - Factory.chainOffsetOf(T, Element);
+    const sub: *T = @ptrFromInt(@intFromPtr(self) + offset);
+    if (comptime lp.IS_DEBUG) {
+        // This pointer dance only works because the factory allocates the chain
+        // in a contiguous block of memory. In debug, we assert this holds via
+        // the _proto_canary back pointer.
+        std.debug.assert(Factory.protoOf(sub) == self);
+    }
+    return sub;
+}
+
+pub fn is(self: *Element, comptime T: type) ?*T {
+    const type_name = @typeName(T);
+    switch (self._type) {
+        .html => {
+            const el = self.subtype(Html);
+            if (T == Html) {
+                return el;
+            }
+            if (comptime std.mem.startsWith(u8, type_name, "browser.webapi.element.html.")) {
+                return el.is(T);
+            }
+        },
+        .svg => {
+            const svg = self.subtype(Svg);
+            if (T == Svg) {
+                return svg;
+            }
+            if (comptime std.mem.startsWith(u8, type_name, "browser.webapi.element.svg.")) {
+                return svg.is(T);
+            }
+        },
+    }
+    return null;
+}
+
+pub fn as(self: *Element, comptime T: type) *T {
+    return self.is(T).?;
+}
+
+pub fn getDocument(self: *Element, frame: *const Frame) *Node.Document {
+    return self.asNode().getDocument(frame);
+}
+
+pub fn asNode(self: *Element) *Node {
+    return Factory.protoOf(self);
+}
+
+pub fn asEventTarget(self: *Element) *EventTarget {
+    return self.asNode().asEventTarget();
+}
+
+pub fn asConstNode(self: *const Element) *const Node {
+    return Factory.protoOf(@constCast(self));
+}
+
+/// TODO: localName and prefix comparison.
+pub fn isEqualNode(self: *Element, other: *Element) bool {
+    const self_tag = self.getTagNameDump();
+    const other_tag = other.getTagNameDump();
+    // Compare namespaces and tags.
+    const dirty = self._namespace != other._namespace or !std.mem.eql(u8, self_tag, other_tag);
+    if (dirty) {
+        return false;
+    }
+
+    if (self._attributes.eql(&other._attributes) == false) {
+        return false;
+    }
+
+    return self.asNode().isEqualChildren(other.asNode());
+}
+
+pub fn getTagNameLower(self: *const Element) []const u8 {
+    switch (self._type) {
+        .html => {
+            const he = self.subtype(Html);
+            switch (he._type) {
+                .custom => {
+                    @branchHint(.unlikely);
+                    return he.subtype(Html.Custom)._tag_name.str();
+                },
+                else => return switch (he._type) {
+                    .anchor => "a",
+                    .area => "area",
+                    .base => "base",
+                    .body => "body",
+                    .br => "br",
+                    .button => "button",
+                    .canvas => "canvas",
+                    .custom => he.subtype(Html.Custom)._tag_name.str(),
+                    .data => "data",
+                    .datalist => "datalist",
+                    .details => "details",
+                    .dialog => "dialog",
+                    .directory => "dir",
+                    .div => "div",
+                    .dl => "dl",
+                    .embed => "embed",
+                    .fieldset => "fieldset",
+                    .font => "font",
+                    .frameset => "frameset",
+                    .form => "form",
+                    .generic => he.subtype(Html.Generic)._tag_name.str(),
+                    .heading => he.subtype(Html.Heading)._tag_name.str(),
+                    .head => "head",
+                    .html => "html",
+                    .hr => "hr",
+                    .iframe => "iframe",
+                    .img => "img",
+                    .input => "input",
+                    .label => "label",
+                    .legend => "legend",
+                    .li => "li",
+                    .link => "link",
+                    .map => "map",
+                    .marquee => "marquee",
+                    .media => switch (he.subtype(Html.Media)._type) {
+                        .audio => "audio",
+                        .video => "video",
+                        .generic => "media",
+                    },
+                    .meta => "meta",
+                    .meter => "meter",
+                    .mod => he.subtype(Html.Mod)._tag_name.str(),
+                    .object => "object",
+                    .ol => "ol",
+                    .optgroup => "optgroup",
+                    .option => "option",
+                    .output => "output",
+                    .p => "p",
+                    .picture => "picture",
+                    .param => "param",
+                    .pre => "pre",
+                    .progress => "progress",
+                    .quote => he.subtype(Html.Quote)._tag_name.str(),
+                    .script => "script",
+                    .select => "select",
+                    .slot => "slot",
+                    .source => "source",
+                    .span => "span",
+                    .style => "style",
+                    .table => "table",
+                    .table_caption => "caption",
+                    .table_cell => he.subtype(Html.TableCell)._tag_name.str(),
+                    .table_col => he.subtype(Html.TableCol)._tag_name.str(),
+                    .table_row => "tr",
+                    .table_section => he.subtype(Html.TableSection)._tag_name.str(),
+                    .template => "template",
+                    .textarea => "textarea",
+                    .time => "time",
+                    .title => "title",
+                    .track => "track",
+                    .ul => "ul",
+                    .unknown => he.subtype(Html.Unknown)._tag_name.str(),
+                },
+            }
+        },
+        .svg => return self.subtype(Svg)._tag_name.str(),
+    }
+}
+
+pub fn getTagNameSpec(self: *const Element, allocator: Allocator) []const u8 {
+    return switch (self._type) {
+        .html => blk: {
+            const he = self.subtype(Html);
+            break :blk switch (he._type) {
+                .anchor => "A",
+                .area => "AREA",
+                .base => "BASE",
+                .body => "BODY",
+                .br => "BR",
+                .button => "BUTTON",
+                .canvas => "CANVAS",
+                .custom => upperTagName(&he.subtype(Html.Custom)._tag_name, allocator),
+                .data => "DATA",
+                .datalist => "DATALIST",
+                .details => "DETAILS",
+                .dialog => "DIALOG",
+                .directory => "DIR",
+                .div => "DIV",
+                .dl => "DL",
+                .embed => "EMBED",
+                .fieldset => "FIELDSET",
+                .font => "FONT",
+                .frameset => "FRAMESET",
+                .form => "FORM",
+                .generic => upperTag(he.subtype(Html.Generic)._tag),
+                .heading => upperTag(he.subtype(Html.Heading)._tag),
+                .head => "HEAD",
+                .html => "HTML",
+                .hr => "HR",
+                .iframe => "IFRAME",
+                .img => "IMG",
+                .input => "INPUT",
+                .label => "LABEL",
+                .legend => "LEGEND",
+                .li => "LI",
+                .link => "LINK",
+                .map => "MAP",
+                .marquee => "MARQUEE",
+                .meta => "META",
+                .media => switch (he.subtype(Html.Media)._type) {
+                    .audio => "AUDIO",
+                    .video => "VIDEO",
+                    .generic => "MEDIA",
+                },
+                .meter => "METER",
+                .mod => upperTag(he.subtype(Html.Mod)._tag),
+                .object => "OBJECT",
+                .ol => "OL",
+                .optgroup => "OPTGROUP",
+                .option => "OPTION",
+                .output => "OUTPUT",
+                .p => "P",
+                .picture => "PICTURE",
+                .param => "PARAM",
+                .pre => "PRE",
+                .progress => "PROGRESS",
+                .quote => upperTag(he.subtype(Html.Quote)._tag),
+                .script => "SCRIPT",
+                .select => "SELECT",
+                .slot => "SLOT",
+                .source => "SOURCE",
+                .span => "SPAN",
+                .style => "STYLE",
+                .table => "TABLE",
+                .table_caption => "CAPTION",
+                .table_cell => upperTag(he.subtype(Html.TableCell)._tag),
+                .table_col => upperTag(he.subtype(Html.TableCol)._tag),
+                .table_row => "TR",
+                .table_section => upperTag(he.subtype(Html.TableSection)._tag),
+                .template => "TEMPLATE",
+                .textarea => "TEXTAREA",
+                .time => "TIME",
+                .title => "TITLE",
+                .track => "TRACK",
+                .ul => "UL",
+                .unknown => switch (self._namespace) {
+                    .html => upperTagName(&he.subtype(Html.Unknown)._tag_name, allocator),
+                    .svg, .xml, .mathml, .unknown, .null => he.subtype(Html.Unknown)._tag_name.str(),
+                },
+            };
+        },
+        .svg => self.subtype(Svg)._tag_name.str(),
+    };
+}
+
+pub fn getTagNameDump(self: *const Element) []const u8 {
+    switch (self._type) {
+        .html => return self.getTagNameLower(),
+        .svg => return self.subtype(Svg)._tag_name.str(),
+    }
+}
+
+pub fn getNamespaceURI(self: *const Element) ?[]const u8 {
+    return self._namespace.toUri();
+}
+
+pub fn getNamespaceUri(self: *Element, frame: *Frame) ?[]const u8 {
+    if (self._namespace != .unknown) return self._namespace.toUri();
+    return frame.page.element_namespace_uris.get(self);
+}
+
+pub fn lookupNamespaceURIForElement(self: *Element, prefix: ?[]const u8, frame: *Frame) ?[]const u8 {
+    // Hardcoded reserved prefixes
+    if (prefix) |p| {
+        if (std.mem.eql(u8, p, "xml")) return "http://www.w3.org/XML/1998/namespace";
+        if (std.mem.eql(u8, p, "xmlns")) return "http://www.w3.org/2000/xmlns/";
+    }
+
+    // Step 1: check element's own namespace/prefix
+    if (self.getNamespaceUri(frame)) |ns_uri| {
+        const el_prefix = self._prefix();
+        const match = if (prefix == null and el_prefix == null)
+            true
+        else if (prefix != null and el_prefix != null)
+            std.mem.eql(u8, prefix.?, el_prefix.?)
+        else
+            false;
+        if (match) return ns_uri;
+    }
+
+    // Step 2: search xmlns attributes
+    for (self._attributes.entries()) |*entry| {
+        if (prefix == null) {
+            if (std.mem.eql(u8, entry.name(), "xmlns")) {
+                const val = entry.value();
+                return if (val.len == 0) null else val;
+            }
+        } else {
+            const name = entry.name();
+            if (std.mem.startsWith(u8, name, "xmlns:")) {
+                if (std.mem.eql(u8, name["xmlns:".len..], prefix.?)) {
+                    const val = entry.value();
+                    return if (val.len == 0) null else val;
+                }
+            }
+        }
+    }
+
+    // Step 3: recurse to parent element
+    const parent = self.asNode().parentElement() orelse return null;
+    return parent.lookupNamespaceURIForElement(prefix, frame);
+}
+
+// Locate a namespace prefix: the inverse of lookupNamespaceURIForElement.
+// Given a namespace URI, find the prefix that declares it.
+pub fn lookupPrefixForElement(self: *Element, namespace: []const u8, frame: *Frame) ?[]const u8 {
+    // Step 1: element's own namespace/prefix
+    if (self.getNamespaceUri(frame)) |ns_uri| {
+        if (self._prefix()) |el_prefix| {
+            if (std.mem.eql(u8, ns_uri, namespace)) {
+                return el_prefix;
+            }
+        }
+    }
+
+    // Step 2: search xmlns: attribute declarations for one whose value is the namespace
+    for (self._attributes.entries()) |*entry| {
+        const name = entry.name();
+        if (std.mem.startsWith(u8, name, "xmlns:") and std.mem.eql(u8, entry.value(), namespace)) {
+            return name["xmlns:".len..];
+        }
+    }
+
+    // Step 3: recurse to parent element
+    const parent = self.asNode().parentElement() orelse return null;
+    return parent.lookupPrefixForElement(namespace, frame);
+}
+
+fn _prefix(self: *const Element) ?[]const u8 {
+    const name = self.getTagNameLower();
+    if (std.mem.findPos(u8, name, 0, ":")) |pos| {
+        return name[0..pos];
+    }
+    return null;
+}
+
+pub fn getLocalName(self: *Element) []const u8 {
+    const name = self.getTagNameLower();
+    if (std.mem.findPos(u8, name, 0, ":")) |pos| {
+        return name[pos + 1 ..];
+    }
+
+    return name;
+}
+
+// Wrapper methods that delegate to Html implementations
+pub fn getInnerText(self: *Element, writer: *std.Io.Writer, frame: *Frame) !void {
+    const he = self.is(Html) orelse return error.NotHtmlElement;
+    return he.getInnerText(writer, frame);
+}
+
+pub fn setInnerText(self: *Element, text: []const u8, frame: *Frame) !void {
+    const he = self.is(Html) orelse return error.NotHtmlElement;
+    return he.setInnerText(text, frame);
+}
+
+pub fn insertAdjacentHTML(
+    self: *Element,
+    position: []const u8,
+    html_or_xml: []const u8,
+    frame: *Frame,
+) !void {
+    const node = self.asNode();
+
+    // The parse context is the node we insert into
+    const context_node, _ = try node.findAdjacentNodes(position, .html);
+    const context = if (context_node.is(Element)) |el|
+        if (el.is(Html.Html) == null) el else null
+    else
+        null;
+
+    const fragment = (try Node.DocumentFragment.init(node.getDocument(frame), frame)).asNode();
+    try Frame.parse.fragment(frame, fragment, html_or_xml, .{ .context = context });
+
+    const target_node, const prev_node = try node.findAdjacentNodes(position, .html);
+
+    var iter = fragment.childrenIterator();
+    while (iter.next()) |child_node| {
+        _ = try target_node.insertBefore(child_node, prev_node, frame);
+    }
+}
+
+pub fn requestFullscreen(_: *const Element, frame: *Frame) js.Promise {
+    return frame.js.local.?.rejectPromise(.{ .type_error = "Fullscreen is not supported" });
+}
+
+pub fn getOuterHTML(self: *Element, writer: *std.Io.Writer, frame: *Frame) !void {
+    return dump.deep(self.asNode(), .{ .shadow = .skip }, writer, frame);
+}
+
+pub fn setOuterHTML(self: *Element, html: []const u8, frame: *Frame) !void {
+    const node = self.asNode();
+    const parent = node._parent orelse return;
+
+    // The parent of a documentElement is the Document, which cannot be modified.
+    if (parent._type == .document) {
+        return error.NoModificationAllowed;
+    }
+
+    frame.domChanged();
+
+    // Observers of the parent must see a single mutation record replacing
+    // this node with the parsed nodes.
+    const notify = Frame.observers.hasMutationObservers(frame);
+    var added: std.ArrayList(*Node) = .empty;
+
+    var fragment: ?*Node = null;
+    if (html.len > 0) {
+        const frag = (try Node.DocumentFragment.init(node.getDocument(frame), frame)).asNode();
+        // The parent is the parse context (a fragment parent means body).
+        try Frame.parse.fragment(frame, frag, html, .{ .context = parent.is(Element) });
+        fragment = frag;
+    }
+
+    // Parsing (and each insertion below) can synchronously run a custom
+    // element constructor that mutates the live tree; per the spec's replace
+    // step, a node that is no longer our parent's child cannot be replaced.
+    if (node._parent != parent) {
+        return error.NotFound;
+    }
+
+    // Captured after the parse: a constructor may have reshuffled siblings.
+    const previous_sibling = node.previousSibling();
+    const next_sibling = node.nextSibling();
+
+    if (fragment) |frag| {
+        var it = frag.childrenIterator();
+        while (it.next()) |child| {
+            if (node._parent != parent) {
+                return error.NotFound;
+            }
+            if (notify) {
+                try added.append(frame.call_arena, child);
+            }
+            frame.removeNode(frag, child, .{ .reconnect_to = parent, .notify_observers = false });
+            try frame.insertNodeRelative(parent, child, .{ .before = node }, .{ .notify_observers = false });
+        }
+    }
+
+    if (node._parent != parent) {
+        return error.NotFound;
+    }
+    frame.removeNode(parent, node, .{ .reconnect_to = null, .notify_observers = false });
+
+    if (notify) {
+        const removed = [_]*Node{node};
+        Frame.observers.notifyChildListChange(frame, parent, added.items, &removed, previous_sibling, next_sibling);
+    }
+}
+
+pub fn getInnerHTML(self: *Element, writer: *std.Io.Writer, frame: *Frame) !void {
+    return dump.children(self.asNode(), .{ .shadow = .skip }, writer, frame);
+}
+
+pub fn getHTML(self: *Element, opts: dump.Opts.Shadow.Declarative, writer: *std.Io.Writer, frame: *Frame) !void {
+    return dump.getHTML(self.asNode(), opts, writer, frame);
+}
+
+pub fn setInnerHTML(self: *Element, html: []const u8, frame: *Frame) !void {
+    const parent = self.asNode();
+    return parent.setHTML(html, .{}, frame);
+}
+
+pub fn setHTML(self: *Element, html: []const u8, options: ?Sanitizer.Options, frame: *Frame) !void {
+    return Sanitizer.setAndFilterHTML(self.htmlTarget(), self, html, options, true, frame);
+}
+
+/// allows declarative shadow dom
+pub fn setHTMLUnsafe(self: *Element, html: []const u8, options: ?Sanitizer.Options, frame: *Frame) !void {
+    return Sanitizer.setAndFilterHTML(self.htmlTarget(), self, html, options, false, frame);
+}
+
+fn htmlTarget(self: *Element) *Node {
+    if (self.is(Html.Template)) |template| {
+        return template.getContent().asNode();
+    }
+    return self.asNode();
+}
+
+pub fn getId(self: *const Element) ?[]const u8 {
+    return self.getAttributeInterned("id");
+}
+
+pub fn setId(self: *Element, value: []const u8, frame: *Frame) !void {
+    return self.setAttributeSafe(comptime .wrap("id"), .wrap(value), frame);
+}
+
+// ** INTERN ONL **. Unlike other getters, e.g. getClassName, getSlot, this
+// isn't a WebApi (some individual types DO have a name getter, but not Element).
+// BUT, enough code internally needs this, that the helper exists.
+pub fn getName(self: *const Element) ?[]const u8 {
+    return self.getAttributeInterned("name");
+}
+
+pub fn hasName(self: *const Element) bool {
+    return self.hasAttributeInterned("name");
+}
+
+pub fn getSlot(self: *const Element) ?[]const u8 {
+    return self.getAttributeSafe(comptime .wrap("slot"));
+}
+
+pub fn setSlot(self: *Element, value: []const u8, frame: *Frame) !void {
+    return self.setAttributeSafe(comptime .wrap("slot"), .wrap(value), frame);
+}
+
+pub fn getDir(self: *const Element) ?[]const u8 {
+    return self.getAttributeInterned("dir");
+}
+
+pub fn setDir(self: *Element, value: []const u8, frame: *Frame) !void {
+    return self.setAttributeSafe(comptime .wrap("dir"), .wrap(value), frame);
+}
+
+pub fn getClassName(self: *const Element) ?[]const u8 {
+    return self.getAttributeInterned("class");
+}
+
+pub fn setClassName(self: *Element, value: []const u8, frame: *Frame) !void {
+    return self.setAttributeSafe(comptime .wrap("class"), .wrap(value), frame);
+}
+
+/// DANGER: Invalidated by mutation of the attribute list.
+pub fn attributeEntries(self: *const Element) []const Attribute.List.Entry {
+    return self._attributes.entries();
+}
+
+pub fn getAttribute(self: *const Element, name: String, frame: *Frame) !?String {
+    return self._attributes.get(name, frame);
+}
+
+pub fn getAttributeNS(
+    self: *const Element,
+    namespace_: ?[]const u8,
+    local_name: String,
+    frame: *Frame,
+) !?String {
+    return self.getAttribute(try self.attributeNameNS(namespace_, local_name, frame), frame);
+}
+
+// The stored name a namespaced lookup resolves to. We don't really support
+// namespaces, but if the namespace has a fixed prefix and the prefixed
+// attribute exists, that's the one.
+pub fn attributeNameNS(self: *const Element, namespace_: ?[]const u8, local_name: String, frame: *Frame) !String {
+    if (namespace_) |namespace| {
+        if (try prefixedAttributeName(namespace, local_name.str(), frame)) |prefixed| {
+            if (try self.hasAttribute(.wrap(prefixed), frame)) {
+                return .wrap(prefixed);
+            }
+        }
+    }
+    return local_name;
+}
+
+fn prefixedAttributeName(namespace: []const u8, local_name: []const u8, frame: *Frame) !?[]const u8 {
+    const prefix = blk: {
+        if (std.mem.eql(u8, namespace, "http://www.w3.org/1999/xlink")) {
+            break :blk "xlink";
+        }
+        if (std.mem.eql(u8, namespace, "http://www.w3.org/XML/1998/namespace")) {
+            break :blk "xml";
+        }
+        if (std.mem.eql(u8, namespace, "http://www.w3.org/2000/xmlns/")) {
+            break :blk "xmlns";
+        }
+        return null;
+    };
+    return try frame.local_arena.print("{s}:{s}", .{ prefix, local_name });
+}
+
+pub fn getAttributeSafe(self: *const Element, name: String) ?[]const u8 {
+    return self._attributes.getSafe(name);
+}
+
+pub fn hasAttribute(self: *const Element, name: String, frame: *Frame) !bool {
+    const value = try self._attributes.get(name, frame);
+    return value != null;
+}
+
+pub fn hasAttributeNS(
+    self: *const Element,
+    namespace_: ?[]const u8,
+    local_name: String,
+    frame: *Frame,
+) !bool {
+    return try self.getAttributeNS(namespace_, local_name, frame) != null;
+}
+
+pub fn hasAttributeSafe(self: *const Element, name: String) bool {
+    return self._attributes.hasSafe(name);
+}
+
+// Like getAttributeSafe, but faster! Only usable for values that are String.intern
+// so that the comparison becomes a single pointer equality.
+pub fn getAttributeInterned(self: *const Element, comptime name: []const u8) ?[]const u8 {
+    return self._attributes.getInterned(name);
+}
+
+pub fn hasAttributeInterned(self: *const Element, comptime name: []const u8) bool {
+    return self._attributes.hasInterned(name);
+}
+
+// Per HTML "concept-fe-disabled", only listed elements participate in the
+// disabled concept. Anything else (e.g. <div disabled>) has no disabled
+// state and never matches :disabled / :enabled.
+pub fn hasDisabledConcept(self: *const Element) bool {
+    return switch (self.getTag()) {
+        .button, .input, .select, .textarea, .optgroup, .option, .fieldset => true,
+        .custom => {
+            const custom = @constCast(self).is(Html.Custom) orelse return false;
+            return custom.isFormAssociated();
+        },
+        else => false,
+    };
+}
+
+pub fn isDisabled(self: *const Element) bool {
+    if (!self.hasDisabledConcept()) {
+        return false;
+    }
+
+    if (self.getAttributeInterned("disabled") != null) {
+        return true;
+    }
+
+    // <option> takes a different inheritance path: per HTML
+    // "concept-option-disabled" an option is disabled when its parent is an
+    // <optgroup disabled>. It does NOT inherit from <select disabled> or
+    // an ancestor <fieldset disabled>.
+    if (self.getTag() == .option) {
+        if (self.asConstNode()._parent) |parent_node| {
+            if (parent_node.is(Element)) |parent_el| {
+                if (parent_el.getTag() == .optgroup and
+                    parent_el.getAttributeInterned("disabled") != null)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    const element_node = self.asConstNode();
+    var current: ?*Node = element_node._parent;
+    while (current) |node| {
+        current = node._parent;
+        const ancestor = node.is(Element) orelse continue;
+
+        if (ancestor.getTag() == .fieldset and ancestor.getAttributeInterned("disabled") != null) {
+            var child = ancestor.firstElementChild();
+            while (child) |c| {
+                if (c.getTag() == .legend) {
+                    if (c.asNode().contains(element_node)) return false;
+                    break;
+                }
+                child = c.nextElementSibling();
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn hasAttributes(self: *const Element) bool {
+    return self._attributes.isEmpty() == false;
+}
+
+pub fn getAttributeNode(self: *Element, name: String, frame: *Frame) !?*Attribute {
+    return self._attributes.getAttribute(name, self, frame);
+}
+
+pub fn getAttributeNodeNS(self: *Element, namespace_: ?[]const u8, local_name: String, frame: *Frame) !?*Attribute {
+    return self.getAttributeNode(try self.attributeNameNS(namespace_, local_name, frame), frame);
+}
+
+pub fn setAttribute(self: *Element, name: String, value: String, frame: *Frame) !void {
+    try Attribute.validateAttributeName(name);
+    _ = try self._attributes.put(name, value, self, frame);
+}
+
+pub fn setAttributeNS(
+    self: *Element,
+    namespace_: ?[]const u8,
+    qualified_name: []const u8,
+    value: String,
+    frame: *Frame,
+) !void {
+    const local_start = if (std.mem.findScalarPos(u8, qualified_name, 0, ':')) |idx| blk: {
+        if (idx == 0 or idx == qualified_name.len - 1) {
+            // cannot be at the start or end of the qname
+            return error.InvalidCharacterError;
+        }
+        if (std.mem.findScalarPos(u8, qualified_name, idx + 1, ':') != null) {
+            // and can only have one
+            return error.InvalidCharacterError;
+        }
+        break :blk idx + 1;
+    } else 0;
+
+    const attr_name = if (namespace_ != null) qualified_name else qualified_name[local_start..];
+    return self.setAttribute(.wrap(attr_name), value, frame);
+}
+
+pub fn setAttributeSafe(self: *Element, name: String, value: String, frame: *Frame) !void {
+    _ = try self._attributes.putSafe(name, value, self, frame);
+}
+
+pub fn getShadowRoot(self: *Element, frame: *Frame) ?*ShadowRoot {
+    const shadow_root = self.hostedShadowRoot(frame) orelse return null;
+    if (shadow_root._mode == .closed) return null;
+    return shadow_root;
+}
+
+pub fn getAssignedSlot(self: *Element, frame: *Frame) ?*Html.Slot {
+    // Hidden by a closed shadow tree
+    return slotting.findSlot(self.asNode(), true, frame);
+}
+
+// Whether this element may host a shadow root
+fn isValidShadowHost(self: *const Element) bool {
+    if (self._namespace != .html) {
+        return false;
+    }
+
+    return switch (self.getTag()) {
+        .article, .aside, .blockquote, .body, .div, .footer, .header, .main, .nav, .p, .section, .span, .h1, .h2, .h3, .h4, .h5, .h6, .custom => true,
+        else => false,
+    };
+}
+
+pub fn attachShadow(self: *Element, opts: ShadowRoot.AttachOptions, frame: *Frame) !*ShadowRoot {
+    if (!self.isValidShadowHost()) {
+        return error.NotSupported;
+    }
+
+    // A custom element whose definition lists "shadow" in disabledFeatures
+    // cannot host a shadow root (imperative or declarative).
+    if (self.is(Html.Custom)) |custom| {
+        if (frame.window._custom_elements._definitions.get(custom._tag_name.str())) |def| {
+            if (def.disable_shadow) {
+                return error.NotSupported;
+            }
+        }
+    }
+
+    if (self.hostedShadowRoot(frame)) |existing| {
+        // Imperative attachShadow over a declarative shadow root with a matching
+        // mode empties it and returns the same root. The parser
+        // (opts.declarative) never replaces an existing root.
+        if (opts.declarative or !existing._declarative or existing._mode != opts.mode) {
+            return error.NotSupported;
+        }
+        try existing.asNode().replaceChildren(&.{}, frame);
+        existing._declarative = false;
+        return existing;
+    }
+
+    const shadow_root = try ShadowRoot.init(self, opts, frame);
+    shadow_root._available_to_internals = opts.declarative or blk: {
+        const custom = self.is(Html.Custom) orelse break :blk false;
+        break :blk custom._definition != null;
+    };
+    const page = frame.page;
+    try page.element_shadow_roots.put(page.arena, self, shadow_root);
+    self._flags.shadow_host = true;
+    return shadow_root;
+}
+
+// The shadow root this element hosts, closed ones included (the JS-facing
+// getShadowRoot filters those). The flag check skips the map probe for the
+// overwhelming majority of elements, which host nothing.
+pub fn hostedShadowRoot(self: *Element, frame: *const Frame) ?*ShadowRoot {
+    if (!self._flags.shadow_host) {
+        return null;
+    }
+    return frame.page.element_shadow_roots.get(self);
+}
+
+pub fn insertAdjacentElement(
+    self: *Element,
+    position: []const u8,
+    element: *Element,
+    frame: *Frame,
+) !?*Element {
+    const target_node, const prev_node = self.asNode().findAdjacentNodes(position, .node) catch |err| switch (err) {
+        // beforebegin/afterend with no parent is a no-op returning null.
+        error.AdjacentNoParent => return null,
+        else => return err,
+    };
+    _ = try target_node.insertBefore(element.asNode(), prev_node, frame);
+    return element;
+}
+
+pub fn insertAdjacentText(
+    self: *Element,
+    where: []const u8,
+    data: []const u8,
+    frame: *Frame,
+) !void {
+    const target_node, const prev_node = self.asNode().findAdjacentNodes(where, .node) catch |err| switch (err) {
+        // beforebegin/afterend with no parent is a no-op.
+        error.AdjacentNoParent => return,
+        else => return err,
+    };
+    const text_node = try Frame.node_factory.createTextNode(self.getDocument(frame), data);
+    _ = try target_node.insertBefore(text_node, prev_node, frame);
+}
+
+pub fn setAttributeNode(self: *Element, attr: *Attribute, frame: *Frame) !?*Attribute {
+    if (attr._element) |el| {
+        if (el == self) {
+            return attr;
+        }
+        return error.InUseAttribute;
+    }
+
+    return self._attributes.putAttribute(attr, self, frame);
+}
+
+pub fn removeAttribute(self: *Element, name: String, frame: *Frame) !void {
+    return self._attributes.delete(name, self, frame);
+}
+
+pub fn removeAttributeNS(self: *Element, namespace_: ?[]const u8, local_name: String, frame: *Frame) !void {
+    return self.removeAttribute(try self.attributeNameNS(namespace_, local_name, frame), frame);
+}
+
+pub fn removeAttributeSafe(self: *Element, name: String, frame: *Frame) void {
+    self._attributes.deleteSafe(name, self, frame);
+}
+
+pub fn toggleAttribute(self: *Element, name: String, force: ?bool, frame: *Frame) !bool {
+    try Attribute.validateAttributeName(name);
+    const has = try self.hasAttribute(name, frame);
+
+    const should_add = force orelse !has;
+
+    if (should_add and !has) {
+        try self.setAttribute(name, String.empty, frame);
+        return true;
+    } else if (!should_add and has) {
+        try self.removeAttribute(name, frame);
+        return false;
+    }
+
+    return should_add;
+}
+
+pub fn removeAttributeNode(self: *Element, attr: *Attribute, frame: *Frame) !*Attribute {
+    if (attr._element == null or attr._element.? != self) {
+        return error.NotFound;
+    }
+    try self.removeAttribute(attr._name, frame);
+    attr._element = null;
+    return attr;
+}
+
+pub fn getAttributeNames(self: *const Element, frame: *Frame) ![][]const u8 {
+    return self._attributes.getNames(frame.local_arena);
+}
+
+pub fn getAttributeNamedNodeMap(self: *Element, frame: *Frame) !*Attribute.NamedNodeMap {
+    const page = frame.page;
+    const gop = try page.attribute_named_node_map_lookup.getOrPut(page.arena, @intFromPtr(self));
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try frame._factory.create(Attribute.NamedNodeMap{ ._element = self });
+    }
+    return gop.value_ptr.*;
+}
+
+// The materialized style is built with the element's own frame, not the
+// caller's: a same-origin script can reach an element in another frame.
+pub fn getOrCreateStyle(self: *Element, frame: *Frame) !*CSSStyleProperties {
+    const owner = self.ownerFrame(frame) orelse frame;
+    const page = frame.page;
+    const gop = try page.element_styles.getOrPut(page.arena, self);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try CSSStyleProperties.init(self, false, owner);
+    }
+    self._flags.has_inline_style = true;
+    return gop.value_ptr.*;
+}
+
+pub fn existingStyle(self: *Element, frame: *Frame) ?*CSSStyleProperties {
+    if (!self._flags.has_inline_style) {
+        return null;
+    }
+    return frame.page.element_styles.get(self);
+}
+
+/// The inline style object, parsed from the style attribute on first use;
+/// null when the element has neither.
+pub fn inlineStyle(self: *Element, frame: *Frame) ?*CSSStyleProperties {
+    if (!self._flags.has_inline_style) {
+        return null;
+    }
+    if (self.existingStyle(frame)) |style| {
+        return style;
+    }
+    if (self.getAttributeInterned("style") == null) {
+        return null;
+    }
+    return self.getOrCreateStyle(frame) catch |err| {
+        log.err(.browser, "inline style parse", .{ .err = err });
+        return null;
+    };
+}
+
+// Marks the element as possibly having inline style once a `style` attribute
+// lands on it. Attribute population paths that bypass attributeChange (the
+// parser, cloneNode) call this after filling the list.
+pub fn noteStyleAttribute(self: *Element) void {
+    if (self._attributes.hasSafe(comptime .wrap("style"))) {
+        self._flags.has_inline_style = true;
+    }
+}
+
+pub fn setStyle(self: *Element, value: []const u8, frame: *Frame) !void {
+    const style = try self.getOrCreateStyle(frame);
+    try style.asCSSStyleDeclaration().setCssText(value, frame);
+}
+
+pub fn getClassList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
+    const page = frame.page;
+    const gop = try page.element_class_lists.getOrPut(page.arena, self);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
+            ._element = self,
+            ._attribute = .class,
+        });
+    }
+    return gop.value_ptr.*;
+}
+
+pub fn setClassList(self: *Element, value: String, frame: *Frame) !void {
+    const class_list = try self.getClassList(frame);
+    try class_list.setValue(value, frame);
+}
+
+pub fn setPartList(self: *Element, value: String, frame: *Frame) !void {
+    const part_list = try self.getPartList(frame);
+    try part_list.setValue(value, frame);
+}
+
+pub fn getPartList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
+    const page = frame.page;
+    const gop = try page.element_part_lists.getOrPut(page.arena, self);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
+            ._element = self,
+            ._attribute = .part,
+        });
+    }
+    return gop.value_ptr.*;
+}
+
+pub fn getRelList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
+    const page = frame.page;
+    const gop = try page.element_rel_lists.getOrPut(page.arena, self);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
+            ._element = self,
+            ._attribute = .rel,
+        });
+    }
+    return gop.value_ptr.*;
+}
+
+// The other DOMTokenList-reflected attributes (class and rel have dedicated
+// lookups above).
+pub const TokenListAttribute = enum { sizes, sandbox, @"for" };
+pub const TokenListKey = struct { element: *Element, attribute: TokenListAttribute };
+pub const TokenListLookup = std.AutoHashMapUnmanaged(TokenListKey, *collections.DOMTokenList);
+
+pub fn getTokenList(self: *Element, comptime attribute: TokenListAttribute, frame: *Frame) !*collections.DOMTokenList {
+    const page = frame.page;
+    const gop = try page.element_token_lists.getOrPut(page.arena, .{ .element = self, .attribute = attribute });
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
+            ._element = self,
+            ._attribute = @field(collections.DOMTokenList.Attribute, @tagName(attribute)),
+        });
+    }
+    return gop.value_ptr.*;
+}
+
+pub fn getDataset(self: *Element, frame: *Frame) !*DOMStringMap {
+    const page = frame.page;
+    const gop = try page.element_datasets.getOrPut(page.arena, self);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try frame._factory.create(DOMStringMap{
+            ._element = self,
+        });
+    }
+    return gop.value_ptr.*;
+}
+
+pub fn replaceChildren(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().replaceChildren(nodes.values, frame);
+}
+
+pub fn replaceWith(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().replaceWithNodes(nodes.values, frame);
+}
+
+pub fn remove(self: *Element, frame: *Frame) void {
+    const node = self.asNode();
+    const parent = node._parent orelse return;
+    frame.domChanged();
+    frame.removeNode(parent, node, .{ .reconnect_to = null });
+}
+
+// SVG 2 <a> links via `href`; xlink:href is the deprecated SVG 1.1 spelling.
+pub fn svgAnchorHref(self: *Element) ?[]const u8 {
+    return self.getAttributeInterned("href") orelse self.getAttributeSafe(comptime .wrap("xlink:href"));
+}
+
+pub fn isSvgLink(self: *Element) bool {
+    return self.is(Svg.Graphics.A) != null and self.svgAnchorHref() != null;
+}
+
+// An editing host takes focus like a form control does.
+pub fn isEditingHost(self: *Element) bool {
+    const value = self.getAttributeInterned("contenteditable") orelse return false;
+    return std.ascii.eqlIgnoreCase(value, "false") == false;
+}
+
+// An editing host or a descendant of one: the nearest contenteditable
+// attribute decides.
+pub fn isEditable(self: *Element) bool {
+    var current: ?*Element = self;
+    while (current) |el| : (current = el.parentElement()) {
+        if (el.getAttributeInterned("contenteditable") != null) {
+            return el.isEditingHost();
+        }
+    }
+    return false;
+}
+
+/// Native input ancestry includes shadow hosts and the iframe embedding chain.
+pub fn isInteractionAncestor(self: *Element, target: ?*Element, frame: *Frame) bool {
+    const element = target orelse return false;
+    var current = element.asNode();
+    var owner = element.ownerFrame(frame) orelse return false;
+    while (true) {
+        if (current == self.asNode()) return true;
+        if (current.parentNode()) |parent| {
+            current = parent;
+            continue;
+        }
+        if (current.is(Node.ShadowRoot)) |shadow| {
+            current = shadow._host.asNode();
+            continue;
+        }
+        if (owner == frame) return false;
+        const iframe = owner.iframe orelse return false;
+        const embedding = iframe.asElement();
+        current = embedding.asNode();
+        owner = embedding.ownerFrame(owner) orelse return false;
+    }
+}
+
+pub fn hasVisibleFocus(self: *Element, frame: *Frame) bool {
+    const owner = self.ownerFrame(frame) orelse return false;
+    if (owner.document._active_element != self) return false;
+    if (owner.page.input_keyboard_modality or self.isEditable() or self.is(Html.TextArea) != null) return true;
+    if (self.is(Html.Input)) |input| {
+        for ([_][]const u8{ "text", "search", "tel", "url", "email", "password", "number" }) |kind| {
+            if (std.mem.eql(u8, input.getType(), kind)) return true;
+        }
+    }
+    return false;
+}
+
+/// Focusable without a tabindex attribute.
+fn isNativelyFocusable(self: *Element) bool {
+    if (self.is(Html) == null) {
+        return self.isSvgLink();
+    }
+
+    return switch (self.getTag()) {
+        .button, .select, .textarea, .iframe => true,
+        .input => self.as(Html.Input)._input_type != .hidden,
+        .a, .area => self.getAttributeInterned("href") != null,
+        else => false,
+    };
+}
+
+// The tabindex of a focusable area, or null when the element can't take focus
+// at all. A negative value is still focusable, just skipped by sequential
+// focus navigation.
+// https://html.spec.whatwg.org/multipage/interaction.html#focusable-area
+pub fn focusTabIndex(self: *Element) ?i32 {
+    if (self.isDisabled()) {
+        return null;
+    }
+
+    if (self.getAttributeInterned("tabindex")) |attr| {
+        if (Html.parseInteger(attr)) |tab_index| {
+            return tab_index;
+        } else {
+            // can't be parsed is treated the same as no tabindex
+        }
+    }
+
+    if (self.isNativelyFocusable() or self.isEditingHost()) {
+        return 0;
+    }
+    return null;
+}
+
+// A focusable area that can take focus right now: connected, not inert and
+// being rendered.
+pub fn isFocusable(self: *Element, frame: *Frame) bool {
+    if (self.focusTabIndex() == null) {
+        return false;
+    }
+    const node = self.asNode();
+    if (node.isConnected() == false) {
+        return false;
+    }
+    if (node.isInert(frame)) {
+        return false;
+    }
+    return self.isVisible(frame);
+}
+
+pub fn focus(self: *Element, frame: *Frame) !void {
+    if (self.asNode().isConnected() == false) {
+        // a disconnected node cannot take focus
+        return;
+    }
+
+    const owner = self.ownerFrame(frame) orelse return;
+    const already_active = owner.document._active_element == self;
+    if (already_active == false and self.isFocusable(owner) == false) {
+        return;
+    }
+
+    try focusFrameAncestors(owner);
+
+    if (already_active) {
+        return;
+    }
+
+    const doc = owner.document;
+    const old_active = doc._active_element;
+    const new_target = self.asEventTarget();
+    doc.setActiveElement(self, owner);
+
+    const old_related: ?*EventTarget = if (old_active) |old| try blurFocusedArea(old, new_target, owner) else null;
+
+    const FocusEvent = @import("event/FocusEvent.zig");
+
+    // Dispatch focus on new element (no bubble, composed)
+    const focus_event = try FocusEvent.initTrusted(comptime .wrap("focus"), .{ .composed = true, .relatedTarget = old_related }, owner);
+    try owner._event_manager.dispatch(new_target, focus_event.asEvent());
+
+    // Dispatch focusin on new element (bubbles, composed)
+    const focusin_event = try FocusEvent.initTrusted(comptime .wrap("focusin"), .{ .bubbles = true, .composed = true, .relatedTarget = old_related }, owner);
+    try owner._event_manager.dispatch(new_target, focusin_event.asEvent());
+}
+
+/// Establish the iframe containers of a focused element or document viewport.
+pub fn focusFrameAncestors(owner: *Frame) !void {
+    // The focus chain runs through navigable containers: each <iframe> holding
+    // the focused document is the focused area of its parent document, so the
+    // parent's activeElement is that <iframe>. Like Chrome, ancestors blur
+    // their previous element first, and the <iframe> itself gets no focus events.
+    // https://html.spec.whatwg.org/multipage/interaction.html#focus-chain
+    var child = owner;
+    while (child.iframe) |container| {
+        const parent = child.parent orelse break;
+        const parent_doc = parent.document;
+        const old = parent_doc._active_element;
+        if (old == container.asElement()) {
+            break;
+        }
+        parent_doc.setActiveElement(container.asElement(), parent);
+        if (old) |o| {
+            _ = try blurFocusedArea(o, null, parent);
+        }
+        child = parent;
+    }
+}
+
+// `old` just lost focus in `frame`'s document. When it's an <iframe> holding
+// the focus chain, the element focused inside it is what blurs (and its
+// document's activeElement is cleared); the <iframe> itself gets no events.
+// Returns the relatedTarget for the element taking focus: the blurred element,
+// unless it was in another document.
+fn blurFocusedArea(old: *Element, related: ?*EventTarget, frame: *Frame) !?*EventTarget {
+    var el = old;
+    var el_frame = frame;
+    var el_related = related;
+    while (el.is(Html.IFrame)) |iframe| {
+        const window = iframe._window orelse break;
+        const child = window._frame;
+        const inner = child.document._active_element orelse return null;
+        child.document.setActiveElement(null, child);
+        el = inner;
+        el_frame = child;
+        // relatedTarget doesn't cross documents
+        el_related = null;
+    }
+    try dispatchBlur(el, el_related, el_frame);
+    return if (el_frame == frame) el.asEventTarget() else null;
+}
+
+// Dispatches blur (no bubble) then focusout (bubbles) on `old`, which just lost focus.
+fn dispatchBlur(old: *Element, related: ?*EventTarget, frame: *Frame) !void {
+    const FocusEvent = @import("event/FocusEvent.zig");
+    const old_target = old.asEventTarget();
+
+    if (old.is(Html.Input)) |input| {
+        try input.dispatchChangeIfEdited(frame);
+    } else if (old.is(Html.TextArea)) |textarea| {
+        try textarea.dispatchChangeIfEdited(frame);
+    }
+
+    const blur_event = try FocusEvent.initTrusted(comptime .wrap("blur"), .{ .composed = true, .relatedTarget = related }, frame);
+    try frame._event_manager.dispatch(old_target, blur_event.asEvent());
+
+    const focusout_event = try FocusEvent.initTrusted(comptime .wrap("focusout"), .{ .bubbles = true, .composed = true, .relatedTarget = related }, frame);
+    try frame._event_manager.dispatch(old_target, focusout_event.asEvent());
+}
+
+pub fn blur(self: *Element, frame: *Frame) !void {
+    // A frameless document never has a focused element.
+    const owner = self.ownerFrame(frame) orelse return;
+    const doc = owner.document;
+    if (doc._active_element != self) return;
+
+    doc.setActiveElement(null, owner);
+    _ = try blurFocusedArea(self, null, owner);
+}
+
+pub fn getChildren(self: *Element, frame: *Frame) !collections.NodeLive(.child_elements) {
+    return collections.NodeLive(.child_elements).init(self.asNode(), {}, frame);
+}
+
+pub fn append(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().appendNodes(nodes.values, frame);
+}
+
+pub fn prepend(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().prependNodes(nodes.values, frame);
+}
+
+pub fn moveBefore(self: *Element, node: js.Value, child: js.Value, frame: *Frame) !void {
+    return self.asNode().moveBefore(node, child, frame);
+}
+
+pub fn before(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    const node = self.asNode();
+    const parent = node.parentNode() orelse return;
+
+    for (nodes.values) |node_or_text| {
+        const child = try node_or_text.toNode(self.getDocument(frame));
+        _ = try parent.insertBefore(child, node, frame);
+    }
+}
+
+pub fn after(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    const node = self.asNode();
+    const parent = node.parentNode() orelse return;
+    const viable_next = Node.NodeOrText.viableNextSibling(node, nodes.values);
+
+    for (nodes.values) |node_or_text| {
+        const child = try node_or_text.toNode(self.getDocument(frame));
+        _ = try parent.insertBefore(child, viable_next, frame);
+    }
+}
+
+pub fn firstElementChild(self: *Element) ?*Element {
+    var maybe_child = self.asNode().firstChild();
+    while (maybe_child) |child| {
+        if (child.is(Element)) |el| return el;
+        maybe_child = child.nextSibling();
+    }
+    return null;
+}
+
+pub fn lastElementChild(self: *Element) ?*Element {
+    var maybe_child = self.asNode().lastChild();
+    while (maybe_child) |child| {
+        if (child.is(Element)) |el| return el;
+        maybe_child = child.previousSibling();
+    }
+    return null;
+}
+
+pub fn nextElementSibling(self: *Element) ?*Element {
+    var maybe_sibling = self.asNode().nextSibling();
+    while (maybe_sibling) |sibling| {
+        if (sibling.is(Element)) |el| return el;
+        maybe_sibling = sibling.nextSibling();
+    }
+    return null;
+}
+
+pub fn previousElementSibling(self: *Element) ?*Element {
+    var maybe_sibling = self.asNode().previousSibling();
+    while (maybe_sibling) |sibling| {
+        if (sibling.is(Element)) |el| return el;
+        maybe_sibling = sibling.previousSibling();
+    }
+    return null;
+}
+
+pub fn getChildElementCount(self: *Element) usize {
+    var count: usize = 0;
+    var it = self.asNode().childrenIterator();
+    while (it.next()) |node| {
+        if (node.is(Element) != null) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+pub fn matches(self: *Element, selector: []const u8, frame: *Frame) !bool {
+    return Selector.matches(self, selector, frame) catch |err| Selector.mapErrorToDOM(err);
+}
+
+pub fn querySelector(self: *Element, selector: []const u8, frame: *Frame) !?*Element {
+    return Selector.querySelector(self.asNode(), selector, frame) catch |err| Selector.mapErrorToDOM(err);
+}
+
+pub fn querySelectorAll(self: *Element, input: []const u8, frame: *Frame) !*Selector.List {
+    return Selector.querySelectorAll(self.asNode(), input, frame) catch |err| Selector.mapErrorToDOM(err);
+}
+
+pub fn getAnimations(_: *const Element) []*Animation {
+    return &.{};
+}
+
+pub fn animate(_: *Element, _: ?js.Object, _: ?js.Object, frame: *Frame) !*Animation {
+    const animation = try Animation.init(frame);
+    try animation.play(frame);
+    return animation;
+}
+
+pub fn closest(self: *Element, input: []const u8, frame: *Frame) !?*Element {
+    if (input.len == 0) {
+        return error.SyntaxError;
+    }
+
+    const selector = try Selector.cachedParse(frame._session.browser, input);
+
+    var current: ?*Element = self;
+    while (current) |el| {
+        if (try Selector.matchesWithScope(el, selector, self, frame)) {
+            return el;
+        }
+
+        const parent = el.asNode()._parent orelse break;
+
+        if (parent.is(ShadowRoot) != null) {
+            break;
+        }
+
+        current = parent.is(Element);
+    }
+    return null;
+}
+
+pub fn parentElement(self: *Element) ?*Element {
+    return self.asNode().parentElement();
+}
+
+// Style checks go through the StyleManager of the element's own frame, not
+// the caller's: its stylesheets and materialized inline styles are per-frame,
+// and a same-origin script can reach an element in another frame.
+pub fn hasPointerEventsNone(self: *Element, frame: *Frame) bool {
+    const owner = self.ownerFrame(frame) orelse return false;
+    return owner._style_manager.hasPointerEventsNone(self);
+}
+
+pub fn isVisible(self: *Element, frame: *Frame) bool {
+    const owner = self.ownerFrame(frame) orelse return false;
+    return !owner._style_manager.isHidden(self, .{});
+}
+
+const CheckVisibilityOpts = struct {
+    checkOpacity: bool = false,
+    checkVisibilityCSS: bool = false,
+    opacityProperty: bool = false,
+    visibilityProperty: bool = false,
+};
+
+pub fn checkVisibility(self: *Element, opts_: ?CheckVisibilityOpts, frame: *Frame) bool {
+    const opts = opts_ orelse CheckVisibilityOpts{};
+    const owner = self.ownerFrame(frame) orelse return false;
+    return !owner._style_manager.isHidden(self, .{
+        .check_opacity = opts.checkOpacity or opts.opacityProperty,
+        .check_visibility = opts.visibilityProperty or opts.checkVisibilityCSS,
+    });
+}
+
+pub const Axis = enum {
+    width,
+    height,
+
+    // The axis' value, and whether it's explicit or the default
+    pub const State = struct {
+        value: f64,
+        explicit: bool = false,
+    };
+};
+
+fn nativeMetrics(self: *Element, frame: *Frame) @import("../native_layout.zig").Metrics {
+    const owner = self.ownerFrame(frame) orelse return .{};
+    return @import("../native_layout.zig").metrics(self, owner) catch |err| {
+        log.err(.browser, "native layout metrics", .{ .err = err });
+        return .{};
+    };
+}
+
+pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.State {
+    const metrics = self.nativeMetrics(frame);
+    return .{ .value = @field(metrics, @tagName(axis)), .explicit = true };
+}
+
+// The document's <html>, or a <body> under it. These span the document and
+// scroll the viewport. A script can insert these tags anywhere, and a nested
+// one gets treated as a normal element.
+pub fn isRootContainer(self: *const Element) bool {
+    const parent = self.asConstNode().parentNode() orelse return false;
+    return switch (self.getTag()) {
+        .html => parent._type == .document,
+        .body => {
+            const html = parent.is(Element) orelse return false;
+            return html.getTag() == .html and html.isRootContainer();
+        },
+        else => false,
+    };
+}
+
+pub fn getClientWidth(self: *Element, frame: *Frame) f64 {
+    return self.clientAxis(frame, .width);
+}
+
+pub fn getClientHeight(self: *Element, frame: *Frame) f64 {
+    return self.clientAxis(frame, .height);
+}
+
+fn clientAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+    if (!self.isVisible(frame)) {
+        return 0.0;
+    }
+    const metrics = self.nativeMetrics(frame);
+    return self.viewportAxis(frame, axis) orelse if (axis == .width) metrics.client_width else metrics.client_height;
+}
+
+/// Document.scrollSize, when self is the root scroller (see viewportAxis).
+fn rootScrollSize(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
+    _ = self.viewportAxis(frame, axis) orelse return null;
+    const doc = self.asNode().ownerDocument(frame) orelse return null;
+    return @field(doc.scrollSize(), @tagName(axis));
+}
+
+fn viewportAxis(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
+    if (!self.isRootContainer()) {
+        return null;
+    }
+    const tag = self.getTag();
+    const doc = self.asNode().ownerDocument(frame) orelse frame.document;
+    if ((tag == .body) != doc.isQuirksMode()) {
+        return null;
+    }
+    // In quicks mode, the root element (the body) reports the viewport for
+    // clientWidth and clientHeight rather than its own MASSIVE box. This
+    // fixes jstracker's uiContourMap which attempts to tile the clientHeight
+    // of the body. (https://github.com/lightpanda-io/browser/issues/3251)
+    const viewport = @import("../native_layout.zig").viewport(frame);
+    return @floatFromInt(if (axis == .width) viewport.width else viewport.height);
+}
+
+/// Border-box geometry from the same retained layout used for paint.
+pub fn boxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+    return @field(self.nativeMetrics(frame), @tagName(axis));
+}
+
+pub fn getBoundingClientRect(self: *Element, frame: *Frame) !*DOMRect {
+    return DOMRect.create(self.boundingClientRectValues(frame), frame._factory);
+}
+
+// Plain rect values, no JS-backed allocation: the internal fast path shared by
+// getBoundingClientRect, getClientRects, and IntersectionObserver. A DOMRect is
+// only materialized at the JS boundary.
+pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
+    if (!self.isVisible(frame)) {
+        return .{};
+    }
+    return self.boundingClientRectValuesForVisible(frame);
+}
+
+// Some cases need the bounding rect but have already done the visibility check.
+pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
+    const owner = self.ownerFrame(frame) orelse return .{};
+    return @import("../native_layout.zig").rect(self, owner) catch .{};
+}
+
+pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {
+    if (!self.isVisible(frame)) {
+        return &.{};
+    }
+    const rects = try frame.local_arena.alloc(*DOMRect, 1);
+    rects[0] = try DOMRect.create(self.boundingClientRectValuesForVisible(frame), frame._factory);
+    return rects;
+}
+
+// Scroll events fire in the element's own frame — not the caller's, which
+// differs when a same-origin script scrolls an element in another frame (e.g.
+// inside an iframe). All scroll accessors resolve the owner frame first so the
+// fired events and the document comparison stay in the element's frame.
+pub fn getScrollTop(self: *Element, frame: *Frame) u32 {
+    const owner = self.ownerFrame(frame) orelse return 0;
+    if (self.viewportAxis(frame, .height) != null) return owner.window.getScrollY();
+    return @intFromFloat(@max(0, self.nativeMetrics(frame).scroll_y));
+}
+
+pub fn setScrollTop(self: *Element, value: i32, frame: *Frame) !void {
+    _ = try self.writeScroll(.{ .to = .{ .left = null, .top = value } }, frame);
+}
+
+pub fn getScrollLeft(self: *Element, frame: *Frame) u32 {
+    const owner = self.ownerFrame(frame) orelse return 0;
+    if (self.viewportAxis(frame, .width) != null) return owner.window.getScrollX();
+    return @intFromFloat(@max(0, self.nativeMetrics(frame).scroll_x));
+}
+
+pub fn setScrollLeft(self: *Element, value: i32, frame: *Frame) !void {
+    _ = try self.writeScroll(.{ .to = .{ .left = value, .top = null } }, frame);
+}
+
+pub const ScrollAxes = struct { x: bool = false, y: bool = false };
+
+/// What a scroll along one axis lands on. html and body scroll the viewport,
+/// and so does a detached element.
+const ScrollTarget = union(enum) {
+    viewport,
+    container: *Element,
+};
+
+/// Nearest ancestor-or-self scroll container along any of `axes`. The walk
+/// is cheap to repeat per axis: the cascade memoizes each element's props.
+pub fn scrollContainer(self: *Element, axes: ScrollAxes, frame: *Frame) ScrollTarget {
+    if (!axes.x and !axes.y) return .viewport;
+    const owner = self.ownerFrame(frame) orelse return .viewport;
+    const style_manager = &owner._style_manager;
+    var current: ?*Element = self;
+    // Shadow content scrolls its host's containers: walk the flat tree.
+    while (current) |el| : (current = el.asNode().flatTreeParentElement(frame)) {
+        if (el.isRootContainer()) break;
+        const scrolls = style_manager.overflowAxes(el);
+        if ((axes.x and scrolls.x) or (axes.y and scrolls.y)) {
+            return .{ .container = el };
+        }
+    }
+    return .viewport;
+}
+
+/// Whether the element's own overscroll-behavior keeps a scroll from chaining
+/// out of it.
+pub fn containsOverscroll(self: *Element, axes: ScrollAxes, frame: *Frame) bool {
+    const owner = self.ownerFrame(frame) orelse return false;
+    const contains = owner._style_manager.overscrollContainAxes(self);
+    return (axes.x and contains.x) or (axes.y and contains.y);
+}
+
+pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
+    return self.rootScrollSize(frame, .height) orelse self.nativeMetrics(frame).scroll_height;
+}
+
+pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
+    return self.rootScrollSize(frame, .width) orelse self.nativeMetrics(frame).scroll_width;
+}
+
+fn scrollExtent(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
+    const metrics = self.nativeMetrics(frame);
+    return if (axis == .width) metrics.max_x else metrics.max_y;
+}
+
+pub fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+    const metrics = self.nativeMetrics(frame);
+    return if (axis == .width) metrics.scroll_width else metrics.scroll_height;
+}
+
+// Unlike clientHeight, the root's offsetHeight is the document height.
+pub fn getOffsetHeight(self: *Element, frame: *Frame) f64 {
+    if (!self.isVisible(frame)) {
+        return 0.0;
+    }
+    return self.boxAxis(frame, .height);
+}
+
+pub fn getOffsetWidth(self: *Element, frame: *Frame) f64 {
+    if (!self.isVisible(frame)) {
+        return 0.0;
+    }
+    return self.boxAxis(frame, .width);
+}
+
+pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
+    if (!self.isVisible(frame)) {
+        return 0.0;
+    }
+    const metrics = self.nativeMetrics(frame);
+    const parent = self.getOffsetParent(frame) orelse return metrics.y;
+    const parent_metrics = parent.nativeMetrics(frame);
+    return metrics.y - parent_metrics.y - parent_metrics.border_top;
+}
+
+pub fn getOffsetLeft(self: *Element, frame: *Frame) f64 {
+    if (!self.isVisible(frame)) {
+        return 0.0;
+    }
+    const metrics = self.nativeMetrics(frame);
+    const parent = self.getOffsetParent(frame) orelse return metrics.x;
+    const parent_metrics = parent.nativeMetrics(frame);
+    return metrics.x - parent_metrics.x - parent_metrics.border_left;
+}
+
+pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
+    if (!self.asNode().isConnected() or !self.isVisible(frame)) {
+        return null;
+    }
+
+    switch (self.getTag()) {
+        .html, .body => return null,
+        else => {},
+    }
+
+    const self_position = self.positionStyle(frame);
+    if (std.mem.eql(u8, self_position, "fixed")) {
+        return null;
+    }
+    const self_static = self_position.len == 0 or std.mem.eql(u8, self_position, "static");
+
+    var node: ?*Node = self.asNode()._parent;
+    while (node) |n| {
+        if (n.is(ShadowRoot)) |sr| {
+            // this always pokes through the shadow dom
+            node = sr.getHost().asNode();
+            continue;
+        }
+        const ancestor = n.is(Element) orelse break;
+
+        const tag = ancestor.getTag();
+        if (tag == .body) {
+            return ancestor;
+        }
+        const position = ancestor.positionStyle(frame);
+        if (position.len > 0 and !std.mem.eql(u8, position, "static")) {
+            return ancestor;
+        }
+        if (self_static and (tag == .td or tag == .th or tag == .table)) {
+            return ancestor;
+        }
+        node = n._parent;
+    }
+    return null;
+}
+
+fn positionStyle(self: *Element, frame: *Frame) []const u8 {
+    const style = self.inlineStyle(frame) orelse return "";
+    return style.asCSSStyleDeclaration().getPropertyValue("position", frame);
+}
+
+pub fn getClientTop(self: *Element, frame: *Frame) f64 {
+    return self.nativeMetrics(frame).border_top;
+}
+
+pub fn getClientLeft(self: *Element, frame: *Frame) f64 {
+    return self.nativeMetrics(frame).border_left;
+}
+
+pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
+    return self.nativeMetrics(frame).x;
+}
+
+pub fn getElementsByTagName(self: *Element, tag_name: []const u8, frame: *Frame) !Node.GetElementsByTagNameResult {
+    return self.asNode().getElementsByTagName(tag_name, frame);
+}
+
+pub fn getElementsByTagNameNS(self: *Element, namespace: ?[]const u8, local_name: []const u8, frame: *Frame) !collections.NodeLive(.tag_name_ns) {
+    return self.asNode().getElementsByTagNameNS(namespace, local_name, frame);
+}
+
+pub fn getElementsByClassName(self: *Element, class_name: []const u8, frame: *Frame) !collections.NodeLive(.class_name) {
+    return self.asNode().getElementsByClassName(class_name, frame);
+}
+pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame: *Frame) !*Node {
+    const tag_name = self.getTagNameDump();
+    const node = try Frame.node_factory.createElementNS(document, self._namespace, tag_name, &self._attributes);
+
+    // A namespace outside the built-in set lives in a side table; the clone
+    // must report the same namespaceURI.
+    if (self._namespace == .unknown) {
+        const page = document._page;
+        if (page.element_namespace_uris.get(self)) |uri| {
+            try page.element_namespace_uris.put(page.arena, node.as(Element), uri);
+        }
+    }
+
+    // Allow element-specific types to copy their runtime state
+    _ = Element.Build.call(node.as(Element), "cloned", .{ self, node.as(Element), deep, frame }) catch |err| {
+        log.err(.dom, "element.clone.failed", .{ .err = err });
+    };
+
+    // Per spec, a clonable shadow root is cloned along with its host — its
+    // children always deep-cloned, even when the host clone is shallow.
+    if (self.hostedShadowRoot(frame)) |shadow| {
+        if (shadow._clonable) {
+            const cloned_shadow = node.as(Element).attachShadow(.{
+                .mode = shadow._mode,
+                .clonable = true,
+                .delegates_focus = shadow._delegates_focus,
+                .slot_assignment = shadow._slot_assignment,
+                .serializable = shadow._serializable,
+                .declarative = shadow._declarative,
+            }, frame) catch return error.CloneError;
+
+            try shadow.asNode().cloneChildrenInto(cloned_shadow.asNode(), document, frame);
+        }
+    }
+
+    if (deep) {
+        try self.asNode().cloneChildrenInto(node, document, frame);
+    }
+
+    return node;
+}
+
+pub fn scrollIntoViewIfNeeded(self: *Element, center_if_needed: ?bool, frame: *Frame) void {
+    _ = center_if_needed;
+    const rect = self.boundingClientRectValues(frame);
+    if (rect.y >= 0 and rect.y + rect.height <= @as(f64, @floatFromInt(@import("../native_layout.zig").viewport(frame).height))) return;
+    self.scrollIntoView(null, frame);
+}
+
+const ScrollIntoViewOpts = union {
+    align_to_top: bool,
+    obj: js.Object,
+};
+pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame) void {
+    _ = opts;
+    const owner = self.ownerFrame(frame) orelse return;
+    var parent = self.asNode().flatTreeParentElement(frame);
+    while (parent) |container| : (parent = container.asNode().flatTreeParentElement(frame)) {
+        if (container.isRootContainer()) break;
+        const metrics = container.nativeMetrics(frame);
+        if (metrics.max_x == 0 and metrics.max_y == 0) continue;
+        const target = self.boundingClientRectValues(frame);
+        const box = container.boundingClientRectValues(frame);
+        const dx = if (target.x < box.x) target.x - box.x else @max(0, target.x + target.width - box.x - metrics.client_width);
+        const dy = if (target.y < box.y) target.y - box.y else @max(0, target.y + target.height - box.y - metrics.client_height);
+        container.scrollBy(.{ .opts = .{ .left = @intFromFloat(dx), .top = @intFromFloat(dy) } }, null, frame) catch return;
+    }
+    const rect = self.boundingClientRectValues(frame);
+    owner.window.scrollBy(.{ .opts = .{ .left = @intFromFloat(rect.x), .top = @intFromFloat(rect.y) } }, null, owner) catch {};
+}
+
+// The scrollTo/scrollBy argument shape shared with Window: positional (x, y)
+// or a dictionary.
+pub const ScrollToOpts = union(enum) {
+    x: i32,
+    opts: Opts,
+
+    pub const Opts = struct {
+        behavior: []const u8 = "",
+        left: ?i32 = null,
+        top: ?i32 = null,
+    };
+
+    pub const Offsets = struct { left: ?i32, top: ?i32 };
+
+    /// Per-axis values; null leaves that axis where it is. Only the dictionary
+    /// form can omit an axis.
+    pub fn offsets(self: ScrollToOpts, y: ?i32) Offsets {
+        return switch (self) {
+            .x => |x| .{ .left = x, .top = y orelse 0 },
+            .opts => |o| .{ .left = o.left, .top = o.top },
+        };
+    }
+};
+
+pub fn scrollTo(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !void {
+    const o = (opts orelse return).offsets(y);
+    _ = try self.writeScroll(.{ .to = o }, frame);
+}
+
+// scrollBy(): like scrollTo() but relative to the current position.
+pub fn scrollBy(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !void {
+    const o = (opts orelse return).offsets(y);
+    _ = try self.writeScroll(.{ .by = o }, frame);
+}
+
+/// Reports whether the container moved: a wheel walks outward until one does.
+pub fn scrollByAxis(self: *Element, comptime axis: Axis, delta: i32, frame: *Frame) !bool {
+    return self.writeScroll(.{ .by = switch (axis) {
+        .width => .{ .left = delta, .top = null },
+        .height => .{ .left = null, .top = delta },
+    } }, frame);
+}
+
+const ScrollWrite = union(enum) {
+    to: ScrollToOpts.Offsets,
+    by: ScrollToOpts.Offsets,
+
+    // Null leaves that axis alone.
+    fn target(self: ScrollWrite, comptime axis: Axis, current: u32) ?i64 {
+        const offsets = switch (self) {
+            inline else => |o| o,
+        };
+        const value = switch (axis) {
+            .width => offsets.left,
+            .height => offsets.top,
+        } orelse return null;
+        return switch (self) {
+            .to => value,
+            .by => @as(i64, current) + value,
+        };
+    }
+};
+
+/// Every scroll write goes through here. Reports whether anything moved; one
+/// that lands where the offsets already are doesn't even take a map entry.
+fn writeScroll(self: *Element, write: ScrollWrite, frame: *Frame) !bool {
+    const owner = self.ownerFrame(frame) orelse return false;
+    if (self.viewportAxis(frame, .width) != null) {
+        const x = write.target(.width, owner.window.getScrollX()) orelse owner.window.getScrollX();
+        const y = write.target(.height, owner.window.getScrollY()) orelse owner.window.getScrollY();
+        try owner.window.scrollTo(.{ .opts = .{ .left = @intCast(std.math.clamp(x, 0, std.math.maxInt(i32))), .top = @intCast(std.math.clamp(y, 0, std.math.maxInt(i32))) } }, null, owner);
+        return true;
+    }
+    const current: ScrollPosition = owner.page.element_scroll_positions.get(self) orelse .{};
+
+    var x = current.x;
+    var y = current.y;
+    if (write.target(.width, current.x)) |target| {
+        x = self.clampScroll(frame, .width, target);
+    }
+    if (write.target(.height, current.y)) |target| {
+        y = self.clampScroll(frame, .height, target);
+    }
+    if (x == current.x and y == current.y) {
+        return false;
+    }
+
+    const gop = try owner.page.element_scroll_positions.getOrPut(owner.page.arena, self);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{};
+    }
+    gop.value_ptr.x = x;
+    gop.value_ptr.y = y;
+    try self.scheduleScrollEvents(gop.value_ptr, owner);
+    return true;
+}
+
+fn clampScroll(self: *Element, frame: *Frame, comptime axis: Axis, target: i64) u32 {
+    var clamped = target;
+    if (clamped < 0) {
+        clamped = 0;
+    } else if (self.scrollExtent(frame, axis)) |extent| {
+        const max: i64 = @floor(extent);
+        clamped = @min(clamped, max);
+    }
+    return @intCast(@min(clamped, std.math.maxInt(u32)));
+}
+
+// Scrolling an element fires a scroll event and then a scrollend event,
+// asynchronously and throttled, mirroring Window.scrollTo. Scrolls of the
+// scrolling element (the root) are fired at the document instead.
+// `frame` is the element's owner frame and `pos` its entry there, both
+// resolved by writeScroll.
+fn scheduleScrollEvents(self: *Element, pos: *ScrollPosition, frame: *Frame) !void {
+    const task_pending = pos.state != .done;
+    pos.state = .scroll;
+    if (task_pending) {
+        return;
+    }
+
+    const task = try frame._factory.create(ScrollEventTask{ .frame = frame, .element = self });
+    errdefer {
+        pos.state = .done;
+        frame._factory.destroy(task);
+    }
+    try frame.js.scheduler.add(task, ScrollEventTask.run, 10, .{
+        .name = "element.scrollEvents",
+        .blocks_done = false,
+        .finalizer = ScrollEventTask.cancelled,
+    });
+}
+
+const ScrollEventTask = struct {
+    frame: *Frame,
+    element: *Element,
+
+    fn eventTarget(self: *ScrollEventTask) *@import("EventTarget.zig") {
+        if (self.frame.document.getDocumentElement() == self.element) {
+            return self.frame.document.asEventTarget();
+        }
+        return self.element.asEventTarget();
+    }
+
+    // Scroll events fired at an element don't bubble; only document-level
+    // scrolls (the scrolling element, dispatched at the document) do.
+    fn bubbles(self: *ScrollEventTask) bool {
+        return self.frame.document.getDocumentElement() == self.element;
+    }
+
+    fn cancelled(ptr: *anyopaque) void {
+        const self: *ScrollEventTask = @ptrCast(@alignCast(ptr));
+        if (self.frame.page.element_scroll_positions.getPtr(self.element)) |pos| {
+            pos.state = .done;
+        }
+        self.frame._factory.destroy(self);
+    }
+
+    fn run(ptr: *anyopaque) anyerror!?u32 {
+        const self: *ScrollEventTask = @ptrCast(@alignCast(ptr));
+        const f = self.frame;
+        const pos = f.page.element_scroll_positions.getPtr(self.element) orelse {
+            f._factory.destroy(self);
+            return null;
+        };
+        switch (pos.state) {
+            .scroll => {
+                pos.state = .end;
+                self.dispatchEvent(comptime .wrap("scroll"));
+                return 10;
+            },
+            .end => {
+                pos.state = .done;
+                defer f._factory.destroy(self);
+                self.dispatchEvent(comptime .wrap("scrollend"));
+                return null;
+            },
+            .done => {
+                f._factory.destroy(self);
+                return null;
+            },
+        }
+    }
+
+    fn dispatchEvent(self: *ScrollEventTask, comptime event_type: String) void {
+        const Event = @import("Event.zig");
+        const event = Event.initTrusted(event_type, .{ .bubbles = self.bubbles() }, self.frame.page) catch |err| {
+            log.debug(.dom, "element.scroll.event", .{ .err = err });
+            return;
+        };
+        self.frame._event_manager.dispatch(self.eventTarget(), event) catch |err| {
+            log.debug(.dom, "element.scroll.dispatch", .{ .err = err });
+        };
+    }
+};
+
+pub fn format(self: *Element, writer: *std.Io.Writer) !void {
+    try writer.writeByte('<');
+    try writer.writeAll(self.getTagNameDump());
+
+    for (self._attributes.entries()) |*attr| {
+        try writer.print(" {f}", .{attr});
+    }
+    try writer.writeByte('>');
+}
+
+// Falls back to the stored name when the copy can't be allocated, e.g. a long
+// name and a caller's fixed buffer.
+fn upperTagName(tag_name: *String, allocator: Allocator) []const u8 {
+    const tag = tag_name.str();
+    return std.ascii.allocUpperString(allocator, tag) catch {
+        log.info(.dom, "tag.long.name", .{ .name = tag });
+        return tag;
+    };
+}
+
+// For the element types that store a Tag, whose name is always @tagName(tag).
+fn upperTag(tag: Tag) []const u8 {
+    @setEvalBranchQuota(10_000);
+    return switch (tag) {
+        inline else => |t| comptime upperLiteral(@tagName(t)),
+    };
+}
+
+fn upperLiteral(comptime lower: []const u8) *const [lower.len]u8 {
+    comptime {
+        var upper: [lower.len]u8 = undefined;
+        _ = std.ascii.upperString(&upper, lower);
+        const final = upper;
+        return &final;
+    }
+}
+
+pub fn getTag(self: *const Element) Tag {
+    return switch (self._type) {
+        .html => blk: {
+            const he = self.subtype(Html);
+            break :blk switch (he._type) {
+                .anchor => .a,
+                .area => .area,
+                .base => .base,
+                .div => .div,
+                .dl => .dl,
+                .embed => .embed,
+                .form => .form,
+                .p => .p,
+                .custom => .custom,
+                .data => .data,
+                .datalist => .datalist,
+                .details => .details,
+                .dialog => .dialog,
+                .directory => .dir,
+                .iframe => .iframe,
+                .img => .img,
+                .br => .br,
+                .button => .button,
+                .canvas => .canvas,
+                .fieldset => .fieldset,
+                .font => .font,
+                .frameset => .frameset,
+                .heading => he.subtype(Html.Heading)._tag,
+                .label => .label,
+                .legend => .legend,
+                .li => .li,
+                .map => .map,
+                .marquee => .marquee,
+                .ul => .ul,
+                .ol => .ol,
+                .object => .object,
+                .optgroup => .optgroup,
+                .output => .output,
+                .picture => .picture,
+                .param => .param,
+                .pre => .pre,
+                .generic => he.subtype(Html.Generic)._tag,
+                .media => switch (he.subtype(Html.Media)._type) {
+                    .audio => .audio,
+                    .video => .video,
+                    .generic => .media,
+                },
+                .meter => .meter,
+                .mod => he.subtype(Html.Mod)._tag,
+                .progress => .progress,
+                .quote => he.subtype(Html.Quote)._tag,
+                .script => .script,
+                .select => .select,
+                .slot => .slot,
+                .source => .source,
+                .span => .span,
+                .option => .option,
+                .table => .table,
+                .table_caption => .caption,
+                .table_cell => he.subtype(Html.TableCell)._tag,
+                .table_col => he.subtype(Html.TableCol)._tag,
+                .table_row => .tr,
+                .table_section => he.subtype(Html.TableSection)._tag,
+                .template => .template,
+                .textarea => .textarea,
+                .time => .time,
+                .track => .track,
+                .input => .input,
+                .link => .link,
+                .meta => .meta,
+                .hr => .hr,
+                .style => .style,
+                .title => .title,
+                .body => .body,
+                .html => .html,
+                .head => .head,
+                .unknown => .unknown,
+            };
+        },
+        .svg => self.subtype(Svg).getTag(),
+    };
+}
+
+pub fn ownerFrame(self: *const Element, frame: *const Frame) ?*Frame {
+    return self.asConstNode().ownerFrame(frame);
+}
+
+pub const Tag = enum {
+    a,
+    address,
+    audio,
+    area,
+    aside,
+    article,
+    b,
+    blockquote,
+    body,
+    br,
+    button,
+    base,
+    canvas,
+    caption,
+    circle,
+    code,
+    col,
+    colgroup,
+    custom,
+    data,
+    datalist,
+    dd,
+    details,
+    del,
+    dfn,
+    dialog,
+    dir,
+    div,
+    dl,
+    dt,
+    embed,
+    ellipse,
+    em,
+    fieldset,
+    figure,
+    frameset,
+    form,
+    font,
+    footer,
+    g,
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6,
+    head,
+    header,
+    heading,
+    hgroup,
+    hr,
+    html,
+    i,
+    iframe,
+    img,
+    input,
+    ins,
+    label,
+    legend,
+    li,
+    line,
+    link,
+    main,
+    map,
+    marquee,
+    media,
+    menu,
+    meta,
+    meter,
+    nav,
+    noscript,
+    object,
+    ol,
+    optgroup,
+    option,
+    output,
+    p,
+    path,
+    param,
+    picture,
+    polygon,
+    polyline,
+    pre,
+    progress,
+    q,
+    rect,
+    s,
+    script,
+    section,
+    select,
+    slot,
+    source,
+    span,
+    strong,
+    style,
+    sub,
+    summary,
+    sup,
+    svg,
+    table,
+    time,
+    tbody,
+    td,
+    text,
+    template,
+    textarea,
+    tfoot,
+    th,
+    thead,
+    title,
+    tr,
+    track,
+    ul,
+    video,
+    unknown,
+
+    // If the tag is "unknown", we can't use the optimized tag matching, but
+    // need to fallback to the actual tag name
+    pub fn parseForMatch(lower: []const u8) ?Tag {
+        const tag = std.meta.stringToEnum(Tag, lower) orelse return null;
+        return switch (tag) {
+            .unknown, .custom => null,
+            // groupings, not element names (h1-h6, audio/video)
+            .heading, .media => null,
+            else => tag,
+        };
+    }
+
+    pub fn isBlock(self: Tag) bool {
+        // zig fmt: off
+        return switch (self) {
+            // Semantic Layout
+            .article, .aside, .footer, .header, .main, .nav, .section,
+            // Grouping / Containers
+            .address, .div, .fieldset, .figure, .p,
+            // Headings
+            .h1, .h2, .h3, .h4, .h5, .h6,
+            // Lists
+            .dl, .ol, .ul,
+            // Preformatted / Quotes
+            .blockquote, .pre,
+            // Tables
+            .table,
+            // Other
+            .hr,
+            => true,
+            else => false,
+        };
+        // zig fmt: on
+    }
+
+    // Replaced elements and form controls: sized by what they show, never
+    // stretched to their container.
+    pub fn isReplacedOrControl(self: Tag) bool {
+        return switch (self) {
+            .img, .iframe, .canvas, .video, .audio, .media, .object, .embed, .svg, .input, .select, .textarea, .button, .meter, .progress => true,
+            else => false,
+        };
+    }
+
+    pub fn isMetadata(self: Tag) bool {
+        return switch (self) {
+            .base, .head, .link, .meta, .noscript, .script, .style, .template, .title => true,
+            else => false,
+        };
+    }
+
+    // UA stylesheet display:none defaults per HTML Rendering §15.3.1
+    // "Hidden elements" (https://html.spec.whatwg.org/multipage/rendering.html#hidden-elements).
+    // The spec also lists basefont, noembed, noframes, rp; those tags are
+    // obsolete and not represented in this enum, so they fall through to
+    // `.unknown`/`.custom` and aren't matched here.
+    pub fn isHiddenByUaStylesheet(self: Tag) bool {
+        return switch (self) {
+            .area,
+            .base,
+            .datalist,
+            .head,
+            .link,
+            .meta,
+            .noscript,
+            .param,
+            .script,
+            .source,
+            .style,
+            .template,
+            .title,
+            .track,
+            => true,
+            else => false,
+        };
+    }
+};
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(Element);
+
+    pub const Meta = struct {
+        pub const name = "Element";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const tagName = bridge.accessor(_tagName, null, .{});
+    fn _tagName(self: *Element, frame: *Frame) []const u8 {
+        return self.getTagNameSpec(frame.local_arena);
+    }
+    // the frame-aware variant returns the original URI for namespaces
+    // outside the built-in set instead of the placeholder
+    pub const namespaceURI = bridge.accessor(Element.getNamespaceUri, null, .{});
+
+    pub const outerHTML = bridge.accessor(_getOuterHTML, _setOuterHTML, .{ .ce_reactions = true });
+    fn _getOuterHTML(self: *Element, frame: *Frame) ![]const u8 {
+        // local_arena: serialization is read-only and the returned string is
+        // converted to v8 before this call returns. No JS runs in between.
+        var buf = std.Io.Writer.Allocating.init(frame.local_arena);
+        try self.getOuterHTML(&buf.writer, frame);
+        return buf.written();
+    }
+    fn _setOuterHTML(self: *Element, value: js.Value, frame: *Frame) !void {
+        // `[LegacyNullToEmptyString] DOMString`: a JS null becomes "", not "null".
+        return self.setOuterHTML(if (value.isNull()) "" else try value.toZig([]const u8), frame);
+    }
+
+    pub const innerHTML = bridge.accessor(_getInnerHTML, _setInnerHTML, .{ .ce_reactions = true });
+    fn _getInnerHTML(self: *Element, frame: *Frame) ![]const u8 {
+        // local_arena: read-only serialization, result converted to v8 before
+        // returning; no JS runs in between.
+        var buf = std.Io.Writer.Allocating.init(frame.local_arena);
+        try self.getInnerHTML(&buf.writer, frame);
+        return buf.written();
+    }
+    fn _setInnerHTML(self: *Element, value: js.Value, frame: *Frame) !void {
+        // `[LegacyNullToEmptyString] DOMString`: a JS null becomes "", not "null".
+        return self.setInnerHTML(if (value.isNull()) "" else try value.toZig([]const u8), frame);
+    }
+
+    pub const getHTML = bridge.function(_getHTML, .{});
+    const GetHTMLOpts = struct {
+        serializableShadowRoots: bool = false,
+        shadowRoots: []const *ShadowRoot = &.{},
+    };
+    fn _getHTML(self: *Element, opts_: ?GetHTMLOpts, frame: *Frame) ![]const u8 {
+        const opts = opts_ orelse GetHTMLOpts{};
+        var buf = std.Io.Writer.Allocating.init(frame.local_arena);
+        try self.getHTML(.{
+            .shadow_roots = opts.shadowRoots,
+            .serializable_shadow_roots = opts.serializableShadowRoots,
+        }, &buf.writer, frame);
+        return buf.written();
+    }
+
+    pub const prefix = bridge.accessor(Element._prefix, null, .{});
+
+    pub const setAttribute = bridge.function(_setAttribute, .{ .ce_reactions = true });
+    fn _setAttribute(self: *Element, name: String, value: js.Value, frame: *Frame) !void {
+        return self.setAttribute(name, .wrap(try value.toStringSlice()), frame);
+    }
+
+    pub const setAttributeNS = bridge.function(_setAttributeNS, .{ .ce_reactions = true });
+    fn _setAttributeNS(self: *Element, maybe_ns: ?[]const u8, qn: []const u8, value: js.Value, frame: *Frame) !void {
+        return self.setAttributeNS(maybe_ns, qn, .wrap(try value.toStringSlice()), frame);
+    }
+
+    pub const localName = bridge.accessor(Element.getLocalName, null, .{});
+    pub const id = bridge.accessor(struct {
+        fn wrap(self: *const Element) []const u8 {
+            return self.getId() orelse "";
+        }
+    }.wrap, Element.setId, .{ .ce_reactions = true });
+    pub const slot = bridge.accessor(struct {
+        fn wrap(self: *const Element) []const u8 {
+            return self.getSlot() orelse "";
+        }
+    }.wrap, Element.setSlot, .{ .ce_reactions = true });
+    pub const role = ariaAccessor("role");
+    pub const ariaAtomic = ariaAccessor("aria-atomic");
+    pub const ariaAutoComplete = ariaAccessor("aria-autocomplete");
+    pub const ariaBrailleLabel = ariaAccessor("aria-braillelabel");
+    pub const ariaBrailleRoleDescription = ariaAccessor("aria-brailleroledescription");
+    pub const ariaBusy = ariaAccessor("aria-busy");
+    pub const ariaChecked = ariaAccessor("aria-checked");
+    pub const ariaColCount = ariaAccessor("aria-colcount");
+    pub const ariaColIndex = ariaAccessor("aria-colindex");
+    pub const ariaColIndexText = ariaAccessor("aria-colindextext");
+    pub const ariaColSpan = ariaAccessor("aria-colspan");
+    pub const ariaCurrent = ariaAccessor("aria-current");
+    pub const ariaDescription = ariaAccessor("aria-description");
+    pub const ariaDisabled = ariaAccessor("aria-disabled");
+    pub const ariaExpanded = ariaAccessor("aria-expanded");
+    pub const ariaHasPopup = ariaAccessor("aria-haspopup");
+    pub const ariaHidden = ariaAccessor("aria-hidden");
+    pub const ariaInvalid = ariaAccessor("aria-invalid");
+    pub const ariaKeyShortcuts = ariaAccessor("aria-keyshortcuts");
+    pub const ariaLabel = ariaAccessor("aria-label");
+    pub const ariaLevel = ariaAccessor("aria-level");
+    pub const ariaLive = ariaAccessor("aria-live");
+    pub const ariaModal = ariaAccessor("aria-modal");
+    pub const ariaMultiLine = ariaAccessor("aria-multiline");
+    pub const ariaMultiSelectable = ariaAccessor("aria-multiselectable");
+    pub const ariaOrientation = ariaAccessor("aria-orientation");
+    pub const ariaPlaceholder = ariaAccessor("aria-placeholder");
+    pub const ariaPosInSet = ariaAccessor("aria-posinset");
+    pub const ariaPressed = ariaAccessor("aria-pressed");
+    pub const ariaReadOnly = ariaAccessor("aria-readonly");
+    pub const ariaRelevant = ariaAccessor("aria-relevant");
+    pub const ariaRequired = ariaAccessor("aria-required");
+    pub const ariaRoleDescription = ariaAccessor("aria-roledescription");
+    pub const ariaRowCount = ariaAccessor("aria-rowcount");
+    pub const ariaRowIndex = ariaAccessor("aria-rowindex");
+    pub const ariaRowIndexText = ariaAccessor("aria-rowindextext");
+    pub const ariaRowSpan = ariaAccessor("aria-rowspan");
+    pub const ariaSelected = ariaAccessor("aria-selected");
+    pub const ariaSetSize = ariaAccessor("aria-setsize");
+    pub const ariaSort = ariaAccessor("aria-sort");
+    pub const ariaValueMax = ariaAccessor("aria-valuemax");
+    pub const ariaValueMin = ariaAccessor("aria-valuemin");
+    pub const ariaValueNow = ariaAccessor("aria-valuenow");
+    pub const ariaValueText = ariaAccessor("aria-valuetext");
+    pub const dir = bridge.accessor(struct {
+        fn wrap(self: *const Element) []const u8 {
+            return self.getDir() orelse "";
+        }
+    }.wrap, Element.setDir, .{ .ce_reactions = true });
+    pub const className = bridge.accessor(struct {
+        fn wrap(self: *const Element) []const u8 {
+            return self.getClassName() orelse "";
+        }
+    }.wrap, Element.setClassName, .{ .ce_reactions = true });
+    pub const classList = bridge.accessor(Element.getClassList, Element.setClassList, .{ .ce_reactions = true });
+    pub const part = bridge.accessor(Element.getPartList, Element.setPartList, .{ .ce_reactions = true });
+    pub const dataset = bridge.accessor(Element.getDataset, null, .{});
+    pub const style = bridge.accessor(Element.getOrCreateStyle, Element.setStyle, .{});
+    pub const attributes = bridge.accessor(Element.getAttributeNamedNodeMap, null, .{});
+    pub const hasAttribute = bridge.function(Element.hasAttribute, .{});
+    pub const hasAttributeNS = bridge.function(Element.hasAttributeNS, .{});
+    pub const hasAttributes = bridge.function(Element.hasAttributes, .{});
+    pub const getAttribute = bridge.function(Element.getAttribute, .{});
+    pub const getAttributeNS = bridge.function(Element.getAttributeNS, .{});
+    pub const getAttributeNode = bridge.function(Element.getAttributeNode, .{});
+    pub const getAttributeNodeNS = bridge.function(Element.getAttributeNodeNS, .{});
+    pub const setAttributeNode = bridge.function(Element.setAttributeNode, .{ .ce_reactions = true });
+    // Attributes don't carry a namespace, so this is setAttributeNode.
+    pub const setAttributeNodeNS = bridge.function(Element.setAttributeNode, .{ .ce_reactions = true });
+    pub const removeAttribute = bridge.function(Element.removeAttribute, .{ .ce_reactions = true });
+    pub const removeAttributeNS = bridge.function(Element.removeAttributeNS, .{ .ce_reactions = true });
+    pub const toggleAttribute = bridge.function(Element.toggleAttribute, .{ .ce_reactions = true });
+    pub const getAttributeNames = bridge.function(Element.getAttributeNames, .{});
+    pub const removeAttributeNode = bridge.function(Element.removeAttributeNode, .{ .ce_reactions = true });
+    pub const shadowRoot = bridge.accessor(Element.getShadowRoot, null, .{});
+    pub const assignedSlot = bridge.accessor(Element.getAssignedSlot, null, .{});
+    pub const attachShadow = bridge.function(_attachShadow, .{});
+    pub const insertAdjacentHTML = bridge.function(Element.insertAdjacentHTML, .{ .ce_reactions = true });
+    pub const setHTML = bridge.function(Element.setHTML, .{ .ce_reactions = true });
+    pub const setHTMLUnsafe = bridge.function(Element.setHTMLUnsafe, .{ .ce_reactions = true });
+    pub const insertAdjacentElement = bridge.function(Element.insertAdjacentElement, .{ .ce_reactions = true });
+    pub const insertAdjacentText = bridge.function(Element.insertAdjacentText, .{ .ce_reactions = true });
+
+    const ShadowRootInit = struct {
+        clonable: bool = false,
+        delegatesFocus: bool = false,
+        mode: String,
+        serializable: bool = false,
+        slotAssignment: ?String = null,
+    };
+    fn _attachShadow(self: *Element, init: ShadowRootInit, frame: *Frame) !*ShadowRoot {
+        const mode: ShadowRoot.Mode = blk: {
+            if (init.mode.eql(comptime .wrap("open"))) break :blk .open;
+            if (init.mode.eql(comptime .wrap("closed"))) break :blk .closed;
+            return error.InvalidArgument;
+        };
+        const slot_assignment: ShadowRoot.SlotAssignment = blk: {
+            const sa = init.slotAssignment orelse break :blk .named;
+            if (sa.eql(comptime .wrap("named"))) break :blk .named;
+            if (sa.eql(comptime .wrap("manual"))) break :blk .manual;
+            return error.InvalidArgument;
+        };
+        return self.attachShadow(.{
+            .mode = mode,
+            .delegates_focus = init.delegatesFocus,
+            .slot_assignment = slot_assignment,
+            .clonable = init.clonable,
+            .serializable = init.serializable,
+        }, frame);
+    }
+    pub const replaceChildren = bridge.function(Element.replaceChildren, .{ .ce_reactions = true });
+    pub const replaceWith = bridge.function(Element.replaceWith, .{ .ce_reactions = true });
+    pub const remove = bridge.function(Element.remove, .{ .ce_reactions = true });
+    pub const append = bridge.function(Element.append, .{ .ce_reactions = true });
+    pub const prepend = bridge.function(Element.prepend, .{ .ce_reactions = true });
+    pub const moveBefore = bridge.function(Element.moveBefore, .{ .ce_reactions = true });
+    pub const before = bridge.function(Element.before, .{ .ce_reactions = true });
+    pub const after = bridge.function(Element.after, .{ .ce_reactions = true });
+    pub const firstElementChild = bridge.accessor(Element.firstElementChild, null, .{});
+    pub const lastElementChild = bridge.accessor(Element.lastElementChild, null, .{});
+    pub const nextElementSibling = bridge.accessor(Element.nextElementSibling, null, .{});
+    pub const previousElementSibling = bridge.accessor(Element.previousElementSibling, null, .{});
+    pub const childElementCount = bridge.accessor(Element.getChildElementCount, null, .{});
+    pub const matches = bridge.function(Element.matches, .{});
+    pub const webkitMatchesSelector = bridge.function(Element.matches, .{});
+    pub const querySelector = bridge.function(Element.querySelector, .{});
+    pub const querySelectorAll = bridge.function(Element.querySelectorAll, .{});
+    pub const closest = bridge.function(Element.closest, .{});
+    pub const getAnimations = bridge.function(Element.getAnimations, .{});
+    pub const animate = bridge.function(Element.animate, .{});
+    pub const checkVisibility = bridge.function(Element.checkVisibility, .{});
+    pub const requestFullscreen = bridge.function(Element.requestFullscreen, .{});
+    pub const clientWidth = bridge.accessor(Element.getClientWidth, null, .{});
+    pub const clientHeight = bridge.accessor(Element.getClientHeight, null, .{});
+    pub const clientTop = bridge.accessor(Element.getClientTop, null, .{});
+    pub const clientLeft = bridge.accessor(Element.getClientLeft, null, .{});
+    pub const scrollTop = bridge.accessor(Element.getScrollTop, Element.setScrollTop, .{});
+    pub const scrollLeft = bridge.accessor(Element.getScrollLeft, Element.setScrollLeft, .{});
+    pub const scrollHeight = bridge.accessor(Element.getScrollHeight, null, .{});
+    pub const scrollWidth = bridge.accessor(Element.getScrollWidth, null, .{});
+    pub const offsetTop = bridge.accessor(Element.getOffsetTop, null, .{});
+    pub const offsetLeft = bridge.accessor(Element.getOffsetLeft, null, .{});
+    pub const offsetWidth = bridge.accessor(Element.getOffsetWidth, null, .{});
+    pub const offsetHeight = bridge.accessor(Element.getOffsetHeight, null, .{});
+    pub const offsetParent = bridge.accessor(Element.getOffsetParent, null, .{});
+    pub const getClientRects = bridge.function(Element.getClientRects, .{});
+    pub const getBoundingClientRect = bridge.function(Element.getBoundingClientRect, .{});
+    pub const getElementsByTagName = bridge.function(Element.getElementsByTagName, .{});
+    pub const getElementsByTagNameNS = bridge.function(Element.getElementsByTagNameNS, .{});
+    pub const getElementsByClassName = bridge.function(Element.getElementsByClassName, .{});
+    pub const children = bridge.accessor(Element.getChildren, null, .{});
+    pub const focus = bridge.function(Element.focus, .{});
+    pub const blur = bridge.function(Element.blur, .{});
+    pub const scrollIntoView = bridge.function(Element.scrollIntoView, .{});
+    pub const scrollIntoViewIfNeeded = bridge.function(Element.scrollIntoViewIfNeeded, .{});
+    pub const scroll = bridge.function(Element.scrollTo, .{});
+    pub const scrollTo = bridge.function(Element.scrollTo, .{});
+    pub const scrollBy = bridge.function(Element.scrollBy, .{});
+
+    fn ariaAccessor(comptime attr: []const u8) js.bridge.Accessor {
+        const R = struct {
+            pub fn get(self: *const Element) ?[]const u8 {
+                return self.getAttributeSafe(.wrap(attr));
+            }
+
+            pub fn set(self: *Element, value: ?[]const u8, frame: *Frame) !void {
+                if (value) |v| {
+                    try self.setAttributeSafe(.wrap(attr), .wrap(v), frame);
+                } else {
+                    try self.removeAttribute(.wrap(attr), frame);
+                }
+            }
+        };
+        return bridge.accessor(R.get, R.set, .{ .ce_reactions = true });
+    }
+};
+
+pub const Build = struct {
+    // Calls `func_name` with `args` on the most specific type where it is
+    // implement. This could be on the Element itself.
+    pub fn call(self: *const Element, comptime func_name: []const u8, args: anytype) !bool {
+        switch (self._type) {
+            inline else => |tag| {
+                const S = Subtype(tag);
+                if (@hasDecl(S, "Build")) {
+                    // The inner type has its own "call" method. Defer to it.
+                    if (@hasDecl(S.Build, "call")) {
+                        return S.Build.call(self.subtype(S), func_name, args);
+                    }
+
+                    // The inner type implements this function. Call it and we're done.
+                    if (@hasDecl(S, func_name)) {
+                        return @call(.auto, @field(S, func_name), args);
+                    }
+                }
+            },
+        }
+
+        if (@hasDecl(Element.Build, func_name)) {
+            // Our last resort - the element implements this function.
+            try @call(.auto, @field(Element.Build, func_name), args);
+            return true;
+        }
+
+        // inform our caller (the Node) that we didn't find anything that implemented
+        // func_name and it should keep searching for a match.
+        return false;
+    }
+};
+
+const testing = @import("../../testing.zig");
+test "WebApi: Element" {
+    try testing.htmlRunner("element", .{});
+}
+
+test "Element: scroll extent" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const root = try frame.window._document.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, root.asNode(),
+        \\<div style="height: 100px; overflow: auto"><div style="height: 500px"></div></div>
+        \\<div style="height: 100px; overflow: auto">text, and no element child to measure</div>
+    );
+    const box = root.asNode().firstChild().?.as(Element);
+    const text = box.nextElementSibling().?;
+
+    try box.setScrollTop(9999, frame);
+    try testing.expectEqual(400, box.getScrollTop(frame));
+    try box.setScrollTop(-1, frame);
+    try testing.expectEqual(0, box.getScrollTop(frame));
+
+    // A real browser clamps this one too, to the height of its text. contentAxis
+    // sums element children only, so we have no extent to clamp against and the
+    // offset stays unbounded.
+    try text.setScrollTop(9999, frame);
+    try testing.expectEqual(9999, text.getScrollTop(frame));
+}
+
+test "Element: div chain slot size" {
+    // Guard against accidental growth: new Element fields (e.g. _flags) must
+    // fit in existing padding. Debug is larger from the _proto_canary fields.
+    const Div = @import("element/html/Div.zig");
+    const slot = comptime Factory.chainOffsetOf(Div, Div) + @sizeOf(Div);
+    try testing.expectEqual(if (comptime lp.IS_DEBUG) 120 else 74, slot);
+}

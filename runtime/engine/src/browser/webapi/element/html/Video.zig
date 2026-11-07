@@ -1,0 +1,86 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const lp = @import("lightpanda");
+
+const js = @import("../../../js/js.zig");
+const Frame = @import("../../../Frame.zig");
+const Factory = @import("../../../Factory.zig");
+
+const Node = @import("../../Node.zig");
+const Element = @import("../../Element.zig");
+
+const Media = @import("Media.zig");
+
+const Video = @This();
+
+pub const Proto = Media;
+
+_pad: bool = false,
+_proto_canary: if (lp.IS_DEBUG) *Media else void = undefined,
+
+pub fn asElement(self: *Video) *Element {
+    return Factory.protoOf(self).asElement();
+}
+
+pub fn asConstElement(self: *const Video) *const Element {
+    return Factory.protoOf(self).asConstElement();
+}
+
+pub fn asNode(self: *Video) *Node {
+    return self.asElement().asNode();
+}
+
+fn getVideoWidth(_: *const Video) u32 {
+    return 0;
+}
+
+fn getVideoHeight(_: *const Video) u32 {
+    return 0;
+}
+
+fn getPoster(self: *const Video, frame: *Frame) ![]const u8 {
+    const element = self.asConstElement();
+    const poster = element.getAttributeSafe(comptime .wrap("poster")) orelse return "";
+    if (poster.len == 0) {
+        return "";
+    }
+    return element.asConstNode().resolveURLReflect(poster, frame, .{});
+}
+
+fn setPoster(self: *Video, value: []const u8, frame: *Frame) !void {
+    try self.asElement().setAttributeSafe(comptime .wrap("poster"), .wrap(value), frame);
+}
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(Video);
+
+    pub const Meta = struct {
+        pub const name = "HTMLVideoElement";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    const reflect = Element.Reflect(Video);
+    pub const width = reflect.unsignedLong("width", .{});
+    pub const height = reflect.unsignedLong("height", .{});
+    pub const playsInline = reflect.boolean("playsinline");
+
+    pub const poster = bridge.accessor(Video.getPoster, Video.setPoster, .{ .ce_reactions = true });
+    pub const videoWidth = bridge.accessor(Video.getVideoWidth, null, .{});
+    pub const videoHeight = bridge.accessor(Video.getVideoHeight, null, .{});
+};

@@ -1,0 +1,588 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("js/js.zig");
+
+const Frame = @import("Frame.zig");
+const Session = @import("Session.zig");
+const Factory = @import("Factory.zig");
+const Viewport = @import("Viewport.zig");
+const EventManagerBase = @import("EventManagerBase.zig");
+const PageStatus = @import("PageStatus.zig");
+
+const Blob = @import("webapi/Blob.zig");
+const Node = @import("webapi/Node.zig");
+const Element = @import("webapi/Element.zig");
+const EventTarget = @import("webapi/EventTarget.zig");
+const WorkerGlobalScope = @import("webapi/WorkerGlobalScope.zig");
+const SharedWorkerGlobalScope = @import("webapi/SharedWorkerGlobalScope.zig");
+const PointList = @import("webapi/svg/PointList.zig");
+const StringList = @import("webapi/svg/StringList.zig");
+const AnimatedEnumeration = @import("webapi/svg/AnimatedEnumeration.zig");
+const AnimatedLength = @import("webapi/svg/AnimatedLength.zig");
+const AnimatedNumber = @import("webapi/svg/AnimatedNumber.zig");
+const AnimatedString = @import("webapi/svg/AnimatedString.zig");
+const AnimatedTransformList = @import("webapi/svg/AnimatedTransformList.zig");
+const ServiceWorkerGlobalScope = @import("webapi/ServiceWorkerGlobalScope.zig");
+const AnimatedPreserveAspectRatio = @import("webapi/svg/AnimatedPreserveAspectRatio.zig");
+
+const log = lp.log;
+const Allocator = std.mem.Allocator;
+
+// A Page is the container for a root Frame and all of its descendants
+// (nested iframes). It owns the resources that share the lifetime of the root
+// document: the DOM factory, the per-page arena, the JS identity map, shared
+// origins, v8 global handles, and queued navigation buffers.
+//
+// In the future, a Session may hold multiple Pages at once (e.g. during a
+// navigation, while the old Page is retiring and the new one is provisional).
+// For now, Session still holds a single Page.
+const Page = @This();
+
+session: *Session,
+
+// DOM version used to invalidate cached state of "live" collections. Ideally
+// this would be on the Frame (and that's where it used to be). But getting the
+// frame from a DOM mutation call is [relatively] expensive. You can't use
+// the bridge-injected *Frame, because that's the frame where the JS is being
+// executed, which might not be the *Frame that owns the node. We don't store
+// *Frame in node (think of the memory!), so we have to iterate through its
+// parents, find the Document, which has the frame.
+// So the choice is between making every DOM mutation (which has to increase
+// the dom_version) + every read (which has to check the version) slow, or
+// putting this on the Page, and having an DOM mutation in Frame 1 invalidate
+// a cached lookup on Frame 2. We picked the latter.
+dom_version: usize = 0,
+
+// Superset of dom_version that also moves for non-tree state (see
+// Frame.styleChanged); validates the StyleManager memo.
+style_version: usize = 0,
+
+// Monotonic creation counter for BroadcastChannels in this Page. A postMessage
+// captures the current value so delivery targets only channels that existed
+// when it was called
+broadcast_sequence: u64 = 0,
+
+// Health signals for this Page
+status: PageStatus = .{},
+
+// Entered (logScope) around any work done on this Page's behalf.
+log_context: log.PageContext,
+
+// DOM object factory scoped to this Page's documents.
+factory: Factory,
+
+// The arena for this Page's lifetime. Document / Frame / Factory / DOM
+// objects allocate out of this.
+_arena: *lp.Arena,
+arena: Allocator,
+
+// Lazily-created per-node state, kept out of the nodes themselves because
+// few nodes ever need it. Keyed by node pointer and held by the Page, not a
+// Frame or Document: the state belongs to the node whichever realm touches
+// it, and follows the node across documents (adoption) with no migration.
+// Nodes live until the Page does, so a key is never reused.
+
+// See Attribute.List for what this is. TL;DR: proper DOM Attribute Nodes are
+// fat yet rarely needed. We only create them on-demand, but still need proper
+// identity (a given attribute should return the same *Attribute), so we do
+// a look here, keyed by (list, name). We don't store this in the Element or
+// Attribute.List.Entry because that would require additional space per
+// element / Attribute.List.Entry even though we'll create very few (if any)
+// actual *Attributes.
+attribute_lookup: Element.Attribute.List.Lookup = .empty,
+
+// Canonical pool for attribute names that aren't in String.intern's.
+// Every Attribute's entry's name is either a String intern or held here.
+// This is both a memory optimization (deduping attribute names) and a performance
+// optimization (since we can compare strings by just their pointer)
+attribute_names: std.StringHashMapUnmanaged(void) = .empty,
+
+// Same as attribute_lookup, but instead of individual attributes, this is for
+// the return of elements.attributes.
+attribute_named_node_map_lookup: std.AutoHashMapUnmanaged(usize, *Element.Attribute.NamedNodeMap) = .empty,
+
+// Lazily-created style, classList, and dataset objects. Only stored for elements
+// that actually access these features via JavaScript, saving 24 bytes per element.
+element_styles: Element.StyleLookup = .empty,
+// Computed-style views handed out by window.getComputedStyle. The computed
+// variant is a stateless lazy view, so one per (element, pseudo-element)
+// suffices — and Chrome returns the same object for repeated calls, so
+// identity is also conformance.
+element_computed_styles: Element.ComputedStyleLookup = .empty,
+element_datasets: Element.DatasetLookup = .empty,
+element_class_lists: Element.ClassListLookup = .empty,
+element_rel_lists: Element.RelListLookup = .empty,
+element_part_lists: Element.PartListLookup = .empty,
+element_token_lists: Element.TokenListLookup = .empty,
+element_shadow_roots: Element.ShadowRootLookup = .empty,
+element_scroll_positions: Element.ScrollPositionLookup = .empty,
+element_namespace_uris: Element.NamespaceUriLookup = .empty,
+svg_animated_enumerations: AnimatedEnumeration.Lookup = .empty,
+svg_animated_lengths: AnimatedLength.Lookup = .empty,
+svg_animated_numbers: AnimatedNumber.Lookup = .empty,
+svg_animated_preserve_aspect_ratios: AnimatedPreserveAspectRatio.Lookup = .empty,
+svg_animated_strings: AnimatedString.Lookup = .empty,
+svg_animated_transform_lists: AnimatedTransformList.Lookup = .empty,
+_svg_point_lists: PointList.Lookup = .empty,
+_svg_string_lists: StringList.Lookup = .empty,
+
+// Same as above, but for Nodes (slot assigments apply to both Element AND
+// Text nodes)
+_assigned_slots: Node.AssignedSlotLookup = .empty,
+_manual_slot_assignments: Node.AssignedSlotLookup = .empty,
+
+// Origin map for same-origin context sharing. Entries live for the Page's
+// lifetime.
+origins: std.StringHashMapUnmanaged(*js.Origin) = .empty,
+
+// Blob URL store for URL.createObjectURL.
+blob_urls: Blob.UrlMap = .empty,
+
+// Identity tracking for the main world. All main-world contexts in this Page
+// share this, ensuring object identity works across same-origin frames.
+identity: js.Identity = .{},
+
+// Finalizer callbacks for Zig instances exposed to v8 in this Page. Keyed by
+// Zig instance ptr. The backing FinalizerCallback.Identity structs come from
+// Browser.fc_identity_pool so they outlive the Page (and the Session) for v8
+// weak-callback safety.
+finalizer_callbacks: std.AutoHashMapUnmanaged(usize, js.FinalizerCallback) = .empty,
+
+// Event listener registration for every Frame in the Page. This used to be
+// per-frame, but a listener belongs to the target, e.g. a Node, and the Node
+// can be reached and live beyond its Frame.
+event_listeners: EventManagerBase,
+
+// Every live WorkerGlobalScope of this page
+worker_scopes: std.DoublyLinkedList = .{},
+
+// Persisted v8 handles owned by this Page. Handles that outlive the Page are
+// reset on teardown; handles that can be released early are dropped
+// individually. See js.GlobalTracker.
+globals: js.GlobalTracker,
+
+// Double buffered so that, as we process one list of queued navigations, new
+// entries are added to the separate buffer. Prevents endless navigation loops
+// and invalidation of the list during iteration.
+queued_navigation_1: std.ArrayList(*Frame) = .empty,
+queued_navigation_2: std.ArrayList(*Frame) = .empty,
+// pointer to either queued_navigation_1 or queued_navigation_2
+queued_navigation: *std.ArrayList(*Frame) = undefined,
+
+// Temporary buffer for about:blank navigations during processing.
+// We process async navigations first (safe from re-entrance), then sync
+// about:blank navigations (which may add to queued_navigation).
+queued_queued_navigation: std.ArrayList(*Frame) = .empty,
+
+// The root Frame of this Page. Non-optional — a Page always has a root frame.
+frame: Frame,
+
+input_modifiers: if (lp.build_config.wpt_extensions) @import("frame/user_input.zig").Modifiers else struct {} = .{},
+
+// The element the synthetic pointer is currently over
+input_hover_target: ?*Element = null,
+
+// Touch contact and tap state; see user_input.TouchInput.
+input_touch: @import("frame/user_input.zig").TouchInput = .{},
+
+// Per-gesture button state for the synthetic mouse pointer; see
+// user_input.PointerButtons.
+input_pointer: @import("frame/user_input.zig").PointerButtons = .{},
+input_keyboard_modality: bool = false,
+
+// Popup Frames opened by window.open. They are top-level browsing contexts
+// (parent == null, no iframe element) but share this Page's factory, arena,
+// and identity map.
+// Their lifetime is bound to the Page: on Page.deinit they
+// are torn down. TODO: this is far from correct. An new window shouldn't be tied
+// to the original page like this.
+popups: std.ArrayList(*Frame) = .empty,
+
+// Popup Frames that have been closed. The window can still be referenced / used
+// from JS, so we defer shutting them down until page tear down (which isn't
+// ideal from a memory point of view).
+closed_frames: std.ArrayList(*Frame) = .empty,
+
+// SharedWorkerGlobalScopes created by this Page's frames (also registered in
+// session.shared_workers so other pages can connect).
+shared_workers: std.ArrayList(*SharedWorkerGlobalScope) = .empty,
+
+// ServiceWorkerGlobalScopes created by this Page's frames. The page "owns" it,
+// but it's also shared with the Session so that two registers with the same URL
+// return the same SWGS, even across pages (but the owning page will tear it down)
+service_workers: std.ArrayList(*ServiceWorkerGlobalScope) = .empty,
+
+// In-flight navigation for a root page. When not null, this page will "replace"
+// the referenced page once the response header arrives. This is necessary
+// because, during navigation, both the "old" and "new" pages remain addressable
+// in CDP
+replaces: ?*Page = null,
+
+// Inverse of `replaces`. While we don't strictly need both, it does streamline
+// code. The two are kept in sync.
+replacement: ?*Page = null,
+
+// Prevents double entry in session._page_destruction_queue. Can happen since
+// various paths can enter this, and there isn't always a single clear owner
+// of who should errdefer, e.g. if this happens before a navigation's
+// transfer.submit(), then the caller needs to handle the failure. If it happens
+// after, then frameErrorCallback does.
+destroying: bool = false,
+
+// The viewport every consumer should read. The runtime override (set via
+// Emulation.setDeviceMetricsOverride) is stored on the Browser so it persists
+// across page navigations; delegate to it here, keeping a single read path for
+// every viewport consumer.
+pub fn getViewport(self: *const Page) Viewport {
+    return self.session.browser.getViewport();
+}
+
+pub fn viewportChanged(self: *Page) void {
+    self.frame.viewportChanged();
+    var i: usize = 0;
+    while (i < self.popups.items.len) : (i += 1) {
+        self.popups.items[i].viewportChanged();
+    }
+}
+
+// Initialize a Page and its root Frame.
+pub fn init(self: *Page, session: *Session, frame_id: u32) !void {
+    const arena = try session.arena_pool.acquire(.large, "Page.arena");
+    errdefer arena.release();
+
+    self.* = .{
+        .session = session,
+        .frame = undefined,
+        ._arena = arena,
+        .arena = arena.allocator(),
+        .factory = Factory.init(self, arena.allocator(), &session.browser.documents),
+        .globals = .init(session.browser.app.allocator),
+        .event_listeners = .init(arena.allocator()),
+        .log_context = .{ .id = log.nextPageId(), .url = &self.frame.url },
+    };
+    self.queued_navigation = &self.queued_navigation_1;
+
+    try Frame.init(&self.frame, frame_id, self, .{});
+}
+
+pub fn logScope(self: *Page) log.PageScope {
+    return log.enterPage(&self.log_context);
+}
+
+// Tear down the Page and its root Frame. Equivalent to the old
+// Session.removePage + Session.resetFrameResources.
+pub fn deinit(self: *Page) void {
+    const page_scope = self.logScope();
+    defer page_scope.exit();
+
+    log.log(.frame, self.log_context.max_level, "navigation done", .{ .url = self.frame.url });
+
+    for (self.popups.items) |popup| {
+        self.session.removeNavigation(popup._frame_id);
+        popup.deinit();
+    }
+    self.popups = .empty;
+
+    for (self.closed_frames.items) |frame| {
+        if (frame.parent == null) {
+            // A closed popup: its window stayed reachable until now, and so
+            // did its session history.
+            self.session.removeNavigation(frame._frame_id);
+        }
+        frame.deinit();
+    }
+    self.closed_frames = .empty;
+
+    const frame_id = self.frame._frame_id;
+    self.frame.deinit();
+
+    // The JS of a closed page can run until now, so its session history must
+    // stay until now too. A root navigation's replacement page reuses the
+    // frame id and keeps the history.
+    if (self.session.livePage(frame_id) == null) {
+        self.session.removeNavigation(frame_id);
+    }
+
+    {
+        var svg_point_lists = self._svg_point_lists.valueIterator();
+        while (svg_point_lists.next()) |list| {
+            list.*.deinit(self);
+        }
+
+        var svg_transform_lists = self.svg_animated_transform_lists.valueIterator();
+        while (svg_transform_lists.next()) |list| {
+            list.*.deinit(self);
+        }
+    }
+
+    for (self.shared_workers.items) |scope| {
+        scope.deinit();
+    }
+    self.shared_workers = .empty;
+
+    for (self.service_workers.items) |scope| {
+        scope.deinit();
+    }
+    self.service_workers = .empty;
+
+    {
+        if (comptime lp.IS_DEBUG) {
+            std.debug.assert(self.blob_urls.count() == 0);
+        }
+
+        // Defensive cleanup
+        var it = self.blob_urls.valueIterator();
+        while (it.next()) |entry| {
+            entry.blob.releaseRef(self);
+        }
+        self.blob_urls = .empty;
+    }
+
+    const session = self.session;
+    lp.metrics.js_heap_size_bytes.observe(session.browser.env.isolate.getHeapStatistics().total_physical_size);
+    session.browser.reportJsHeap();
+    defer session.browser.env.memoryPressureNotification(.moderate);
+
+    self.identity.deinit();
+    self.identity = .{};
+
+    // Force cleanup all remaining finalized objects.
+    {
+        var it = self.finalizer_callbacks.valueIterator();
+        while (it.next()) |fc| {
+            fc.deinit(self);
+        }
+        self.finalizer_callbacks = .empty;
+    }
+
+    self.globals.deinit();
+
+    if (comptime lp.IS_DEBUG) {
+        std.debug.assert(self.origins.count() == 0);
+    }
+    // Defensive cleanup in case origins leaked.
+    {
+        const app = session.browser.app;
+        var it = self.origins.valueIterator();
+        while (it.next()) |value| {
+            value.*.deinit(app);
+        }
+        self.origins = .empty;
+    }
+
+    self.factory.deinit();
+    self._arena.release();
+}
+
+pub fn recordJsError(self: *Page, err: anyerror) void {
+    self.status.js_errors += 1;
+    lp.metrics.js_errors.incr(if (err == error.JsException) .js_exception else .other);
+}
+
+pub fn getArena(self: *Page, size_or_bucket: anytype, debug: []const u8) !*lp.Arena {
+    return self.session.getArena(size_or_bucket, debug);
+}
+
+pub fn getPinnedArena(self: *Page, size_or_bucket: anytype, debug: []const u8) !*lp.Arena {
+    return self.session.getPinnedArena(size_or_bucket, debug);
+}
+
+pub fn getOrCreateOrigin(self: *Page, key_: ?[]const u8) !*js.Origin {
+    const session = self.session;
+    const key = key_ orelse {
+        var opaque_origin: [36]u8 = undefined;
+        @import("../id.zig").uuidv4(&opaque_origin);
+        // Origin.init will dupe opaque_origin. It's fine that this doesn't
+        // get added to self.origins. In fact, it further isolates it. When the
+        // context is freed, it'll call Page.releaseOrigin which will free it.
+        return js.Origin.init(session.browser.app, session.browser.env.isolate, &opaque_origin);
+    };
+
+    const gop = try self.origins.getOrPut(session.arena.allocator(), key);
+    if (gop.found_existing) {
+        const origin = gop.value_ptr.*;
+        origin.rc += 1;
+        return origin;
+    }
+
+    errdefer _ = self.origins.remove(key);
+
+    const origin = try js.Origin.init(session.browser.app, session.browser.env.isolate, key);
+    gop.key_ptr.* = origin.key;
+    gop.value_ptr.* = origin;
+    return origin;
+}
+
+pub fn createBlobUrl(self: *Page, blob: *Blob, origin: ?[]const u8, creator_frame_id: u32) ![]const u8 {
+    var uuid: [36]u8 = undefined;
+    @import("../id.zig").uuidv4(&uuid);
+
+    const url = try self.arena.print("blob:{s}/{s}", .{ origin orelse "null", uuid });
+    try self.blob_urls.put(self.arena, url, .{ .blob = blob, .creator = creator_frame_id });
+    blob.acquireRef();
+    return url;
+}
+
+pub fn revokeBlobUrl(self: *Page, url: []const u8) void {
+    if (self.blob_urls.fetchRemove(url)) |entry| {
+        entry.value.blob.releaseRef(self);
+    }
+}
+
+pub fn revokeBlobUrlsFor(self: *Page, creator: u32) void {
+    var it = self.blob_urls.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.creator != creator) {
+            continue;
+        }
+        entry.value_ptr.blob.releaseRef(self);
+        self.blob_urls.removeByPtr(entry.key_ptr);
+        // Removal invalidates the iterator; restart. Entry counts are tiny.
+        it = self.blob_urls.iterator();
+    }
+}
+
+pub fn releaseOrigin(self: *Page, origin: *js.Origin) void {
+    const rc = origin.rc;
+    if (rc == 1) {
+        _ = self.origins.remove(origin.key);
+        origin.deinit(self.session.browser.app);
+    } else {
+        origin.rc = rc - 1;
+    }
+}
+
+pub fn scheduleNavigation(self: *Page, frame: *Frame) !void {
+    const list = self.queued_navigation;
+
+    // Check if frame is already queued
+    for (list.items) |existing| {
+        if (existing == frame) {
+            // Already queued
+            return;
+        }
+    }
+
+    return list.append(self.session.arena.allocator(), frame);
+}
+
+pub fn findFrameByFrameId(self: *Page, frame_id: u32) ?*Frame {
+    if (findFrameBy(&self.frame, "_frame_id", frame_id)) |found| {
+        return found;
+    }
+    return self.findPopupBy("_frame_id", frame_id);
+}
+
+// Returns the popup Frame registered under `name`, or null.
+pub fn findPopupByName(self: *Page, name: []const u8) ?*Frame {
+    for (self.popups.items) |popup| {
+        if (std.mem.eql(u8, popup.window._name, name)) {
+            return popup;
+        }
+    }
+    return null;
+}
+
+pub fn findFrameByLoaderId(self: *Page, loader_id: u32) ?*Frame {
+    if (findFrameBy(&self.frame, "_loader_id", loader_id)) |found| {
+        return found;
+    }
+    return self.findPopupBy("_loader_id", loader_id);
+}
+
+fn findFrameBy(frame: *Frame, comptime field: []const u8, id: u32) ?*Frame {
+    if (@field(frame, field) == id) {
+        return frame;
+    }
+    for (frame.child_frames.items) |f| {
+        if (findFrameBy(f, field, id)) |found| {
+            return found;
+        }
+    }
+    return null;
+}
+
+fn findPopupBy(self: *Page, comptime field: []const u8, id: u32) ?*Frame {
+    for (self.popups.items) |frame| {
+        if (findFrameBy(frame, field, id)) |found| {
+            return found;
+        }
+    }
+    return null;
+}
+
+// Called when an EventTarget is eagerly freed. Any listener it installed need
+// to be freed.
+pub fn removeTarget(self: *Page, target: *EventTarget) void {
+    self.event_listeners.removeTarget(target);
+    var node = self.worker_scopes.first;
+    while (node) |n| : (node = n.next) {
+        const wgs: *WorkerGlobalScope = @alignCast(@fieldParentPtr("_page_node", n));
+        wgs._event_manager.removeTarget(target);
+    }
+}
+
+// Snapshots the Execution of every same-origin global in this Page — the root
+// frame, descendant iframes, popups (and their descendants), and each frame's
+// worker scopes — into `arena`.
+//
+// The returned set is fixed, so a caller may run user JS (which can create or
+// tear down frames/workers) while walking it without invalidating the slice.
+pub fn executionsForOrigin(self: *Page, arena: Allocator, origin: []const u8) ![]*js.Execution {
+    var list: std.ArrayList(*js.Execution) = .empty;
+    try appendFrameExecutions(&self.frame, origin, arena, &list);
+    for (self.popups.items) |popup| {
+        try appendFrameExecutions(popup, origin, arena, &list);
+    }
+    return list.items;
+}
+
+fn appendFrameExecutions(frame: *Frame, origin: []const u8, arena: Allocator, list: *std.ArrayList(*js.Execution)) !void {
+    if (frame.origin) |fo| {
+        if (std.mem.eql(u8, fo, origin)) {
+            try list.append(arena, &frame.js.execution);
+        }
+    }
+    for (frame.workers.items) |worker| {
+        const wgs = worker._worker_scope._proto;
+        if (wgs.origin) |wo| {
+            if (std.mem.eql(u8, wo, origin)) {
+                try list.append(arena, &wgs.js.execution);
+            }
+        }
+    }
+    for (frame.child_frames.items) |child| {
+        try appendFrameExecutions(child, origin, arena, list);
+    }
+}
+
+const testing = @import("../testing.zig");
+
+test "Page: status counts uncaught JS errors" {
+    // One uncaught top-level script exception, one uncaught timer-callback
+    // exception.
+    testing.expectLog(&.{ .page_error, .page_error });
+    const page = try testing.pageTest("page_js_error.html", .{});
+    defer page.close();
+
+    try testing.expectEqual(2, page.frame().?.page.status.js_errors);
+}

@@ -1,0 +1,338 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("../js/js.zig");
+
+const Fetch = @import("net/Fetch.zig");
+
+const Event = @import("Event.zig");
+const Scheduler = @import("Scheduler.zig");
+const EventTarget = @import("EventTarget.zig");
+const DOMException = @import("DOMException.zig");
+const ModelContextTool = @import("ModelContext.zig").Tool;
+const LockRequest = @import("LockManager.zig").LockRequest;
+
+const log = lp.log;
+const Execution = js.Execution;
+
+const AbortSignal = @This();
+
+pub const Proto = EventTarget;
+
+const Dependend = union(enum) {
+    signal: *AbortSignal,
+    model_context_tool: *ModelContextTool,
+    // Handled by the owning signal's markAborted (which runs for dependent
+    // signals too, unlike this union's markAborted).
+    scheduler_task: *Scheduler.Task,
+    fetch: *Fetch, // The fetch removes itself when it completes.
+    lock_request: *LockRequest,
+
+    // Returns false if the dependent was already aborted, in which case no
+    // abort event must be dispatched for it.
+    fn markAborted(self: Dependend, reason_: ?Reason, exec: *const Execution) !bool {
+        switch (self) {
+            .signal => |dep| {
+                if (dep._aborted) return false;
+                try dep.markAborted(reason_, exec);
+                return true;
+            },
+            .model_context_tool => |dep| {
+                try dep.markAborted(exec);
+                return true;
+            },
+            .scheduler_task, .fetch, .lock_request => return false,
+        }
+    }
+
+    fn dispatchAbortEvent(self: Dependend, exec: *const Execution) !void {
+        switch (self) {
+            .signal => |dep| try dep.dispatchAbortEvent(exec),
+            .model_context_tool, .scheduler_task, .fetch, .lock_request => {},
+        }
+    }
+};
+
+_proto: *EventTarget,
+_type: Type = .generic,
+_aborted: bool = false,
+_is_dependent: bool = false,
+_reason: Reason = .undefined,
+_dependents: std.ArrayList(Dependend) = .empty,
+_source_signals: std.ArrayList(*AbortSignal) = .empty,
+
+pub const Type = union(enum) {
+    generic: void,
+    task_signal: *@import("TaskSignal.zig"),
+};
+
+pub fn init(exec: *const Execution) !*AbortSignal {
+    return exec._factory.eventTarget(AbortSignal{
+        ._proto = undefined,
+    });
+}
+
+pub fn getAborted(self: *const AbortSignal) bool {
+    return self._aborted;
+}
+
+fn getReason(self: *const AbortSignal) Reason {
+    return self._reason;
+}
+
+pub fn asEventTarget(self: *AbortSignal) *EventTarget {
+    return self._proto;
+}
+
+pub fn abort(self: *AbortSignal, reason_: ?Reason, exec: *const Execution) !void {
+    if (self._aborted) {
+        return;
+    }
+
+    try self.markAborted(reason_, exec);
+
+    // Per spec: mark all direct dependents aborted (with this signal's reason)
+    // BEFORE firing any abort events. The graph is flattened at any() creation,
+    // so we never need to recurse here.
+    var to_dispatch: std.ArrayList(Dependend) = .empty;
+    for (self._dependents.items) |dep| {
+        if (try dep.markAborted(self._reason, exec)) {
+            try to_dispatch.append(exec.call_arena, dep);
+        }
+    }
+
+    try self.dispatchAbortEvent(exec);
+    for (to_dispatch.items) |dep| {
+        dep.dispatchAbortEvent(exec) catch |err| {
+            log.debug(.app, "abort dependent dispatch", .{ .err = err });
+        };
+    }
+}
+
+fn markAborted(self: *AbortSignal, reason_: ?Reason, exec: *const Execution) !void {
+    self._aborted = true;
+    if (reason_) |reason| {
+        switch (reason) {
+            .dom => |dom| self._reason = .{ .dom = dom },
+            .js_val => |js_val| self._reason = .{ .js_val = js_val },
+            .string => |str| self._reason = .{ .string = try exec.dupeString(str) },
+            .undefined => self._reason = reason,
+        }
+    } else {
+        // Allocate the DOMException so the reason keeps a single JS identity:
+        // dependent signals must expose the very same DOMException instance.
+        const dom = try exec.page_arena.create(DOMException);
+        dom.* = defaultReason();
+        self._reason = .{ .dom = dom };
+    }
+
+    // Unlike the loop in abort(), this runs for dependent signals too, so a
+    // task or fetch registered on an any() signal still gets rejected.
+    for (self._dependents.items) |dep| {
+        switch (dep) {
+            .scheduler_task => |task| task.onAbort(self._reason, exec),
+            .fetch => |fetch| fetch.abort(self._reason),
+            .lock_request => |lr| lr.onAbort(self._reason, exec),
+            else => {},
+        }
+    }
+}
+
+pub fn removeDependent(self: *AbortSignal, dep: Dependend) void {
+    for (self._dependents.items, 0..) |d, i| {
+        if (std.meta.eql(d, dep)) {
+            _ = self._dependents.orderedRemove(i);
+            return;
+        }
+    }
+}
+
+fn dispatchAbortEvent(self: *AbortSignal, exec: *const Execution) !void {
+    const target = self.asEventTarget();
+    if (exec.hasDirectListeners(target, "abort")) {
+        const event = try Event.initTrusted(comptime .wrap("abort"), .{}, exec.page);
+        try exec.dispatch(target, event, .{ .context = "abort signal" });
+    }
+}
+
+// Converts an abort(reason) JS argument to a Reason. Per spec, only a
+// missing or undefined reason falls back to the default "AbortError"
+// DOMException: an explicit null (or any other value) is kept as-is.
+pub fn reasonFromJs(reason_: ?js.Value) !?Reason {
+    const reason = reason_ orelse return null;
+    if (reason.isUndefined()) {
+        return null;
+    }
+    return .{ .js_val = try reason.persist() };
+}
+
+// Static method to create an already-aborted signal
+fn createAborted(reason_: ?js.Value, exec: *const Execution) !*AbortSignal {
+    const signal = try init(exec);
+    try signal.abort(try reasonFromJs(reason_), exec);
+    return signal;
+}
+
+fn createAny(signals: []const *AbortSignal, exec: *const Execution) !*AbortSignal {
+    const result = try init(exec);
+    for (signals) |source| {
+        if (source._aborted) {
+            try result.abort(source._reason, exec);
+            return result;
+        }
+    }
+
+    result._is_dependent = true;
+
+    for (signals) |source| {
+        if (!source._is_dependent) {
+            try source._dependents.append(exec.page_arena, .{ .signal = result });
+            try result._source_signals.append(exec.page_arena, source);
+        } else {
+            for (source._source_signals.items) |s| {
+                try s._dependents.append(exec.page_arena, .{ .signal = result });
+                try result._source_signals.append(exec.page_arena, s);
+            }
+        }
+    }
+    return result;
+}
+
+fn createTimeout(milliseconds: f64, exec: *const Execution) !*AbortSignal {
+    if (std.math.isFinite(milliseconds) == false) {
+        return error.TypeError;
+    }
+    const truncated = @trunc(milliseconds);
+    if (truncated < 0 or truncated > std.math.maxInt(u53)) {
+        return error.TypeError;
+    }
+    const delay: u32 = @intFromFloat(@min(truncated, std.math.maxInt(u32)));
+
+    const callback = try exec.page_arena.create(TimeoutCallback);
+    callback.* = .{
+        .exec = exec,
+        .signal = try init(exec),
+    };
+
+    try exec._scheduler.add(callback, TimeoutCallback.run, delay, .{
+        .name = "AbortSignal.timeout",
+    });
+
+    return callback.signal;
+}
+
+const ThrowIfAborted = union(enum) {
+    exception: js.Exception,
+    undefined: void,
+};
+fn throwIfAborted(self: *const AbortSignal, exec: *const Execution) !ThrowIfAborted {
+    const local = exec.js.local.?;
+
+    if (self._aborted) {
+        const exception = switch (self._reason) {
+            .dom => |err| local.newException(err),
+            .string => |str| local.newException(str),
+            .js_val => |js_val| local.newException(js_val),
+            .undefined => local.newException(defaultReason()),
+        };
+        return .{ .exception = exception };
+    }
+    return .undefined;
+}
+
+// The reason for an abort without one. The message matches Chrome's.
+fn defaultReason() DOMException {
+    return .init("signal is aborted without reason", "AbortError");
+}
+
+pub const Reason = union(enum) {
+    js_val: js.Value.Global,
+    dom: *DOMException,
+    string: []const u8,
+    undefined: void,
+};
+
+// The reason as a JS value, e.g. to reject a promise with it.
+pub fn reasonJsValue(reason: Reason, local: *const js.Local) !js.Value {
+    return switch (reason) {
+        .dom => |dom| local.zigValueToJs(dom, .{}),
+        .string => |str| local.zigValueToJs(str, .{}),
+        .js_val => |global| local.toLocal(global),
+        .undefined => local.zigValueToJs(defaultReason(), .{}),
+    };
+}
+
+const TimeoutCallback = struct {
+    exec: *const Execution,
+    signal: *AbortSignal,
+
+    fn run(ctx: *anyopaque) !?u32 {
+        const self: *TimeoutCallback = @ptrCast(@alignCast(ctx));
+        self.timeoutAbort() catch |err| {
+            log.debug(.app, "abort signal timeout", .{ .err = err });
+        };
+        return null;
+    }
+
+    fn timeoutAbort(self: *TimeoutCallback) !void {
+        // Per spec, the abort is queued as a global task on the signal's
+        // global: it must not run when the global's document is no longer
+        // fully active (e.g. the iframe that created the signal was detached).
+        switch (self.exec.js.global) {
+            .frame => |frame| {
+                var current: ?@TypeOf(frame) = frame;
+                while (current) |f| : (current = f.parent) {
+                    const iframe = f.iframe orelse continue;
+                    if (!iframe.asNode().isConnected()) {
+                        return;
+                    }
+                }
+            },
+            .worker => {},
+        }
+
+        const dom = try self.exec.page_arena.create(DOMException);
+        dom.* = DOMException.init("signal timed out", "TimeoutError");
+        try self.signal.abort(.{ .dom = dom }, self.exec);
+    }
+};
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(AbortSignal);
+
+    pub const Meta = struct {
+        pub const name = "AbortSignal";
+
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const Prototype = EventTarget;
+
+    pub const aborted = bridge.accessor(AbortSignal.getAborted, null, .{});
+    pub const reason = bridge.accessor(AbortSignal.getReason, null, .{});
+    pub const onabort = EventTarget.handlerAccessor(AbortSignal, "abort");
+    pub const throwIfAborted = bridge.function(AbortSignal.throwIfAborted, .{});
+
+    // Static method
+    pub const abort = bridge.function(AbortSignal.createAborted, .{ .static = true });
+    pub const any = bridge.function(AbortSignal.createAny, .{ .static = true });
+    pub const timeout = bridge.function(AbortSignal.createTimeout, .{ .static = true });
+};

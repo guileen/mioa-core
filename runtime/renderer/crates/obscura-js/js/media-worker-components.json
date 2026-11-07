@@ -1,0 +1,245 @@
+{
+  "audio": {
+    "package": "web-audio-engine",
+    "version": "0.13.4",
+    "url": "https://unpkg.com/web-audio-engine@0.13.4/build/web-audio-engine.js",
+    "upstreamCommit": "a7d09ffd8aa1ef9837355fd412457c8bab296a21",
+    "upstreamPublishedSha256": "2dcfefee4ab4120c38dd1d47a640c997e6ce6589b662827dad097981e161907d",
+    "dependencyVersionSource": "upstream yarn.lock at the same commit; artifact content identity is pinned separately",
+    "packages": [
+      {
+        "name": "web-audio-engine",
+        "version": "0.13.4",
+        "license": "MIT",
+        "author": {
+          "name": "Nao Yonamine",
+          "email": "mohayonao@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "audio-type",
+        "version": "1.0.2",
+        "license": "MIT",
+        "author": {
+          "url": "http://h3manth.com",
+          "name": "Hemanth.HM",
+          "email": "hemanth.hm@gmail.com"
+        },
+        "licenseFiles": [
+          "/license"
+        ]
+      },
+      {
+        "name": "biquad-coeffs-webaudio",
+        "version": "1.2.0",
+        "license": "MIT",
+        "author": {
+          "name": "Nao Yonamine",
+          "email": "mohayonao@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "biquad-coeffs-webaudio-v1",
+        "version": "1.2.0",
+        "license": "MIT",
+        "author": {
+          "name": "Nao Yonamine",
+          "email": "mohayonao@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "biquad-coeffs-webaudio-v2",
+        "version": "1.2.0",
+        "license": "MIT",
+        "author": {
+          "name": "Nao Yonamine",
+          "email": "mohayonao@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "events",
+        "version": "1.1.1",
+        "license": "MIT",
+        "author": {
+          "url": "http://jeditoolkit.com",
+          "name": "Irakli Gozalishvili",
+          "email": "rfobic@gmail.com"
+        },
+        "licenseFiles": [
+          "/LICENSE"
+        ]
+      },
+      {
+        "name": "fourier-transform",
+        "version": "1.0.2",
+        "license": "MIT",
+        "author": {
+          "name": "ΔY",
+          "email": "dfcreative@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "is-flac",
+        "version": "1.1.2",
+        "license": "MIT",
+        "author": {
+          "url": "http://h3manth.com",
+          "name": "Hemanth.HM",
+          "email": "hemanth.hm@gmail.com"
+        },
+        "licenseFiles": [
+          "/license"
+        ]
+      },
+      {
+        "name": "is-m4a",
+        "version": "1.1.0",
+        "license": "MIT",
+        "author": {
+          "url": "http://h3manth.com",
+          "name": "Hemanth.HM",
+          "email": "hemanth.hm@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "is-mp3",
+        "version": "1.1.2",
+        "license": "MIT",
+        "author": {
+          "url": "http://h3manth.com",
+          "name": "Hemanth.HM",
+          "email": "hemanth.hm@gmail.com"
+        },
+        "licenseFiles": [
+          "/license"
+        ]
+      },
+      {
+        "name": "is-ogg",
+        "version": "1.1.2",
+        "license": "MIT",
+        "author": {
+          "url": "http://h3manth.com",
+          "name": "Hemanth.HM",
+          "email": "hemanth.hm@gmail.com"
+        },
+        "licenseFiles": [
+          "/license"
+        ]
+      },
+      {
+        "name": "is-wav",
+        "version": "1.1.2",
+        "license": "MIT",
+        "author": {
+          "url": "http://h3manth.com",
+          "name": "Hemanth.HM",
+          "email": "hemanth.hm@gmail.com"
+        },
+        "licenseFiles": [
+          "/license"
+        ]
+      },
+      {
+        "name": "nmap",
+        "version": "1.1.0",
+        "license": "MIT",
+        "author": {
+          "name": "Nao Yonamine",
+          "email": "mohayonao@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "wav-decoder",
+        "version": "1.1.0",
+        "license": "MIT",
+        "author": {
+          "name": "Nao Yonamine",
+          "email": "mohayonao@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "wav-encoder",
+        "version": "1.1.0",
+        "license": "MIT",
+        "author": {
+          "name": "Nao Yonamine",
+          "email": "mohayonao@gmail.com"
+        },
+        "licenseFiles": []
+      },
+      {
+        "name": "scijs-window-functions",
+        "version": "2.0.2",
+        "license": "MIT",
+        "author": {
+          "name": "Ricky Reusser"
+        },
+        "licenseFiles": []
+      }
+    ],
+    "backend": "pure JavaScript signal graph and DSP; software headless sink; 128-frame render quantum",
+    "supportedSampleRatesHz": [
+      8000,
+      96000
+    ],
+    "unsupported": [
+      "physical audio devices",
+      "AudioWorklet",
+      "media element/stream source and destination",
+      "convolution",
+      "3D panning/spatial listener",
+      "compressed codecs other than WAV",
+      "bit-identical Chrome/WebKit audio fingerprint output"
+    ],
+    "compressor": "local linked-channel soft-knee DSP replaces upstream passthrough; attack/release smoothing, no look-ahead/platform matching"
+  },
+  "worker": {
+    "runtime": "existing deno_core 0.412.0 / V8 on its dedicated owning OS thread; one-worker multi-thread Tokio reactor; no page snapshot",
+    "threadCost": "One additional persistent Tokio reactor worker thread per live dedicated Worker supports synchronous classic imports; V8 and Rc state never move to it. Existing DNS/blocking I/O pool costs remain transport-dependent.",
+    "classicImports": "importScripts resolves arguments against the final Worker entry URL, loads sequentially through the existing native fetch/proxy/cookie/origin/SSRF/redirect/interception pipeline, validates status and JavaScript MIME, then compiles/runs on the original Worker isolate; termination cancels pending loading",
+    "newRustDependencies": [],
+    "sharedResources": [
+      "host-owned schema3 resolved identity and native creator origin override page-supplied values",
+      "native HTTP client and configured proxy",
+      "cookie jar",
+      "IndexedDB context store",
+      "request callbacks/interception",
+      "page in-flight counter"
+    ],
+    "messaging": "native structured serialization with IndexedDB Blob/File codecs, asynchronous native channels plus receiver task dispatch; termination interrupts the V8 isolate",
+    "unsupported": [
+      "module workers",
+      "nested workers",
+      "SharedWorker",
+      "ServiceWorker",
+      "transfer lists/MessagePort transfer",
+      "SharedArrayBuffer and WebAssembly.Module transfer",
+      "streaming Response.body and request bodies",
+      "streaming TextDecoder",
+      "WebSocket",
+      "WebCrypto subtle",
+      "unavailable architecture/bitness/model/platformVersion high-entropy values are reported empty",
+      "URLSearchParams and FormData",
+      "MessageChannel and BroadcastChannel",
+      "Fetch cache modes other than default/no-store, referrer policy and non-follow redirect modes",
+      "platform-object cloning beyond the shared Blob/File storage codecs",
+      "complete WebIDL descriptor and brand conformance",
+      "OffscreenCanvas and Worker Canvas/WebGL rendering (Window/iframe real rendering is unchanged)"
+    ]
+  },
+  "build": {
+    "additionalSystemDependencies": [],
+    "additionalCargoFeatures": [],
+    "existingOptionalFeature": "stealth preserves the existing native stealth HTTP transport; no render feature required for Audio/Worker",
+    "verification": "Not run: assignment forbids builds, tests, lint, formatting and smoke runs."
+  }
+}

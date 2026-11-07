@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<script id=basic>
+{
+  const headers = new Headers();
+  testing.expectEqual(null, headers.get('Content-Type'));
+  testing.expectEqual(false, headers.has('Content-Type'));
+
+  headers.set('Content-Type', 'application/json');
+  testing.expectEqual('application/json', headers.get('Content-Type'));
+  testing.expectEqual(true, headers.has('Content-Type'));
+
+  headers.set('Content-Type', 'text/html');
+  testing.expectEqual('text/html', headers.get('Content-Type'));
+
+  headers.delete('Content-Type');
+  testing.expectEqual(null, headers.get('Content-Type'));
+  testing.expectEqual(false, headers.has('Content-Type'));
+}
+</script>
+
+<script id=case-insensitive>
+// Headers should be case-insensitive per HTTP spec
+{
+  const headers = new Headers();
+
+  // Set with one case, get with another
+  headers.set('Content-Type', 'application/json');
+  testing.expectEqual('application/json', headers.get('content-type'));
+  testing.expectEqual('application/json', headers.get('CONTENT-TYPE'));
+  testing.expectEqual('application/json', headers.get('Content-Type'));
+
+  // has should be case-insensitive
+  testing.expectEqual(true, headers.has('content-type'));
+  testing.expectEqual(true, headers.has('CONTENT-TYPE'));
+  testing.expectEqual(true, headers.has('Content-Type'));
+
+  // delete should be case-insensitive
+  headers.delete('CONTENT-TYPE');
+  testing.expectEqual(false, headers.has('content-type'));
+  testing.expectEqual(false, headers.has('Content-Type'));
+}
+
+{
+  const headers = new Headers();
+
+  // Append with different cases - should all be treated as same header
+  headers.append('Accept', 'application/json');
+  headers.append('ACCEPT', 'text/html');
+  headers.append('accept', 'text/plain');
+
+  // Iteration combines a name's values into one entry.
+  const values = Array.from(headers.values());
+  testing.expectEqual(1, values.length);
+  testing.expectEqual('application/json, text/html, text/plain', values[0]);
+}
+
+{
+  const headers = new Headers();
+
+  // Set should replace regardless of case
+  headers.set('Authorization', 'Bearer token1');
+  headers.set('AUTHORIZATION', 'Bearer token2');
+
+  testing.expectEqual('Bearer token2', headers.get('authorization'));
+
+  // Should only have one entry after set replaces
+  const entries = Array.from(headers.entries());
+  testing.expectEqual(1, entries.length);
+  testing.expectEqual('authorization', entries[0][0]);
+  testing.expectEqual('Bearer token2', entries[0][1]);
+}
+
+{
+    const headers = new Headers({"Set-Cookie": "name=world"});
+    testing.expectEqual("name=world", headers.get("set-cookie"));
+}
+
+// Test object initialization with case normalization
+{
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "AUTHORIZATION": "Bearer token",
+    "x-CuStOm": "mixed-case"
+  });
+
+  // All headers should be normalized to lowercase
+  testing.expectEqual("application/json", headers.get("content-type"));
+  testing.expectEqual("Bearer token", headers.get("authorization"));
+  testing.expectEqual("mixed-case", headers.get("x-custom"));
+
+  // Verify via keys iterator that names are normalized
+  const keys = Array.from(headers.keys());
+  testing.expectEqual(3, keys.length);
+  testing.expectEqual(true, keys.includes("content-type"));
+  testing.expectEqual(true, keys.includes("authorization"));
+  testing.expectEqual(true, keys.includes("x-custom"));
+}
+</script>
+
+<script id=array-initialization>
+// Test array initialization
+{
+  const headers = new Headers([
+    ["Content-Type", "application/json"],
+    ["Authorization", "Bearer token123"]
+  ]);
+
+  testing.expectEqual("application/json", headers.get("Content-Type"));
+  testing.expectEqual("Bearer token123", headers.get("Authorization"));
+  testing.expectEqual(true, headers.has("Content-Type"));
+  testing.expectEqual(true, headers.has("Authorization"));
+}
+
+// Test array initialization with case normalization
+{
+  const headers = new Headers([
+    ["Content-Type", "text/html"],
+    ["AUTHORIZATION", "Bearer abc"],
+    ["x-CuStOm-HeAdEr", "value123"]
+  ]);
+
+  // All header names should be normalized to lowercase
+  testing.expectEqual("text/html", headers.get("content-type"));
+  testing.expectEqual("Bearer abc", headers.get("authorization"));
+  testing.expectEqual("value123", headers.get("x-custom-header"));
+
+  // Verify case-insensitive access works
+  testing.expectEqual("text/html", headers.get("CONTENT-TYPE"));
+  testing.expectEqual("Bearer abc", headers.get("Authorization"));
+  testing.expectEqual("value123", headers.get("X-CUSTOM-HEADER"));
+
+  // Verify keys are normalized (and iterated in sorted order)
+  const keys = Array.from(headers.keys());
+  testing.expectEqual(3, keys.length);
+  testing.expectEqual("authorization", keys[0]);
+  testing.expectEqual("content-type", keys[1]);
+  testing.expectEqual("x-custom-header", keys[2]);
+}
+
+// Test array initialization with multiple values
+{
+  const headers = new Headers([
+    ["Accept", "application/json"],
+    ["Accept", "text/html"],
+    ["Content-Type", "text/plain"]
+  ]);
+
+  // Iteration combines a name's values; get() sees the same thing.
+  const entries = Array.from(headers.entries());
+  testing.expectEqual(2, entries.length);
+  testing.expectEqual("accept", entries[0][0]);
+  testing.expectEqual("application/json, text/html", entries[0][1]);
+  testing.expectEqual("application/json, text/html", headers.get("accept"));
+}
+</script>
+
+<script id=iterable-initialization>
+// A sequence<sequence<ByteString>> takes any iterable, not only an Array:
+// a Map, a Set of pairs, a generator. A plain object is still a record.
+{
+  testing.expectEqual("1", new Headers(new Map([["a", "1"]])).get("a"));
+  testing.expectEqual("2", new Headers(new Set([["b", "2"]])).get("b"));
+  testing.expectEqual("3", new Headers((function* () { yield ["c", "3"]; })()).get("c"));
+  testing.expectEqual("4", new Request("http://example.com/", { headers: new Map([["d", "4"]]) }).headers.get("d"));
+  testing.expectEqual("5", new Response("", { headers: new Map([["e", "5"]]) }).headers.get("e"));
+  testing.expectEqual("6", new Headers({ f: "6" }).get("f"));
+  // A platform object that iterates pairs is a sequence too, not a record.
+  testing.expectEqual("7", new Headers(new URLSearchParams("g=7")).get("g"));
+  const form = new FormData();
+  form.append("h", "8");
+  testing.expectEqual("8", new Headers(form).get("h"));
+}
+
+// Each item must itself be a pair, and an exception from the page's
+// iterator propagates.
+{
+  const errorName = (fn) => {
+    try {
+      fn();
+      return null;
+    } catch (err) {
+      return err.name;
+    }
+  };
+  testing.expectEqual("TypeError", errorName(() => new Headers(new Set([5]))));
+  testing.expectEqual("TypeError", errorName(() => new Headers(new Set([["a"]]))));
+  const boom = new RangeError("boom");
+  let thrown = null;
+  try {
+    new Headers({ [Symbol.iterator]() { throw boom; } });
+  } catch (err) {
+    thrown = err;
+  }
+  testing.expectEqual(boom, thrown);
+}
+</script>
+
+<script id=value-validation>
+// The constructor validates names/values and normalizes values per Fetch.
+{
+  // Leading/trailing HTTP whitespace in values is stripped.
+  const headers = new Headers([["Content-Type", "  text/html\t"]]);
+  testing.expectEqual("text/html", headers.get("content-type"));
+}
+
+// An invalid header name throws a TypeError.
+testing.expectError('TypeError: Invalid header name', () => new Headers([["a b", "x"]]));
+testing.expectError('TypeError: Invalid header name', () => new Headers({ "a b": "x" }));
+
+// A value with a forbidden byte (here an interior newline) throws a TypeError.
+testing.expectError('TypeError: Invalid header value', () => new Headers([["x", "a\nb"]]));
+
+// A value with a code point above U+00FF cannot be a byte string: TypeError.
+{
+  let threw = false;
+  try { new Headers({ "x": "Ā" }); } catch (e) { threw = e instanceof TypeError; }
+  testing.expectEqual(true, threw);
+}
+</script>
+
+<script id=copy-constructor>
+// Test creating Headers from another Headers object
+{
+  const original = new Headers();
+  original.set("Content-Type", "application/json");
+  original.set("Authorization", "Bearer token123");
+  original.set("X-Custom", "test-value");
+
+  const copy = new Headers(original);
+
+  // Copy should have all the same headers
+  testing.expectEqual("application/json", copy.get("Content-Type"));
+  testing.expectEqual("Bearer token123", copy.get("Authorization"));
+  testing.expectEqual("test-value", copy.get("X-Custom"));
+
+  // Copy should be independent
+  copy.set("X-Modified", "new-value");
+  testing.expectEqual("new-value", copy.get("X-Modified"));
+  testing.expectEqual(null, original.get("X-Modified"));
+
+  // Modifying copy shouldn't affect original
+  copy.set("Content-Type", "text/html");
+  testing.expectEqual("text/html", copy.get("Content-Type"));
+  testing.expectEqual("application/json", original.get("Content-Type"));
+}
+
+// Test copy constructor with mixed-case headers
+{
+  const original = new Headers([
+    ["Content-TYPE", "application/json"],
+    ["AUTHORIZATION", "Bearer xyz"]
+  ]);
+
+  const copy = new Headers(original);
+
+  // Headers should be normalized in copy
+  testing.expectEqual("application/json", copy.get("content-type"));
+  testing.expectEqual("Bearer xyz", copy.get("authorization"));
+
+  const keys = Array.from(copy.keys());
+  testing.expectEqual(2, keys.length);
+  testing.expectEqual("authorization", keys[0]);
+  testing.expectEqual("content-type", keys[1]);
+}
+</script>
+
+<script id=iterators>
+// Test keys(), values(), entries() iterators
+{
+  const headers = new Headers();
+  headers.set('Content-Type', 'application/json');
+  headers.set('Authorization', 'Bearer token123');
+  headers.set('X-Custom', 'test-value');
+
+  // Iteration is in sorted name order, not insertion order.
+  const keys = Array.from(headers.keys());
+  testing.expectEqual(3, keys.length);
+  testing.expectEqual('authorization', keys[0]);
+  testing.expectEqual('content-type', keys[1]);
+  testing.expectEqual('x-custom', keys[2]);
+
+  // Test values()
+  const values = Array.from(headers.values());
+  testing.expectEqual(3, values.length);
+  testing.expectEqual('Bearer token123', values[0]);
+  testing.expectEqual('application/json', values[1]);
+  testing.expectEqual('test-value', values[2]);
+
+  // Test entries()
+  const entries = Array.from(headers.entries());
+  testing.expectEqual(3, entries.length);
+  testing.expectEqual('authorization', entries[0][0]);
+  testing.expectEqual('Bearer token123', entries[0][1]);
+  testing.expectEqual('content-type', entries[1][0]);
+  testing.expectEqual('application/json', entries[1][1]);
+  testing.expectEqual('x-custom', entries[2][0]);
+  testing.expectEqual('test-value', entries[2][1]);
+}
+
+// Headers is iterable: for..of, spread and Object.fromEntries all go
+// through Symbol.iterator, not entries().
+{
+  const headers = new Headers({ 'X-B': '2', 'X-A': '1' });
+  testing.expectEqual('function', typeof headers[Symbol.iterator]);
+
+  const spread = [...headers];
+  testing.expectEqual(2, spread.length);
+  testing.expectEqual('x-a', spread[0][0]);
+  testing.expectEqual('1', spread[0][1]);
+
+  const collected = [];
+  for (const [name, value] of headers) {
+    collected.push(name + '=' + value);
+  }
+  testing.expectEqual('x-a=1,x-b=2', collected.join(','));
+
+  // set-cookie is never combined and keeps its order; a name's other values are.
+  headers.append('Set-Cookie', 'a=1');
+  headers.append('set-cookie', 'b=2');
+  headers.append('x-a', '3');
+  testing.expectEqual('set-cookie=a=1,set-cookie=b=2,x-a=1, 3,x-b=2', [...headers].map(e => e.join('=')).join(','));
+
+  // append/set validate names and normalize values like the constructor.
+  headers.set('X-Trim', '  v  ');
+  testing.expectEqual('v', headers.get('x-trim'));
+  let threw = 0;
+  try { headers.append('Bad Name', 'x'); } catch (e) { threw += e instanceof TypeError; }
+  try { headers.set('X-Ok', 'a\nb'); } catch (e) { threw += e instanceof TypeError; }
+  try { headers.get(''); } catch (e) { threw += e instanceof TypeError; }
+  testing.expectEqual(3, threw);
+
+  const obj = Object.fromEntries(headers);
+  testing.expectEqual('1, 3', obj['x-a']);
+  testing.expectEqual('2', new Map(headers).get('x-b'));
+}
+
+// Test forEach()
+{
+  const headers = new Headers();
+  headers.set('Content-Type', 'application/json');
+  headers.set('Authorization', 'Bearer token123');
+
+  const collected = [];
+  headers.forEach(function(value, name, headersObj) {
+    collected.push([name, value]);
+    testing.expectEqual(headers, headersObj);
+  });
+
+  testing.expectEqual(2, collected.length);
+  testing.expectEqual('authorization', collected[0][0]);
+  testing.expectEqual('Bearer token123', collected[0][1]);
+  testing.expectEqual('content-type', collected[1][0]);
+  testing.expectEqual('application/json', collected[1][1]);
+}
+
+// Test forEach with thisArg
+{
+  const headers = new Headers();
+  headers.set('X-Test', 'value');
+
+  const context = { count: 0 };
+  headers.forEach(function() {
+    this.count++;
+  }, context);
+
+  testing.expectEqual(1, context.count);
+}
+
+// Test multiple values for same header using append
+{
+  const headers = new Headers();
+  headers.append('Accept', 'application/json');
+  headers.append('Accept', 'text/html');
+  headers.append('Accept', 'text/plain');
+
+  const values = [];
+  headers.forEach((value, name) => {
+    if (name === 'accept') {
+      values.push(value);
+    }
+  });
+
+  // forEach sees the combined value, like iteration.
+  testing.expectEqual(1, values.length);
+  testing.expectEqual('application/json, text/html, text/plain', values[0]);
+}
+</script>
+
+<script id=get-concatenation>
+// Test that get() returns concatenated values for headers with multiple values
+{
+  const headers = new Headers();
+  headers.append('Accept', 'application/json');
+  headers.append('Accept', 'text/html');
+  headers.append('Accept', 'text/plain');
+
+  // get() should return comma-separated concatenated values
+  const acceptValue = headers.get('Accept');
+  testing.expectEqual('application/json, text/html, text/plain', acceptValue);
+}
+
+// Test concatenation with case-insensitive header names
+{
+  const headers = new Headers();
+  headers.append('Content-Type', 'image/jpeg');
+  headers.append('CONTENT-TYPE', 'image/png');
+  headers.append('content-type', 'image/svg+xml');
+
+  const contentType = headers.get('Content-Type');
+  testing.expectEqual('image/jpeg, image/png, image/svg+xml', contentType);
+}
+
+// Test that set() replaces all values, not concatenates
+{
+  const headers = new Headers();
+  headers.append('Authorization', 'Bearer token1');
+  headers.append('Authorization', 'Bearer token2');
+
+  // Before set, should have both values
+  testing.expectEqual('Bearer token1, Bearer token2', headers.get('Authorization'));
+
+  // set() should replace all values
+  headers.set('Authorization', 'Bearer new-token');
+  testing.expectEqual('Bearer new-token', headers.get('Authorization'));
+
+  // Should only have one entry now
+  const entries = Array.from(headers.entries());
+  const authEntries = entries.filter(e => e[0] === 'authorization');
+  testing.expectEqual(1, authEntries.length);
+}
+</script>
+
+<script id=getSetCookie>
+{
+  const headers = new Headers();
+  testing.expectEqual(0, headers.getSetCookie().length);
+
+  headers.append('Set-Cookie', 'a=1; Path=/');
+  headers.append('set-cookie', 'b=2; HttpOnly');
+  // get() joins, which corrupts cookies that themselves contain commas.
+  testing.expectEqual('a=1; Path=/, b=2; HttpOnly', headers.get('Set-Cookie'));
+  const cookies = headers.getSetCookie();
+  testing.expectEqual(2, cookies.length);
+  testing.expectEqual('a=1; Path=/', cookies[0]);
+  testing.expectEqual('b=2; HttpOnly', cookies[1]);
+}
+</script>
+
+<script id=guard>
+{
+  // Set-Cookie is a forbidden response header: a response-guarded Headers
+  // ignores it however it arrives.
+  const res = new Response();
+  res.headers.append('Set-Cookie', 'a=1');
+  res.headers.set('sEt-cOokIe', 'b=2');
+  testing.expectEqual(0, res.headers.getSetCookie().length);
+  testing.expectEqual(null, res.headers.get('set-cookie'));
+
+  const from_init = new Response('', {headers: {'Set-Cookie': 'a=1', 'X-Keep': 'yes'}});
+  testing.expectEqual(0, from_init.headers.getSetCookie().length);
+  testing.expectEqual('yes', from_init.headers.get('x-keep'));
+
+  // A standalone Headers is unguarded and keeps them, but filling a Response
+  // from one still drops them.
+  const plain = new Headers({'Set-Cookie': 'a=1'});
+  testing.expectEqual(1, plain.getSetCookie().length);
+  testing.expectEqual(0, new Response('', {headers: plain}).headers.getSetCookie().length);
+
+  // clone() carries the guard over.
+  const cloned = from_init.clone();
+  cloned.headers.append('Set-Cookie', 'a=1');
+  testing.expectEqual(0, cloned.headers.getSetCookie().length);
+  testing.expectEqual('yes', cloned.headers.get('x-keep'));
+}
+</script>
+
+<script id=guard_immutable>
+{
+  const redirect = Response.redirect('http://127.0.0.1:9582/hi.html', 302);
+  testing.expectEqual('http://127.0.0.1:9582/hi.html', redirect.headers.get('location'));
+
+  for (const headers of [Response.error().headers, redirect.headers]) {
+    let threw = 0;
+    try { headers.append('x-a', '1'); } catch (e) { if (e instanceof TypeError) threw += 1; }
+    try { headers.set('x-a', '1'); } catch (e) { if (e instanceof TypeError) threw += 1; }
+    try { headers.delete('x-a'); } catch (e) { if (e instanceof TypeError) threw += 1; }
+    testing.expectEqual(3, threw);
+    testing.expectEqual(null, headers.get('x-a'));
+  }
+}
+</script>
+
+<script id=long_name>
+{
+  // longer than the 1024-byte buffer names used to be lowercased into
+  const name = 'x-' + 'a'.repeat(2000);
+  const headers = new Headers({ [name.toUpperCase()]: '1' });
+  testing.expectEqual('1', headers.get(name));
+  headers.append(name.toUpperCase(), '2');
+  testing.expectEqual('1, 2', headers.get(name));
+}
+</script>

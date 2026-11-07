@@ -1,0 +1,12 @@
+.local/
+**/.zig-cache/
+**/zig-out/
+**/target/
+**/zig-pkg/
+**/.lp-cache/
+
+# Required maintained compile/test/runtime assets, despite broad parent rules.
+!engine/src/rust/render/fonts/*.ttf
+!renderer/crates/obscura-render/assets/*.ttf
+!renderer/vendor/cosmic-text/fonts/*.ttf
+!assets/fonts/*.otf

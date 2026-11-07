@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<script>
+  // Every window.postMessage below goes to the same window. Posting one
+  // message at a time, each with its own `once` listener, keeps the tests from
+  // receiving each other's messages.
+  let postChain = Promise.resolve();
+  function postAndReceive(data, transfer) {
+    const received = postChain.then(() => new Promise((resolve) => {
+      window.addEventListener('message', resolve, { once: true });
+      window.postMessage(data, '*', transfer);
+    }));
+    postChain = received;
+    return received;
+  }
+</script>
+
+<script id=messageEventConstructor>
+{
+  const evt = new MessageEvent('message', {
+    data: { foo: 'bar', count: 42 },
+    origin: 'https://example.com',
+    source: window
+  });
+
+  testing.expectEqual('message', evt.type);
+  testing.expectEqual({ foo: 'bar', count: 42 }, evt.data);
+  testing.expectEqual('https://example.com', evt.origin);
+  testing.expectEqual(window, evt.source);
+  testing.expectEqual(false, evt.bubbles);
+  testing.expectEqual(false, evt.cancelable);
+}
+</script>
+
+<script id=messageEventWithString>
+{
+  const evt2 = new MessageEvent('message', {
+    data: 'Hello, World!',
+    origin: 'https://test.com'
+  });
+
+  testing.expectEqual('Hello, World!', evt2.data);
+  testing.expectEqual('https://test.com', evt2.origin);
+}
+</script>
+
+<script id=messageEventDefaults>
+{
+  const evt3 = new MessageEvent('message');
+
+  testing.expectEqual('', evt3.origin);
+  testing.expectEqual(false, evt3.bubbles);
+  testing.expectEqual(false, evt3.cancelable);
+}
+</script>
+
+<script id=messageEventPorts>
+{
+  // ports must always be a (frozen) array, never undefined.
+  const evt = new MessageEvent('message');
+  testing.expectEqual(0, evt.ports.length);
+  testing.expectEqual(true, Array.isArray(evt.ports) || typeof evt.ports.length === 'number');
+}
+</script>
+
+<script id=messageEventInheritance>
+{
+  const evt4 = new MessageEvent('custom');
+
+  testing.expectEqual('custom', evt4.type);
+  testing.expectEqual(Event.NONE, evt4.eventPhase);
+  testing.expectEqual(false, evt4.defaultPrevented);
+}
+</script>
+
+<script id=postMessageBasic type=module>
+{
+  const state = await testing.async();
+  state.resolve(await postAndReceive('test data'));
+  await state.done((e) => {
+    testing.expectEqual('test data', e.data);
+    testing.expectEqual(window, e.source);
+    testing.expectEqual('message', e.type);
+  });
+}
+</script>
+
+<script id=postMessageWithObject type=module>
+{
+  const state = await testing.async();
+  const testObj = { type: 'test', value: 123, nested: { key: 'value' } };
+  state.resolve(await postAndReceive(testObj));
+  await state.done((e) => {
+    testing.expectEqual(testObj, e.data);
+  });
+}
+</script>
+
+<script id=messageEventWithBubbles>
+{
+  const evt = new MessageEvent('message', {
+    data: 'test',
+    bubbles: true,
+    cancelable: true
+  });
+
+  testing.expectEqual(true, evt.bubbles);
+  testing.expectEqual(true, evt.cancelable);
+}
+</script>
+
+<script id=postMessageWithNumber type=module>
+{
+  const state = await testing.async();
+  state.resolve(await postAndReceive(42));
+  await state.done((e) => {
+    testing.expectEqual(42, e.data);
+  });
+}
+</script>
+
+<script id=postMessageWithArray type=module>
+{
+  const state = await testing.async();
+  const arr = [1, 2, 3, 'test'];
+  state.resolve(await postAndReceive(arr));
+  await state.done((e) => {
+    testing.expectEqual(arr, e.data);
+  });
+}
+</script>
+
+<script id=postMessageWithNull type=module>
+{
+  const state = await testing.async();
+  state.resolve(await postAndReceive(null));
+  await state.done((e) => {
+    testing.expectEqual(null, e.data);
+  });
+}
+</script>
+
+<script id=postMessageTransfersPorts type=module>
+{
+  // window.postMessage(data, targetOrigin, [port]) must deliver the transferred
+  // MessagePort as event.ports[0] (regression: ports used to always be empty,
+  // so receivers doing `e.ports[0].onmessage = ...` threw on undefined).
+  const state = await testing.async();
+  const channel = new MessageChannel();
+  const echoed = new Promise((resolve) => {
+    channel.port1.onmessage = (e) => resolve(e.data);
+  });
+
+  const e = await postAndReceive('ping', [channel.port2]);
+  const received = e.ports[0];
+  received.postMessage('pong');
+  state.resolve({ received, echo: await echoed });
+  await state.done(({ received, echo }) => {
+    testing.expectEqual(true, received instanceof MessagePort);
+    testing.expectEqual('pong', echo);
+  });
+}
+</script>
+
+<script id=messageEventOriginFromLocation type=module>
+{
+  const state = await testing.async();
+  state.resolve(await postAndReceive('test'));
+  await state.done((e) => {
+    testing.expectEqual('http://127.0.0.1:9582', e.origin);
+  });
+}
+</script>

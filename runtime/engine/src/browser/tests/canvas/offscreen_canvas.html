@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<script id="offscreen_real_pixels_identity_resize">
+{
+  const canvas=new OffscreenCanvas(16,12);const ctx=canvas.getContext('2d');
+  testing.expectTrue(canvas instanceof OffscreenCanvas);testing.expectTrue(ctx instanceof OffscreenCanvasRenderingContext2D);
+  testing.expectEqual(canvas,ctx.canvas);testing.expectEqual(ctx,canvas.getContext('2d'));testing.expectEqual(null,canvas.getContext('webgl'));
+  ctx.fillStyle='red';ctx.fillRect(1,1,4,4);testing.expectEqual('255,0,0,255',Array.from(ctx.getImageData(2,2,1,1).data).join());
+  canvas.width=16;testing.expectEqual(0,ctx.getImageData(2,2,1,1).data[3]);testing.expectEqual('#000000',ctx.fillStyle);
+  canvas.height=8;testing.expectEqual(8,canvas.height);
+}
+</script>
+<script id="offscreen_png_blob_dimensions" type="module">
+{
+  const state=await testing.async();
+  const canvas=new OffscreenCanvas(13,7);canvas.getContext('2d').fillRect(0,0,13,7);
+  canvas.convertToBlob().then(async blob=>{
+    const bytes=new Uint8Array(await blob.arrayBuffer());const view=new DataView(bytes.buffer);
+    state.resolve({blob,signature:Array.from(bytes.subarray(0,8)).join(),width:view.getUint32(16),height:view.getUint32(20)});
+  },error=>state.resolve({error:String(error)}));
+  await state.done(value=>{testing.expectTrue(value.blob instanceof Blob);testing.expectEqual('image/png',value.blob.type);testing.expectEqual('137,80,78,71,13,10,26,10',value.signature);testing.expectEqual(13,value.width);testing.expectEqual(7,value.height);});
+}
+</script>
+<script id="offscreen_zero_png_rejects" type="module">
+{
+  const state=await testing.async();new OffscreenCanvas(0,7).convertToBlob().then(()=>state.resolve('wrong'),e=>state.resolve(e.name));
+  await state.done(name=>testing.expectEqual('IndexSizeError',name));
+}
+</script>
+<script id="offscreen_image_bitmap_ownership">
+{
+  const canvas=new OffscreenCanvas(8,8);const ctx=canvas.getContext('2d');ctx.fillStyle='red';ctx.fillRect(0,0,8,8);ctx.translate(2,0);
+  const bitmap=canvas.transferToImageBitmap();testing.expectTrue(bitmap instanceof ImageBitmap);testing.expectEqual(8,bitmap.width);
+  testing.expectEqual(0,ctx.getImageData(1,1,1,1).data[3]);testing.expectEqual(2,ctx.getTransform().e);
+  ctx.fillStyle='blue';ctx.fillRect(0,0,2,2);
+  const other=new OffscreenCanvas(8,8).getContext('2d');other.drawImage(bitmap,0,0);testing.expectEqual('255,0,0,255',Array.from(other.getImageData(1,1,1,1).data).join());
+  bitmap.close();testing.expectEqual(0,bitmap.width);
+}
+</script>
+<script id="html_placeholder_shared_surface">
+{
+  const html=document.createElement('canvas');html.width=8;html.height=8;
+  const canvas=html.transferControlToOffscreen();canvas.getContext('2d').fillStyle='lime';canvas.getContext('2d').fillRect(0,0,8,8);
+  const target=document.createElement('canvas').getContext('2d');target.drawImage(html,0,0);
+  testing.expectEqual('0,255,0,255',Array.from(target.getImageData(2,2,1,1).data).join());
+  testing.expectError('Invalid',()=>html.getContext('2d'));testing.expectError('Invalid',()=>html.transferControlToOffscreen());
+  canvas.width=4;testing.expectEqual(4,html.width);
+}
+</script>
+<script id="worker_own_realm_native_raster" type="module">
+{
+  const state=await testing.async();const worker=new Worker('native-worker.js');
+  worker.onmessage=e=>state.resolve(e.data);worker.onerror=e=>state.resolve({error:e.message});worker.postMessage('draw');
+  await state.done(result=>{
+    testing.expectEqual(undefined,result.error);testing.expectEqual('undefined',result.document);testing.expectEqual('undefined',result.window);
+    testing.expectTrue(result.canvasBrand && result.contextBrand && result.gradientBrand && result.pathBrand && result.metricsBrand && result.blobBrand);
+    testing.expectTrue(result.gpuBrand && result.bitmapBrand);
+    testing.expectEqual('0,255,0,255',result.gpuClear);testing.expectEqual('255,0,0,255',result.gpuDraw);
+    testing.expectEqual('0,0,0,0',result.gpuAfterTransfer);testing.expectEqual('255,0,0,255',result.gpuSnapshot);
+    testing.expectEqual('0,0,255,255',result.gpuStateRetained);
+    testing.expectEqual('255,0,0,255',result.pixel);testing.expectTrue(result.wide>result.narrow);testing.expectTrue(result.textPainted);
+    testing.expectEqual(32,result.pngWidth);testing.expectEqual(24,result.pngHeight);testing.expectEqual(0,result.afterResize);
+    worker.terminate();
+  });
+}
+</script>
+<script id="html_placeholder_observes_same_gpu_surface">
+{
+  const html=document.createElement('canvas');html.width=8;html.height=8;
+  const offscreen=html.transferControlToOffscreen();const gl=offscreen.getContext('webgl');
+  testing.expectTrue(gl instanceof WebGLRenderingContext);
+  gl.clearColor(0,1,0,1);gl.clear(gl.COLOR_BUFFER_BIT);
+  const target=document.createElement('canvas').getContext('2d');target.drawImage(html,0,0);
+  testing.expectEqual('0,255,0,255',Array.from(target.getImageData(2,2,1,1).data).join());
+  const bitmap=offscreen.transferToImageBitmap();target.clearRect(0,0,8,8);target.drawImage(bitmap,0,0);
+  testing.expectEqual('0,255,0,255',Array.from(target.getImageData(2,2,1,1).data).join());
+  target.clearRect(0,0,8,8);target.drawImage(html,0,0);
+  testing.expectEqual(0,target.getImageData(2,2,1,1).data[3]);
+}
+</script>

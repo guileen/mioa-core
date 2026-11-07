@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<!--
+  document.write into an iframe must parse and run the written markup in the
+  IFRAME's own frame, not the calling (main) frame. Previously the scripts ran
+  in the caller's frame, so their globals / window / parent were the main
+  page's — which broke cross-frame messaging (parent resolved to self).
+-->
+<script id=iframe_write_runs_in_iframe>
+{
+  const iframe = document.createElement('iframe');
+  document.documentElement.appendChild(iframe);
+
+  const doc = iframe.contentDocument;
+  doc.write('<!DOCTYPE html><html><body><script>window.ranHere = true; window.parentIsSelf = (window.parent === window);<\/script></body></html>');
+  doc.close();
+
+  // Read the flags from the IFRAME's window. If the script had (wrongly) run in
+  // the main frame, they'd be set there and these would read undefined.
+  testing.expectEqual(true, iframe.contentWindow.ranHere);
+  // The script's `parent` is the main window, so parent !== self.
+  testing.expectEqual(false, iframe.contentWindow.parentIsSelf);
+}
+</script>
+
+<!--
+  A deferred (module) script written into an iframe must still run. A freshly
+  loaded iframe never fires its static-parse "done" signal, so document.close()
+  is what flushes the deferred scripts the write produced.
+-->
+<script id=iframe_write_flushes_deferred_module type=module>
+{
+  const state = await testing.async();
+
+  const iframe = document.createElement('iframe');
+  document.documentElement.appendChild(iframe);
+
+  const doc = iframe.contentDocument;
+  doc.write('<!DOCTYPE html><html><body><script type="module">window.moduleRan = true;<\/script></body></html>');
+  doc.close();
+
+  // Give the deferred module a tick to run, then confirm it executed in the
+  // iframe (not the main frame, where contentWindow.moduleRan would be unset).
+  setTimeout(() => state.resolve(), 5);
+  await state.done(() => {
+    testing.expectEqual(true, iframe.contentWindow.moduleRan);
+  });
+}
+</script>
+
+<!-- Written text is in the DOM when write() returns, not only after close(). -->
+<script id=iframe_write_text_visible>
+{
+  const iframe = document.createElement('iframe');
+  document.documentElement.appendChild(iframe);
+
+  const doc = iframe.contentDocument;
+  doc.write('WRITE HAPPENED');
+  testing.expectEqual('WRITE HAPPENED', doc.body.innerHTML);
+  doc.write(' AGAIN');
+  testing.expectEqual('WRITE HAPPENED AGAIN', doc.body.innerHTML);
+  doc.close();
+}
+</script>
+
+<!--
+  A document whose frame navigated away is inactive: write() is a no-op. Its
+  <iframe> outlives the (torn down) child frame, so removing it must not crash.
+-->
+<script id=write_to_navigated_away_document type=module>
+{
+  const state = await testing.async();
+
+  const iframe = document.createElement('iframe');
+  let old_doc = null;
+  iframe.onload = () => {
+    if (old_doc === null) {
+      old_doc = iframe.contentDocument;
+      old_doc.body.appendChild(old_doc.createElement('iframe'));
+      iframe.src = 'support/sub2.html';
+      return;
+    }
+    old_doc.write('WRITE HAPPENED');
+    state.resolve();
+  };
+  iframe.src = 'support/page.html';
+  document.documentElement.appendChild(iframe);
+
+  await state.done(() => {
+    testing.expectEqual('IFRAME', old_doc.body.lastChild.tagName);
+    old_doc.body.lastChild.remove();
+    testing.expectEqual(null, old_doc.querySelector('iframe'));
+    testing.expectEqual('sub2 div1', iframe.contentDocument.getElementById('div-1').textContent);
+  });
+}
+</script>
+
+<!-- Same, for the document of an iframe nested in the navigated-away one. -->
+<script id=write_to_nested_navigated_away_document type=module>
+{
+  const state = await testing.async();
+
+  const iframe = document.createElement('iframe');
+  let inner_doc = null;
+  iframe.onload = () => {
+    if (inner_doc === null) {
+      const doc = iframe.contentDocument;
+      const inner = doc.createElement('iframe');
+      doc.body.appendChild(inner);
+      inner_doc = inner.contentDocument;
+      iframe.src = 'support/sub2.html';
+      return;
+    }
+    inner_doc.write('<p>WRITE HAPPENED</p>');
+    state.resolve();
+  };
+  iframe.src = 'support/page.html';
+  document.documentElement.appendChild(iframe);
+
+  await state.done(() => {
+    testing.expectEqual('', inner_doc.body.innerHTML);
+  });
+}
+</script>

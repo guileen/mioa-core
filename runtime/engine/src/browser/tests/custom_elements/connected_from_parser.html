@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<head>
+<script src="../testing.js"></script>
+<script>
+{
+    // Define the custom element BEFORE the HTML is parsed
+    window.preParseConnectedCount = 0;
+
+    class PreParseElement extends HTMLElement {
+        connectedCallback() {
+            window.preParseConnectedCount++;
+        }
+    }
+
+    customElements.define('pre-parse-element', PreParseElement);
+}
+</script>
+</head>
+<body>
+<!-- This element is in the HTML and should have connectedCallback invoked -->
+<pre-parse-element id="static-element"></pre-parse-element>
+
+<script id="test-static-element">
+{
+    // connectedCallback should have been called for the element in HTML
+    testing.expectEqual(1, window.preParseConnectedCount);
+
+    const el = document.getElementById('static-element');
+    testing.expectTrue(el !== null);
+    testing.expectEqual('PRE-PARSE-ELEMENT', el.tagName);
+}
+</script>
+
+<script id="test-programmatic-still-works">
+{
+    // Reset counter
+    window.preParseConnectedCount = 0;
+
+    // This should still work (programmatic creation)
+    const el = document.createElement('pre-parse-element');
+    testing.expectEqual(0, window.preParseConnectedCount);
+
+    document.body.appendChild(el);
+    testing.expectEqual(1, window.preParseConnectedCount);
+}
+</script>
+
+<script>
+{
+    window.nestedParentCount = 0;
+    window.nestedChildCount = 0;
+
+    class NestedParent extends HTMLElement {
+        connectedCallback() {
+            window.nestedParentCount++;
+        }
+    }
+
+    class NestedChild extends HTMLElement {
+        connectedCallback() {
+            window.nestedChildCount++;
+        }
+    }
+
+    customElements.define('nested-parent', NestedParent);
+    customElements.define('nested-child', NestedChild);
+}
+</script>
+
+<nested-parent id="parent-element">
+    <nested-child id="child-element"></nested-child>
+</nested-parent>
+
+<script id="verify-nested">
+{
+    // Both parent and child should have connectedCallback invoked
+    testing.expectEqual(1, window.nestedParentCount);
+    testing.expectEqual(1, window.nestedChildCount);
+
+    const parent = document.getElementById('parent-element');
+    const child = document.getElementById('child-element');
+    testing.expectTrue(parent !== null);
+    testing.expectTrue(child !== null);
+}
+</script>
+
+<script>
+{
+    // Test attributeChangedCallback for initial attributes during parsing
+    window.attrChangedCalls = [];
+
+    class AttrElement extends HTMLElement {
+        static get observedAttributes() {
+            return ['foo', 'bar'];
+        }
+
+        attributeChangedCallback(name, oldValue, newValue) {
+            window.attrChangedCalls.push({ name, oldValue, newValue });
+        }
+    }
+
+    customElements.define('attr-element', AttrElement);
+}
+</script>
+
+<attr-element foo="value1" bar="value2" ignored="value3"></attr-element>
+
+<script id="verify-attribute-changed">
+{
+    // attributeChangedCallback should have been called for initial attributes
+    testing.expectEqual(2, window.attrChangedCalls.length);
+
+    testing.expectEqual('foo', window.attrChangedCalls[0].name);
+    testing.expectEqual(null, window.attrChangedCalls[0].oldValue);
+    testing.expectEqual('value1', window.attrChangedCalls[0].newValue);
+
+    testing.expectEqual('bar', window.attrChangedCalls[1].name);
+    testing.expectEqual(null, window.attrChangedCalls[1].oldValue);
+    testing.expectEqual('value2', window.attrChangedCalls[1].newValue);
+}
+</script>
+
+<script>
+{
+    window.disconnectedParseCalls = [];
+
+    class DisconnectedParseElement extends HTMLElement {
+        constructor() {
+            super();
+            // No id yet when constructed synchronously by the parser.
+            window.disconnectedParseCalls.push('ctor');
+        }
+        connectedCallback() {
+            window.disconnectedParseCalls.push('connected ' + this.id);
+        }
+    }
+
+    customElements.define('disconnected-parse-element', DisconnectedParseElement);
+}
+</script>
+
+<div id="detached-mid-parse"><script>document.getElementById('detached-mid-parse').remove();</script><disconnected-parse-element id="after-detach"></disconnected-parse-element></div>
+
+<template id="parse-template"><disconnected-parse-element id="in-template"></disconnected-parse-element></template>
+
+<script id="verify-disconnected-parse">
+{
+    // The parser kept appending into a parent a script had detached: the
+    // element is constructed (synchronously, main-document parse) but never
+    // connected.
+    testing.expectEqual(null, document.getElementById('after-detach'));
+    testing.expectEqual('ctor', window.disconnectedParseCalls.join(','));
+
+    // Template contents are never connected (nor upgraded).
+    testing.expectEqual(null, document.getElementById('in-template'));
+
+    window.disconnectedParseCalls = [];
+
+    // A shadow root scopes ids even when its host is detached, but nothing in
+    // it is connected.
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({mode: 'open'});
+    shadow.innerHTML = '<disconnected-parse-element id="in-detached-shadow"></disconnected-parse-element>';
+    testing.expectTrue(shadow.getElementById('in-detached-shadow') !== null);
+    // (Fragment-parse constructors still run synchronously, so only check
+    // that it isn't connected.)
+    testing.expectEqual(-1, window.disconnectedParseCalls.indexOf('connected in-detached-shadow'));
+
+    // Once the host is connected, so is the element.
+    document.body.appendChild(host);
+    testing.expectEqual('connected in-detached-shadow', window.disconnectedParseCalls.at(-1));
+    host.remove();
+}
+</script>
+</body>

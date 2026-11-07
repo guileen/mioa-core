@@ -1,0 +1,794 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const Allocator = std.mem.Allocator;
+
+const M = @This();
+
+// German-string (small string optimization)
+// It's important that we end up with an align(8)...a previous packed version
+// was align(16) and that increased the size of most structs that embed it (e.g.
+// CData/Text nodes)
+pub const String = extern struct {
+    len: i32,
+    prefix: u32,
+    suffix: extern union {
+        buf: [8]u8,
+        ptr: usize,
+    },
+
+    comptime {
+        std.debug.assert(@sizeOf(String) == 16);
+        std.debug.assert(@alignOf(String) == 8);
+        std.debug.assert(@offsetOf(String, "prefix") == 4);
+        std.debug.assert(@offsetOf(String, "suffix") == 8);
+    }
+
+    const tombstone = -1;
+    pub const empty = String.sso(0, @splat(0));
+    pub const deleted = String.sso(tombstone, @splat(0));
+
+    fn sso(len: i32, content: [12]u8) String {
+        return .{
+            .len = len,
+            .prefix = @bitCast(content[0..4].*),
+            .suffix = .{ .buf = content[4..12].* },
+        };
+    }
+
+    // for packages that already have String imported, then can use String.Global
+    pub const Global = M.Global;
+
+    // Wraps an existing string. For strings with len <= 12, this can be done at
+    // comptime: comptime String.wrap("id");
+    // For strings with len > 12, this must be done at runtime even for a string
+    // literal. This is because, at comptime, we do not have a ptr for data and
+    // thus can't store it.
+    pub fn wrap(input: anytype) String {
+        if (@inComptime()) {
+            const l = input.len;
+            if (l > 12) {
+                @compileError("Comptime string must be <= 12 bytes (SSO only): " ++ input);
+            }
+
+            var content: [12]u8 = @splat(0);
+            @memcpy(content[0..l], input);
+            return sso(@intCast(l), content);
+        }
+
+        // Runtime path - handle both String and []const u8
+        if (@TypeOf(input) == String) {
+            return input;
+        }
+
+        const l = input.len;
+
+        if (l <= 12) {
+            var content: [12]u8 = @splat(0);
+            @memcpy(content[0..l], input);
+            return sso(@intCast(l), content);
+        }
+
+        return .{
+            .len = @intCast(l),
+            .prefix = @bitCast(input[0..4].*),
+            .suffix = .{ .ptr = @intFromPtr(input.ptr) },
+        };
+    }
+
+    pub const InitOpts = struct {
+        dupe: bool = true,
+    };
+    pub fn init(allocator: Allocator, input: []const u8, opts: InitOpts) !String {
+        if (input.len >= std.math.maxInt(i32)) {
+            return error.StringTooLarge;
+        }
+        const l: u32 = @intCast(input.len);
+        if (l <= 12) {
+            var content: [12]u8 = @splat(0);
+            @memcpy(content[0..l], input);
+            return sso(@intCast(l), content);
+        }
+
+        return .{
+            .len = @intCast(l),
+            .prefix = @bitCast(input[0..4].*),
+            .suffix = .{ .ptr = @intFromPtr((intern(input) orelse (if (opts.dupe) (try allocator.dupe(u8, input)) else input)).ptr) },
+        };
+    }
+
+    pub fn deinit(self: *const String, allocator: Allocator) void {
+        const len = self.len;
+        if (len > 12) {
+            const p: [*]const u8 = @ptrFromInt(self.suffix.ptr);
+            allocator.free(p[0..@intCast(len)]);
+        }
+    }
+
+    pub fn dupe(self: *const String, allocator: Allocator) !String {
+        return .init(allocator, self.str(), .{ .dupe = true });
+    }
+
+    pub fn trim(self: *const String, values: []const u8) String {
+        return wrap(std.mem.trim(u8, self.str(), values));
+    }
+
+    pub fn concat(allocator: Allocator, parts: []const []const u8) !String {
+        var total_len: usize = 0;
+        for (parts) |part| {
+            total_len += part.len;
+        }
+
+        if (total_len <= 12) {
+            var content: [12]u8 = @splat(0);
+            var pos: usize = 0;
+            for (parts) |part| {
+                @memcpy(content[pos..][0..part.len], part);
+                pos += part.len;
+            }
+            return sso(@intCast(total_len), content);
+        }
+
+        const result = try allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        for (parts) |part| {
+            @memcpy(result[pos..][0..part.len], part);
+            pos += part.len;
+        }
+
+        return .{
+            .len = @intCast(total_len),
+            .prefix = @bitCast(result[0..4].*),
+            .suffix = .{ .ptr = @intFromPtr((intern(result) orelse result).ptr) },
+        };
+    }
+
+    pub fn str(self: *const String) []const u8 {
+        const l = self.len;
+        if (l < 0) {
+            return "";
+        }
+
+        const ul: usize = @intCast(l);
+
+        if (ul <= 12) {
+            const slice: []const u8 = @ptrCast(self);
+            return slice[4 .. ul + 4];
+        }
+
+        const p: [*]const u8 = @ptrFromInt(self.suffix.ptr);
+        return p[0..ul];
+    }
+
+    pub fn format(self: String, writer: *std.Io.Writer) !void {
+        return writer.writeAll(self.str());
+    }
+
+    pub fn eql(a: String, b: String) bool {
+        if (@as(*const u64, @ptrCast(&a)).* != @as(*const u64, @ptrCast(&b)).*) {
+            return false;
+        }
+
+        if (a.len < 0 or b.len < 0) {
+            return false;
+        }
+        return eqlWithSameLen(a, b);
+    }
+
+    // Dangerous. Use this only when you have to (and, obviously, when you know
+    // a.len == b.len)
+    pub fn eqlWithSameLen(a: String, b: String) bool {
+        if (comptime lp.IS_DEBUG) {
+            std.debug.assert(a.len == b.len);
+        }
+
+        const len = a.len;
+        if (len <= 12) {
+            return a.prefix == b.prefix and
+                @as(u64, @bitCast(a.suffix.buf)) == @as(u64, @bitCast(b.suffix.buf));
+        }
+
+        const al: usize = @intCast(len);
+        const bl: usize = @intCast(len);
+        const ap: [*]const u8 = @ptrFromInt(a.suffix.ptr);
+        const bp: [*]const u8 = @ptrFromInt(b.suffix.ptr);
+        return std.mem.eql(u8, ap[0..al], bp[0..bl]);
+    }
+
+    pub fn eqlSlice(a: String, b: []const u8) bool {
+        return switch (a.eqlSliceOrDeleted(b)) {
+            .equal => |r| r,
+            .deleted => false,
+        };
+    }
+
+    const EqualOrDeleted = union(enum) {
+        deleted,
+        equal: bool,
+    };
+    fn eqlSliceOrDeleted(a: String, b: []const u8) EqualOrDeleted {
+        if (a.len == tombstone) {
+            return .deleted;
+        }
+        return .{ .equal = std.mem.eql(u8, a.str(), b) };
+    }
+
+    // This can be used outside of the small string optimization
+    pub fn intern(input: []const u8) ?[]const u8 {
+        switch (input.len) {
+            0 => return "",
+            1 => switch (input[0]) {
+                '\n' => return "\n",
+                '\r' => return "\r",
+                '\t' => return "\t",
+                ' ' => return " ",
+                '0' => return "0",
+                '1' => return "1",
+                '2' => return "2",
+                '3' => return "3",
+                '4' => return "4",
+                '5' => return "5",
+                '6' => return "6",
+                '7' => return "7",
+                '8' => return "8",
+                '9' => return "9",
+                '.' => return ".",
+                ',' => return ",",
+                '-' => return "-",
+                '(' => return "(",
+                ')' => return ")",
+                '?' => return "?",
+                ';' => return ";",
+                '=' => return "=",
+                else => {},
+            },
+            2 => switch (@as(u16, @bitCast(input[0..2].*))) {
+                asUint("id") => return "id",
+                asUint("  ") => return "  ",
+                asUint("\r\n") => return "\r\n",
+                asUint(", ") => return ", ",
+                asUint("·") => return "·",
+                else => {},
+            },
+            3 => switch (@as(u24, @bitCast(input[0..3].*))) {
+                asUint("   ") => return "   ",
+                asUint("•") => return "•",
+                asUint("src") => return "src",
+                asUint("rel") => return "rel",
+                asUint("alt") => return "alt",
+                asUint("dir") => return "dir",
+                asUint("for") => return "for",
+                else => {},
+            },
+            4 => switch (@as(u32, @bitCast(input[0..4].*))) {
+                asUint("    ") => return "    ",
+                asUint(" to ") => return " to ",
+                asUint("type") => return "type",
+                asUint("name") => return "name",
+                asUint("href") => return "href",
+                asUint("role") => return "role",
+                asUint("lang") => return "lang",
+                asUint("true") => return "true",
+                asUint("text") => return "text",
+                asUint("none") => return "none",
+                asUint("lazy") => return "lazy",
+                else => {},
+            },
+            5 => switch (@as(u40, @bitCast(input[0..5].*))) {
+                asUint("     ") => return "     ",
+                asUint(" › ") => return " › ",
+                asUint("class") => return "class",
+                asUint("style") => return "style",
+                asUint("title") => return "title",
+                asUint("value") => return "value",
+                asUint("width") => return "width",
+                asUint("media") => return "media",
+                asUint("async") => return "async",
+                asUint("defer") => return "defer",
+                asUint("false") => return "false",
+                else => {},
+            },
+            6 => switch (@as(u48, @bitCast(input[0..6].*))) {
+                asUint("      ") => return "      ",
+                asUint("height") => return "height",
+                asUint("action") => return "action",
+                asUint("method") => return "method",
+                asUint("target") => return "target",
+                asUint("srcset") => return "srcset",
+                asUint("hidden") => return "hidden",
+                asUint("button") => return "button",
+                asUint("submit") => return "submit",
+                asUint("_blank") => return "_blank",
+                else => {},
+            },
+            7 => switch (@as(u56, @bitCast(input[0..7].*))) {
+                asUint("       ") => return "       ",
+                asUint("content") => return "content",
+                asUint("charset") => return "charset",
+                asUint("checked") => return "checked",
+                asUint("loading") => return "loading",
+                asUint("popover") => return "popover",
+                else => {},
+            },
+            8 => switch (@as(u64, @bitCast(input[0..8].*))) {
+                asUint("        ") => return "        ",
+                asUint("disabled") => return "disabled",
+                asUint("multiple") => return "multiple",
+                asUint("readonly") => return "readonly",
+                asUint("required") => return "required",
+                asUint("selected") => return "selected",
+                asUint("tabindex") => return "tabindex",
+                asUint("checkbox") => return "checkbox",
+                asUint("noopener") => return "noopener",
+                asUint("download") => return "download",
+                else => {},
+            },
+            9 => switch (@as(u72, @bitCast(input[0..9].*))) {
+                asUint("         ") => return "         ",
+                asUint("autofocus") => return "autofocus",
+                asUint("maxlength") => return "maxlength",
+                asUint("draggable") => return "draggable",
+                asUint("anonymous") => return "anonymous",
+                else => {},
+            },
+            10 => switch (@as(u80, @bitCast(input[0..10].*))) {
+                asUint("          ") => return "          ",
+                asUint("aria-label") => return "aria-label",
+                asUint("novalidate") => return "novalidate",
+                asUint("spellcheck") => return "spellcheck",
+                asUint("stylesheet") => return "stylesheet",
+                asUint("noreferrer") => return "noreferrer",
+                else => {},
+            },
+            11 => switch (@as(u88, @bitCast(input[0..11].*))) {
+                asUint("aria-hidden") => return "aria-hidden",
+                asUint("crossorigin") => return "crossorigin",
+                asUint("placeholder") => return "placeholder",
+                else => {},
+            },
+            12 => switch (@as(u96, @bitCast(input[0..12].*))) {
+                asUint("autocomplete") => return "autocomplete",
+                asUint("aria-current") => return "aria-current",
+                asUint("presentation") => return "presentation",
+                else => {},
+            },
+            13 => switch (@as(u104, @bitCast(input[0..13].*))) {
+                asUint("border-radius") => return "border-radius",
+                asUint("padding-right") => return "padding-right",
+                asUint("margin-bottom") => return "margin-bottom",
+                asUint("space-between") => return "space-between",
+                asUint("aria-expanded") => return "aria-expanded",
+                asUint("aria-disabled") => return "aria-disabled",
+                asUint("aria-controls") => return "aria-controls",
+                else => {},
+            },
+            14 => switch (@as(u112, @bitCast(input[0..14].*))) {
+                asUint("padding-bottom") => return "padding-bottom",
+                asUint("text-transform") => return "text-transform",
+                asUint("letter-spacing") => return "letter-spacing",
+                asUint("vertical-align") => return "vertical-align",
+                asUint("referrerpolicy") => return "referrerpolicy",
+                else => {},
+            },
+            15 => switch (@as(u120, @bitCast(input[0..15].*))) {
+                asUint("text-decoration") => return "text-decoration",
+                asUint("contenteditable") => return "contenteditable",
+                asUint("justify-content") => return "justify-content",
+                asUint("aria-labelledby") => return "aria-labelledby",
+                else => {},
+            },
+            16 => switch (@as(u128, @bitCast(input[0..16].*))) {
+                asUint("background-color") => return "background-color",
+                asUint("aria-describedby") => return "aria-describedby",
+                else => {},
+            },
+            else => {},
+        }
+        return null;
+    }
+};
+
+pub fn isAllWhitespace(text: []const u8) bool {
+    return for (text) |c| {
+        if (!std.ascii.isWhitespace(c)) break false;
+    } else true;
+}
+
+/// True when `needle` is byte-equal to one of the strings in `haystack`.
+pub fn isOneOf(needle: []const u8, haystack: []const []const u8) bool {
+    return for (haystack) |s| {
+        if (std.mem.eql(u8, s, needle)) break true;
+    } else false;
+}
+
+/// Case-insensitive, and swapping two adjacent characters counts as one
+/// edit. Inputs over 64 bytes return `maxInt`; that fits the longest CLI flag.
+fn editDistance(a: []const u8, b: []const u8) usize {
+    const max = 64;
+    if (a.len > max or b.len > max) return std.math.maxInt(usize);
+    var a_buf: [max]u8 = undefined;
+    var b_buf: [max]u8 = undefined;
+    const la = std.ascii.lowerString(&a_buf, a);
+    const lb = std.ascii.lowerString(&b_buf, b);
+
+    var prev2: [max + 1]u8 = undefined;
+    var prev: [max + 1]u8 = undefined;
+    var cur: [max + 1]u8 = undefined;
+    for (0..lb.len + 1) |j| prev[j] = @intCast(j);
+    for (la, 1..) |ca, i| {
+        cur[0] = @intCast(i);
+        for (lb, 1..) |cb, j| {
+            const cost: u8 = if (ca == cb) 0 else 1;
+            cur[j] = @min(@min(prev[j] + 1, cur[j - 1] + 1), prev[j - 1] + cost);
+            if (i > 1 and j > 1 and ca == lb[j - 2] and la[i - 2] == cb) {
+                cur[j] = @min(cur[j], prev2[j - 2] + 1);
+            }
+        }
+        prev2 = prev;
+        prev = cur;
+    }
+    return prev[b.len];
+}
+
+/// The candidate nearest to `name`, within about one edit per three characters
+/// (rustc's rule). A prefix every candidate shares, like a flag's `--`, doesn't
+/// count toward the length. Earlier candidates win ties.
+pub fn closest(name: []const u8, candidates: []const []const u8) ?[]const u8 {
+    if (candidates.len == 0) return null;
+    var shared = candidates[0];
+    for (candidates[1..]) |cand| {
+        shared = shared[0 .. std.mem.findDiff(u8, shared, cand) orelse shared.len];
+    }
+    const typed = if (std.mem.startsWith(u8, name, shared)) name.len - shared.len else name.len;
+    const max_dist = @max(typed, 3) / 3;
+    var best: ?[]const u8 = null;
+    var best_dist: usize = std.math.maxInt(usize);
+    for (candidates) |cand| {
+        const dist = editDistance(name, cand);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = cand;
+        }
+    }
+    return if (best_dist <= max_dist) best else null;
+}
+
+/// Largest prefix of `bytes` whose length is at most `max_bytes` and
+/// ends on a UTF-8 codepoint boundary. Invalid sequences count as one
+/// byte each so the function never loops.
+pub fn truncateUtf8(bytes: []const u8, max_bytes: usize) []const u8 {
+    if (bytes.len <= max_bytes) return bytes;
+    var i: usize = 0;
+    while (i < max_bytes) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 1;
+        if (i + seq_len > max_bytes) break;
+        i += seq_len;
+    }
+    return bytes[0..i];
+}
+
+/// Reinterprets `bytes` as Latin-1 (each byte one codepoint) and encodes it
+/// as UTF-8. For bytes that aren't valid UTF-8 but must become a valid UTF-8
+/// string (JSON, filenames).
+pub fn latin1ToUtf8(allocator: Allocator, bytes: []const u8) ![]u8 {
+    var extra: usize = 0;
+    for (bytes) |b| {
+        if (b >= 0x80) {
+            extra += 1;
+        }
+    }
+    if (comptime lp.IS_DEBUG) {
+        // The way this is currently used:
+        // 1 - the caller always wants the value duped,
+        // 2 - the caller only got here because utf8ValidateSlice failed.
+        // If both of those ever change, maybe it's worth reconsidering whether
+        // this API unconditionally dupes.
+        std.debug.assert(extra != 0);
+    }
+
+    const out = try allocator.alloc(u8, bytes.len + extra);
+    var i: usize = 0;
+    for (bytes) |b| {
+        if (b < 0x80) {
+            out[i] = b;
+            i += 1;
+        } else {
+            out[i] = 0xC0 | (b >> 6);
+            out[i + 1] = 0x80 | (b & 0x3F);
+            i += 2;
+        }
+    }
+    return out;
+}
+
+// Discriminatory type that signals the bridge to use arena instead of call_arena
+// Use this for strings that need to persist beyond the current call
+// The caller can unwrap and store just the underlying .str field
+pub const Global = struct {
+    str: String,
+};
+
+fn asUint(comptime string: anytype) @Int(
+    .unsigned,
+    @bitSizeOf(@TypeOf(string.*)) - 8, // (- 8) to exclude sentinel 0
+) {
+    const byteLength = @sizeOf(@TypeOf(string.*)) - 1;
+    const expectedType = *const [byteLength:0]u8;
+    if (@TypeOf(string) != expectedType) {
+        @compileError("expected : " ++ @typeName(expectedType) ++ ", got: " ++ @typeName(@TypeOf(string)));
+    }
+
+    return @bitCast(@as(*const [byteLength]u8, string).*);
+}
+
+/// `s` concatenated `n` times, the replacement for the removed `s ** n`.
+pub fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    return &Repeated(s, n).value;
+}
+
+fn Repeated(comptime s: []const u8, comptime n: usize) type {
+    return struct {
+        const value: [s.len * n:0]u8 = blk: {
+            // Doubling: log2(n) concatenations instead of n comptime memcpys.
+            var acc: []const u8 = "";
+            var pow: []const u8 = s;
+            var k = n;
+            while (k > 0) : (k >>= 1) {
+                if (k & 1 == 1) acc = acc ++ pow;
+                if (k > 1) pow = pow ++ pow;
+            }
+            break :blk acc[0 .. s.len * n].* ++ [_:0]u8{};
+        };
+    };
+}
+
+const testing = @import("testing.zig");
+
+test "truncateUtf8" {
+    try testing.expectEqual("", truncateUtf8("", 10));
+    try testing.expectEqual("abc", truncateUtf8("abc", 10));
+    try testing.expectEqual("abc", truncateUtf8("abcdef", 3));
+
+    // 'é' = 0xC3 0xA9 — cap inside the codepoint walks back to the leader.
+    try testing.expectEqual("", truncateUtf8("é", 1));
+    try testing.expectEqual("é", truncateUtf8("é", 2));
+    try testing.expectEqual("é", truncateUtf8("éé", 3));
+
+    // 3-byte codepoint '世' = 0xE4 0xB8 0x96.
+    try testing.expectEqual("", truncateUtf8("世", 2));
+    try testing.expectEqual("世", truncateUtf8("世界", 3));
+    try testing.expectEqual("世", truncateUtf8("世界", 5));
+
+    // 4-byte codepoint '𝄞' (musical G clef) = 0xF0 0x9D 0x84 0x9E.
+    try testing.expectEqual("", truncateUtf8("𝄞", 3));
+    try testing.expectEqual("𝄞", truncateUtf8("𝄞x", 4));
+
+    // Invalid leader byte counts as one byte so the loop terminates.
+    try testing.expectEqual("\xFF", truncateUtf8("\xFFx", 1));
+    try testing.expectEqual("\xFFx", truncateUtf8("\xFFx", 2));
+}
+
+test "editDistance" {
+    try testing.expectEqual(@as(usize, 0), editDistance("", ""));
+    try testing.expectEqual(@as(usize, 0), editDistance("wait-ms", "wait-ms"));
+    try testing.expectEqual(@as(usize, 0), editDistance("Wait-MS", "wait-ms"));
+    try testing.expectEqual(@as(usize, 1), editDistance("wait-mss", "wait-ms"));
+    try testing.expectEqual(@as(usize, 1), editDistance("wait-m", "wait-ms"));
+    try testing.expectEqual(@as(usize, 1), editDistance("wait_ms", "wait-ms"));
+    try testing.expectEqual(@as(usize, 3), editDistance("kitten", "sitting"));
+    try testing.expectEqual(@as(usize, 1), editDistance("dmup", "dump"));
+    try testing.expectEqual(@as(usize, 1), editDistance("ab", "ba"));
+    try testing.expectEqual(@as(usize, 3), editDistance("", "abc"));
+    try testing.expectEqual(@as(usize, 3), editDistance("abc", ""));
+
+    const long = repeat("x", 64);
+    try testing.expectEqual(@as(usize, 0), editDistance(long, long));
+    try testing.expectEqual(std.math.maxInt(usize), editDistance(long ++ "x", long));
+}
+
+test "closest" {
+    const names = [_][]const u8{ "--dump", "--wait-ms", "--wait-until", "--insecure-disable-tls-host-verification" };
+    try testing.expectEqual("--wait-ms", closest("--wait-mss", &names));
+    try testing.expectEqual("--dump", closest("--dmup", &names));
+    try testing.expectEqual(null, closest("--dmpx", &names));
+    try testing.expectEqual(null, closest("--totally-wrong", &names));
+    try testing.expectEqual(null, closest("--dump", &.{}));
+    try testing.expectEqual("--insecure-disable-tls-host-verification", closest("--insecure-disable-tls-verification", &names));
+
+    const formats = [_][]const u8{ "html", "markdown", "pdf", "png" };
+    try testing.expectEqual(null, closest("md", &formats));
+    try testing.expectEqual("pdf", closest("pdg", &formats));
+
+    const commands = [_][]const u8{ "fetch", "mcp", "run" };
+    try testing.expectEqual("run", closest("fun", &commands));
+    try testing.expectEqual(null, closest("ab", &commands));
+
+    const tie = [_][]const u8{ "abcd", "abce" };
+    try testing.expectEqual("abcd", closest("abc", &tie));
+}
+
+test "latin1ToUtf8" {
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "caf\xE9.txt", .out = "café.txt" },
+        .{ .in = "report\xFF.csv", .out = "report\xC3\xBF.csv" },
+        .{ .in = "\x82\xd3\x82\xe9.xlsx", .out = "\xC2\x82\xC3\x93\xC2\x82\xC3\xA9.xlsx" },
+    };
+    for (cases) |case| {
+        const out = try latin1ToUtf8(testing.allocator, case.in);
+        defer testing.allocator.free(out);
+        try testing.expectEqual(case.out, out);
+        try testing.expectEqual(true, std.unicode.utf8ValidateSlice(out));
+    }
+}
+
+test "String" {
+    const other_short = try String.init(undefined, "other_short", .{});
+    const other_long = try String.init(testing.allocator, repeat("other_long", 100), .{});
+    defer other_long.deinit(testing.allocator);
+
+    inline for (0..100) |i| {
+        const input = repeat("a", i);
+        const str = try String.init(testing.allocator, input, .{});
+        defer str.deinit(testing.allocator);
+
+        try testing.expectEqual(input, str.str());
+
+        try testing.expectEqual(true, str.eql(str));
+        try testing.expectEqual(true, str.eqlSlice(input));
+        try testing.expectEqual(false, str.eql(other_short));
+        try testing.expectEqual(false, str.eqlSlice("other_short"));
+
+        try testing.expectEqual(false, str.eql(other_long));
+        try testing.expectEqual(false, str.eqlSlice(repeat("other_long", 100)));
+    }
+}
+
+test "String.trim" {
+    const expect = struct {
+        fn expect(expected: []const u8, input: []const u8, values: []const u8) !void {
+            const s = try String.init(testing.allocator, input, .{});
+            defer s.deinit(testing.allocator);
+            const trimmed = s.trim(values);
+            try testing.expectEqual(expected, trimmed.str());
+        }
+    }.expect;
+
+    try expect("hi", "  hi  ", " "); // SSO, both ends
+    try expect("hello", "hello", " "); // nothing to trim (no allocation)
+    try expect("", "   ", " "); // fully trimmed away
+    try expect(repeat("x", 20), "   " ++ (repeat("x", 20)) ++ "\t", &.{ ' ', '\t' }); // heap stays heap (view)
+    try expect("abc", "abc" ++ (repeat("  ", 6)), " "); // heap trims down to SSO
+}
+
+test "String.concat" {
+    {
+        const result = try String.concat(testing.allocator, &.{});
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 0), result.str().len);
+        try testing.expectEqual("", result.str());
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{"hello"});
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("hello", result.str());
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "foo", "bar" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("foobar", result.str());
+        try testing.expectEqual(@as(i32, 6), result.len);
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "test", "ing", "1234" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("testing1234", result.str());
+        try testing.expectEqual(@as(i32, 11), result.len);
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "foo", "bar", "baz", "qux" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("foobarbazqux", result.str());
+        try testing.expectEqual(@as(i32, 12), result.len);
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "hello", " world!" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("hello world!", result.str());
+        try testing.expectEqual(@as(i32, 12), result.len);
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "a", "b", "c", "d", "e" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("abcde", result.str());
+        try testing.expectEqual(@as(i32, 5), result.len);
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "one", " ", "two", " ", "three", " ", "four" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("one two three four", result.str());
+        try testing.expectEqual(@as(i32, 18), result.len);
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "hello", "", "world" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("helloworld", result.str());
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "", "", "" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("", result.str());
+        try testing.expectEqual(@as(i32, 0), result.len);
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "café", " ☕" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("café ☕", result.str());
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "Hello ", "世界", " and ", "مرحبا" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("Hello 世界 and مرحبا", result.str());
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ " ", "test", " " });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(" test ", result.str());
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "  ", "  " });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("    ", result.str());
+        try testing.expectEqual(@as(i32, 4), result.len);
+    }
+
+    {
+        const result = try String.concat(testing.allocator, &.{ "Item ", "1", "2", "3" });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("Item 123", result.str());
+    }
+
+    {
+        const original = "Hello, world!";
+        const result = try String.concat(testing.allocator, &.{ original[0..5], original[7..] });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("Helloworld!", result.str());
+    }
+
+    {
+        const original = "Hello!";
+        const result = try String.concat(testing.allocator, &.{ original[0..5], " world", original[5..] });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual("Hello world!", result.str());
+    }
+}

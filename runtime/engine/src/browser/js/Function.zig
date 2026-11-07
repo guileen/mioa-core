@@ -1,0 +1,466 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const lp = @import("lightpanda");
+
+const js = @import("js.zig");
+
+const v8 = js.v8;
+const log = lp.log;
+
+const Function = @This();
+
+local: *const js.Local,
+this: ?*const v8.Object = null,
+handle: *const v8.Function,
+
+pub const Result = struct {
+    stack: ?[]const u8,
+    exception: []const u8,
+};
+
+pub fn withThis(self: *const Function, value: anytype) !Function {
+    const local = self.local;
+    const this_obj = if (@TypeOf(value) == js.Object)
+        value.handle
+    else
+        (try local.zigValueToJs(value, .{})).handle;
+
+    return .{
+        .local = local,
+        .this = this_obj,
+        .handle = self.handle,
+    };
+}
+
+pub fn newInstance(self: *const Function, caught: *js.TryCatch.Caught) !js.Object {
+    var try_catch: js.TryCatch = undefined;
+    try_catch.init(self.local);
+    defer try_catch.deinit();
+
+    return self.newInstanceThrow() catch |err| {
+        if (err == error.JsConstructorFailed) {
+            caught.* = try_catch.caughtOrError(self.local.call_arena, error.Unknown);
+        }
+        return err;
+    };
+}
+
+// Like newInstance, but with no TryCatch of our own. Gives more flexibility to
+// the caller on how to handle the error (e.g. window.reportError)
+pub fn newInstanceThrow(self: *const Function) !js.Object {
+    const local = self.local;
+
+    if (comptime lp.IS_DEBUG == false) {
+        // This should not be possible, yet it happens. In Release, we'll log an
+        // error and hope for the best. In Debug, we'll let the code execute
+        // and v8 will crash on the null reference. This null value almost
+        // certainly comes from a Global that was reset and thus gets unwrapped
+        // to null (but I haven't figured out the flow that can cause that). This
+        // does indicate that we might be in some shutdown state, so just
+        // return an error might not be too bad.
+        if (@intFromPtr(self.handle) == 0) {
+            log.err(.browser, "newInstance on dead handle", .{});
+            return error.DeadFunctionHandle;
+        }
+    }
+
+    // See _tryCallWithThis for why a pending termination blocks V8 entry.
+    if (local.ctx.env.terminatePending()) {
+        return error.ExecutionTerminated;
+    }
+
+    // This creates a new instance using this Function as a constructor.
+    // const c_args = @as(?[*]const ?*c.Value, @ptrCast(&.{}));
+    const handle = v8.v8__Function__NewInstance(self.handle, local.handle, 0, null) orelse {
+        if (local.ctx.env.terminatePending()) {
+            return error.ExecutionTerminated;
+        }
+        return error.JsConstructorFailed;
+    };
+
+    return .{
+        .local = local,
+        .handle = handle,
+    };
+}
+
+pub fn call(self: *const Function, comptime T: type, args: anytype) !T {
+    var caught: js.TryCatch.Caught = .{};
+    return self._tryCallWithThis(T, self.getThis(), args, &caught, .{}) catch |err| {
+        log.debug(.js, "call caught", .{ .err = err, .caught = caught });
+        return err;
+    };
+}
+
+pub fn callRethrow(self: *const Function, comptime T: type, args: anytype) !T {
+    var caught: js.TryCatch.Caught = .{};
+    return self._tryCallWithThis(T, self.getThis(), args, &caught, .{ .rethrow = true }) catch |err| {
+        if (err != error.TryCatchRethrow) {
+            // error.TryCatchRethrow is a control flow (sorry!), not an actual
+            // error we want to log
+            log.debug(.js, "call caught", .{ .err = err, .caught = caught });
+        }
+        return err;
+    };
+}
+
+pub fn callWithThis(self: *const Function, comptime T: type, this: anytype, args: anytype) !T {
+    var caught: js.TryCatch.Caught = .{};
+    return self._tryCallWithThis(T, this, args, &caught, .{}) catch |err| {
+        log.debug(.js, "callWithThis caught", .{ .err = err, .caught = caught });
+        return err;
+    };
+}
+
+// Like callWithThis, but a thrown JS exception is rethrown past the internal
+// TryCatch, so an enclosing TryCatch of the caller can observe the exception
+// value itself (e.g. to report it to window.onerror).
+pub fn callWithThisRethrow(self: *const Function, comptime T: type, this: anytype, args: anytype) !T {
+    var caught: js.TryCatch.Caught = .{};
+    return self._tryCallWithThis(T, this, args, &caught, .{ .rethrow = true });
+}
+
+// An exception is reported on the global (e.g. window.reportError, which also
+// dispatches the "error" event).
+pub fn callWithThisReport(self: *const Function, this: anytype, args: anytype) !void {
+    var try_catch: js.TryCatch = undefined;
+    try_catch.init(self.local);
+    defer try_catch.deinit();
+
+    self.callWithThisRethrow(void, this, args) catch |err| {
+        if (err != error.TryCatchRethrow) {
+            return err;
+        }
+        const exc = try_catch.exceptionValue() orelse return;
+        try self.local.ctx.global.reportError(exc);
+    };
+}
+
+pub fn tryCall(self: *const Function, comptime T: type, args: anytype, caught: *js.TryCatch.Caught) !T {
+    return self._tryCallWithThis(T, self.getThis(), args, caught, .{});
+}
+
+pub fn tryCallWithThis(self: *const Function, comptime T: type, this: anytype, args: anytype, caught: *js.TryCatch.Caught) !T {
+    return self._tryCallWithThis(T, this, args, caught, .{});
+}
+
+const CallOpts = struct {
+    rethrow: bool = false,
+};
+fn _tryCallWithThis(self: *const Function, comptime T: type, this: anytype, args: anytype, caught: *js.TryCatch.Caught, comptime opts: CallOpts) !T {
+    const local = self.local;
+
+    if (comptime lp.IS_DEBUG == false) {
+        // This should not be possible, yet it happens. In Release, we'll log an
+        // error and hope for the best. In Debug, we'll let the code execute
+        // and v8 will crash on the null reference. This null value almost
+        // certainly comes from a Global that was reset and thus gets unwrapped
+        // to null (but I haven't figured out the flow that can cause that). This
+        // does indicate that we might be in some shutdown state, so just
+        // return an error might not be too bad.
+        if (@intFromPtr(self.handle) == 0) {
+            log.err(.browser, "call on dead handle", .{});
+            return error.DeadFunctionHandle;
+        }
+    }
+
+    // A pending termination (watchdog / CDP-disconnect kill) must not be
+    // followed by another V8 entry. Callers must treat ExecutionTerminated as
+    // stop running JS and unwind".
+    if (local.ctx.env.terminatePending()) {
+        return error.ExecutionTerminated;
+    }
+
+    // When we're calling a function from within JavaScript itself, this isn't
+    // necessary. We're within a Caller instantiation, which will already have
+    // incremented the call_depth and it won't decrement it until the Caller is
+    // done.
+    // But some JS functions are initiated from Zig code, and not v8. For
+    // example, Observers, some event and window callbacks. In those cases, we
+    // need to increase the call_depth so that the call_arena remains valid for
+    // the duration of the function call. If we don't do this, the call_arena
+    // will be reset after each statement of the function which executes Zig code.
+    const ctx = local.ctx;
+    const call_depth = ctx.call_depth;
+    ctx.call_depth = call_depth + 1;
+    defer ctx.call_depth = call_depth;
+
+    const js_this = blk: {
+        if (@TypeOf(this) == js.Object) {
+            break :blk this;
+        }
+        break :blk try local.zigValueToJs(this, .{});
+    };
+
+    const aargs = if (comptime @typeInfo(@TypeOf(args)) == .null) struct {}{} else args;
+
+    const js_args: []const *const v8.Value = switch (@typeInfo(@TypeOf(aargs))) {
+        .@"struct" => |s| blk: {
+            const field_names = s.field_names;
+            var js_args: [field_names.len]*const v8.Value = undefined;
+            inline for (field_names, 0..) |field_name, i| {
+                js_args[i] = (try local.zigValueToJs(@field(aargs, field_name), .{})).handle;
+            }
+            const cargs: [field_names.len]*const v8.Value = js_args;
+            break :blk &cargs;
+        },
+        .pointer => blk: {
+            var values = try local.call_arena.alloc(*const v8.Value, args.len);
+            for (args, 0..) |a, i| {
+                values[i] = (try local.zigValueToJs(a, .{})).handle;
+            }
+            break :blk values;
+        },
+        else => @compileError("JS Function called with invalid parameter type"),
+    };
+
+    const c_args = @as(?[*]const ?*v8.Value, @ptrCast(js_args.ptr));
+
+    var try_catch: js.TryCatch = undefined;
+    try_catch.init(local);
+    defer try_catch.deinit();
+
+    const handle = v8.v8__Function__Call(self.handle, local.handle, js_this.handle, @as(c_int, @intCast(js_args.len)), c_args) orelse {
+        if (local.ctx.env.terminatePending()) {
+            // Terminated mid-call, not a JS throw: no rethrow, no reporting.
+            return error.ExecutionTerminated;
+        }
+        if ((comptime opts.rethrow) and try_catch.hasCaught()) {
+            try_catch.rethrow();
+            return error.TryCatchRethrow;
+        }
+        caught.* = try_catch.caughtOrError(local.call_arena, error.JsException);
+        return error.JsException;
+    };
+
+    if (@typeInfo(T) == .void) {
+        return {};
+    }
+    return local.jsValueToZig(T, .{ .local = local, .handle = handle });
+}
+
+fn getThis(self: *const Function) js.Object {
+    const handle = if (self.this) |t| t else v8.v8__Context__Global(self.local.handle).?;
+    return .{
+        .local = self.local,
+        .handle = handle,
+    };
+}
+
+pub fn src(self: *const Function) ![]const u8 {
+    return js.Value.toStringSlice(.{ .local = self.local, .handle = @ptrCast(self.handle) });
+}
+
+pub fn getPropertyValue(self: *const Function, name: []const u8) !?js.Value {
+    const local = self.local;
+    const key = local.isolate.initStringHandle(name);
+    const handle = v8.v8__Object__Get(self.handle, self.local.handle, key) orelse {
+        return error.JsException;
+    };
+
+    return .{
+        .local = local,
+        .handle = handle,
+    };
+}
+
+pub fn persist(self: *const Function) !Global {
+    return .{ .slot = try js.newTrackedSlot(self.local.ctx, self.handle) };
+}
+
+pub fn persistWithThis(self: *const Function, value: anytype) !Global {
+    const with_this = try self.withThis(value);
+    return with_this.persist();
+}
+
+const testing = @import("../../testing.zig");
+test "Function: requested termination is classified and blocks re-entry" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const env = frame.js.env;
+    defer env.cancelTerminate();
+
+    const State = struct {
+        env: *js.Env,
+        f_kill: ?Function = null,
+        f_probe: ?Function = null,
+        probe_ran: bool = false,
+        kill_err: ?anyerror = null,
+        probe_err: ?anyerror = null,
+        nested_probe_err: ?anyerror = null,
+
+        fn kill(self: *@This()) void {
+            self.env.requestTerminate();
+        }
+
+        fn probed(self: *@This()) void {
+            self.probe_ran = true;
+        }
+
+        // Runs at call depth >= 1: the killed inner call must leave the
+        // termination pending, and the follow-up call must refuse to enter V8
+        // (running it would silently clear the pending termination).
+        fn nested(self: *@This()) void {
+            var caught: js.TryCatch.Caught = .{};
+            _ = self.f_kill.?.tryCall(void, .{}, &caught) catch |err| {
+                self.kill_err = err;
+            };
+            _ = self.f_probe.?.tryCall(void, .{}, &caught) catch |err| {
+                self.nested_probe_err = err;
+            };
+        }
+    };
+    var state = State{ .env = env };
+
+    const kill_cb = local.newCallback(State.kill, &state);
+    const mk = try local.exec("(function(k){ return function(){ k(); for(;;){} }; })", null);
+    const mk_fn = Function{ .local = local, .handle = @ptrCast(mk.handle) };
+    const f_kill = try mk_fn.call(js.Value, .{kill_cb});
+    state.f_kill = .{ .local = local, .handle = @ptrCast(f_kill.handle) };
+    state.f_probe = local.newCallback(State.probed, &state);
+
+    const nested_cb = local.newCallback(State.nested, &state);
+    const driver = try local.exec("(function(n){ n(); })", null);
+    const driver_fn = Function{ .local = local, .handle = @ptrCast(driver.handle) };
+
+    var caught: js.TryCatch.Caught = .{};
+    try testing.expectError(error.ExecutionTerminated, driver_fn.tryCall(void, .{nested_cb}, &caught));
+    try testing.expectEqual(error.ExecutionTerminated, state.kill_err.?);
+    try testing.expectEqual(error.ExecutionTerminated, state.nested_probe_err.?);
+    try testing.expectEqual(true, env.terminatePending());
+    try testing.expectEqual(false, v8.v8__Isolate__IsExecutionTerminating(env.isolate.handle));
+
+    _ = state.f_probe.?.tryCall(void, .{}, &caught) catch |err| {
+        state.probe_err = err;
+    };
+    try testing.expectEqual(error.ExecutionTerminated, state.probe_err.?);
+    try testing.expectEqual(false, state.probe_ran);
+
+    // a top-level cancel restores normal execution
+    env.cancelTerminate();
+    try testing.expectEqual(3, try (try local.exec("1 + 2", null)).toI32());
+}
+
+test "Function: microtask checkpoint is a no-op while JS is on the stack" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const State = struct {
+        local: *const js.Local,
+
+        // A native call runs at call depth >= 1, with the caller's JS still on
+        // the stack: draining the queue here would run reactions mid-script.
+        fn pump(self: *@This()) void {
+            self.local.runMicrotasks();
+        }
+    };
+    var state = State{ .local = local };
+
+    const driver = try local.exec(
+        \\(function(pump) {
+        \\  let ran = false;
+        \\  Promise.resolve().then(function(){ ran = true; });
+        \\  pump();
+        \\  return ran;
+        \\})
+    , null);
+    const driver_fn = Function{ .local = local, .handle = @ptrCast(driver.handle) };
+    try testing.expectEqual(false, try driver_fn.call(bool, .{local.newCallback(State.pump, &state)}));
+}
+
+test "Function: a terminated checkpoint stops the context loop" {
+    const frame = try testing.createFrame();
+    const other = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const env = frame.js.env;
+    defer env.cancelTerminate();
+
+    const State = struct {
+        env: *js.Env,
+
+        fn kill(self: *@This()) void {
+            self.env.requestTerminate();
+        }
+    };
+    var state = State{ .env = env };
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        const local = &ls.local;
+
+        const setup = try local.exec(
+            \\(function(kill) {
+            \\  Promise.resolve().then(function(){ kill(); for(;;){} });
+            \\})
+        , null);
+        const setup_fn = Function{ .local = local, .handle = @ptrCast(setup.handle) };
+        try setup_fn.call(void, .{local.newCallback(State.kill, &state)});
+    }
+
+    // The second context's queue is the one the loop must not go on to reach
+    // once the first context's checkpoint was terminated.
+    var other_ls: js.Local.Scope = undefined;
+    other.js.localScope(&other_ls);
+    defer other_ls.deinit();
+    try other_ls.local.eval(
+        \\window.__ran = false;
+        \\Promise.resolve().then(function(){ window.__ran = true; });
+    , null);
+
+    env.runMicrotasks();
+    try testing.expectEqual(true, env.terminatePending());
+
+    env.cancelTerminate();
+    try testing.expectEqual(false, (try other_ls.local.exec("window.__ran", null)).toBool());
+}
+
+// A cheap, copyable handle to a persisted function. See js.GlobalSlot.
+pub const Global = struct {
+    slot: *js.GlobalSlot,
+
+    pub fn deinit(self: Global) void {
+        self.slot.release();
+    }
+    pub const release = deinit;
+
+    pub fn local(self: Global, l: *const js.Local) Function {
+        return .{
+            .local = l,
+            .handle = @ptrCast(v8.v8__Global__Get(&self.slot.handle, l.isolate.handle)),
+        };
+    }
+
+    pub fn isEqual(self: Global, other: Function) bool {
+        return v8.v8__Global__IsEqual(&self.slot.handle, other.handle);
+    }
+};

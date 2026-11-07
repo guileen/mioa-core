@@ -1,0 +1,2268 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const zenai = @import("zenai");
+const lp = @import("lightpanda");
+const browser_tools = lp.tools;
+const BrowserTool = browser_tools.Tool;
+const ProviderTool = zenai.provider.Tool;
+
+const log = lp.log;
+const Config = lp.Config;
+const Command = lp.Command;
+const Schema = lp.Schema;
+const Recorder = lp.Recorder;
+const ScriptRuntime = lp.Runtime;
+const Candidate = zenai.provider.Candidate;
+
+const App = @import("../App.zig");
+const Conversation = @import("Conversation.zig");
+const ModelCall = @import("ModelCall.zig");
+const Trace = @import("Trace.zig");
+const Terminal = @import("Terminal.zig");
+const SlashCommand = @import("SlashCommand.zig");
+const settings = @import("settings.zig");
+const auth = @import("auth/auth.zig");
+const models_dev = @import("auth/models_dev.zig");
+const picker = @import("picker.zig");
+const save = @import("save.zig");
+const welcome = @import("welcome.zig");
+const string = @import("../string.zig");
+
+const Agent = @This();
+
+/// Raised by init/listModels after they've printed a user-facing message to
+/// stderr; callers should exit non-zero without logging more.
+const UserError = error{
+    MissingApiKey,
+    MissingProvider,
+    ConflictingFlags,
+    ModelNotAvailable,
+};
+
+pub fn isUserError(err: anyerror) bool {
+    inline for (@typeInfo(UserError).error_set.error_names.?) |name| {
+        if (err == @field(anyerror, name)) return true;
+    }
+    return false;
+}
+
+const default_system_prompt = browser_tools.driver_guidance ++
+    \\
+    \\Agent-specific behavior:
+    \\- Call a tool for every browser action. NEVER claim you performed an
+    \\  action, visited a page, or saw content without the corresponding tool
+    \\  call. If a task needs a capability Lightpanda lacks (images, PDFs,
+    \\  audio), say so rather than improvising.
+    \\- Verify before answering: when a task asks for a specific value, ranked
+    \\  list, or comparison, and your first source is ambiguous, incomplete,
+    \\  or the answer is non-obvious, cross-check on ONE more authoritative
+    \\  source before committing. For multi-candidate questions (yes/no,
+    \\  A/B/C, pick-N), commit to a choice — don't abstain when you have data
+    \\  to reason from.
+    \\- If the user asks for account-scoped data (karma, profile, inbox, …)
+    \\  and the page shows you're not signed in, log in proactively (per
+    \\  the Credentials section above) before reporting unavailable.
+    \\
+++ lp.skill.semantics_note;
+
+/// Without today's date the model guesses "now" from its training data and
+/// misreads relative dates.
+fn withCurrentDate(allocator: std.mem.Allocator, prompt: []const u8, tm: lp.datetime.LibcTm, locale: []const u8) ![]u8 {
+    const weekdays = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+    const offset_min = @divTrunc(tm.tm_gmtoff, 60);
+    return allocator.print("{s}\nToday is {s}, {d}-{d:0>2}-{d:0>2} (UTC{c}{d:0>2}:{d:0>2}{s}{s}); browser locale {s}. Resolve relative dates against it.\n", .{
+        prompt,
+        weekdays[@intCast(tm.tm_wday)],
+        tm.tm_year + 1900,
+        @as(u32, @intCast(tm.tm_mon + 1)),
+        @as(u32, @intCast(tm.tm_mday)),
+        @as(u8, if (offset_min < 0) '-' else '+'),
+        @abs(offset_min) / 60,
+        @abs(offset_min) % 60,
+        if (tm.tm_zone != null) ", " else "",
+        if (tm.tm_zone) |z| std.mem.span(z) else "",
+        locale,
+    });
+}
+
+// System prompt of the `/save` command: the save instructions plus the
+// script skill (`lp.skill`), whose primitives reference is rendered from
+// the tool schemas at first use — hence lazy rather than comptime.
+var save_prompts_once = lp.once(initSavePrompts);
+var save_system_prompt: []const u8 = undefined;
+var save_revision_system_prompt: []const u8 = undefined;
+
+// Swapped in instead of `save_system_prompt` when the user message carries a
+// previously saved script: the "this session" framing above would otherwise
+// make the model discard it as out-of-scope.
+const save_revision_note =
+    \\This save REVISES an existing script, included in the user message. Its
+    \\goal spans every session that contributed to it, not just this one. Use
+    \\it as the base: keep its steps, structure, and output shape unchanged
+    \\except where this session's commands or the user's instruction require
+    \\a change, and add what this session contributes. Output the complete
+    \\updated script — never a fragment, diff, or continuation.
+;
+
+/// Panics on OOM like `Schema.all()` — the inputs are static, process-lifetime
+/// strings, so failure is a build bug, not a runtime condition.
+fn initSavePrompts() void {
+    const a = std.heap.page_allocator;
+    save_system_prompt = std.mem.concat(a, u8, &.{
+        browser_tools.save_synthesis_prompt, "\n\n", lp.skill.text(),
+    }) catch @panic("OOM building save prompt");
+    save_revision_system_prompt = std.mem.concat(a, u8, &.{
+        browser_tools.save_synthesis_prompt, "\n", save_revision_note, "\n", lp.skill.text(),
+    }) catch @panic("OOM building save prompt");
+}
+
+fn savePrompt(revision: bool) []const u8 {
+    save_prompts_once.call();
+    return if (revision) save_revision_system_prompt else save_system_prompt;
+}
+
+const synthesis_prompt =
+    \\You have used your tool budget or cannot finish the exploration.
+    \\Give your best final answer using only what the tool outputs above
+    \\show, not prior knowledge. If they show only cookie banners,
+    \\403/access-denied pages, blocked search results, or empty bodies, say
+    \\so plainly (e.g. "the page was blocked by a cookie wall and I could not
+    \\extract X") rather than filling the gap. Answer at the length the
+    \\question needs.
+;
+
+allocator: std.mem.Allocator,
+ai_client: ?zenai.provider.Client,
+/// The active LLM credential (null = LLM disabled). The AI client borrows
+/// its key, so deinit only after the client is gone.
+credential: ?settings.Credential,
+/// App data dir (owned by `App`, which outlives the agent), used to cache the
+/// models.dev catalog. Null when no data dir is available.
+app_dir: ?[]const u8,
+/// True when the no-LLM state is a persisted preference (remembered null
+/// provider or runtime `/provider null`), so `reportSaved` writes
+/// `provider = null`. A transient `--no-llm` run leaves it false so saving
+/// other settings doesn't clobber the remembered provider.
+no_llm_persisted: bool,
+model_base_url: ?[:0]const u8,
+/// Cached chat-model ids for the current provider, backed by
+/// `model_completion_arena`; invalidated on `/provider` switch.
+model_completions: ?ModelCompletions,
+model_completion_arena: std.heap.ArenaAllocator,
+ts: lp.ToolSession,
+terminal: Terminal,
+save_buffer: Recorder,
+save_path: ?[]u8,
+script_runtime_mutex: std.Io.Mutex = .init,
+active_script_runtime: ?*ScriptRuntime = null,
+conversation: Conversation,
+model: []u8,
+/// Per-turn reasoning budget for LLM turns. Mutable at runtime via `/effort`.
+effort: Config.Effort,
+script_file: ?[]const u8,
+/// `--url`: opened before the first turn, so a `--task` run does not spend a
+/// model turn navigating to its own start page.
+start_url: ?[:0]const u8,
+one_shot_task: ?[]const u8,
+one_shot_save: ?[]const u8,
+one_shot_attachments: ?[]const []const u8,
+cancel_requested: std.atomic.Value(bool) = .init(false),
+/// Shuts down the in-flight LLM socket on Ctrl-C so an agent turn aborts
+/// mid-request instead of blocking until the model's full response arrives.
+http_interrupt: zenai.http.Interrupt = .{},
+synthetic_tool_call_id: u32 = 0,
+/// Per-turn record of each tool call the model made, in call order, so
+/// `--save` can record a call that addressed its element by `backendNodeId`
+/// and the navigation a read tool's `url` made.
+save_calls: std.ArrayList(SavedCall) = .empty,
+capturing_for_save: bool = false,
+/// Aggregate Anthropic/OpenAI/Gemini token usage across every model call.
+/// Printed as a structured `$usage ...` line on stderr at the end of `--task`
+/// (one-shot) mode so wrappers can capture per-task cost.
+total_usage: zenai.provider.Usage = .{},
+trace: ?Trace = null,
+trace_phase: []const u8 = "turn",
+/// Set when the last turn ended in a model refusal (safety stop).
+last_turn_refused: bool = false,
+/// Whether assistant text streams to the terminal as the model produces it.
+/// Toggled via `/stream`; persisted in `.lp-agent.zon`.
+stream_enabled: bool,
+/// True while assistant text is streaming to stdout (spinner paused). Cleared
+/// by `endStreamedText`, which also emits the closing newline.
+stream_active: bool = false,
+/// True when any assistant text streamed during the current turn, so `runTurn`
+/// skips the buffered `printMarkdown` that would double-print it.
+streamed_text: bool = false,
+available_providers: []const []const u8,
+/// Cached reachability of each `local_providers` entry, so the per-keystroke
+/// `/provider` hinter probes each local server at most once.
+local_completable: [local_providers.len]?bool = @splat(null),
+api_error_buf: [512]u8 = undefined,
+/// Last failure's status+message, surfaced by `runTurn` past `error.ApiError`.
+api_error_detail: ?[]const u8 = null,
+
+pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent {
+    var providers_buf: [@typeInfo(Config.AiProvider).@"enum".field_names.len]Candidate = undefined;
+    const found_providers = settings.availableProviders(&providers_buf);
+    const available_providers = try allocator.alloc([]const u8, found_providers.len);
+    for (found_providers, 0..) |f, i| {
+        available_providers[i] = @tagName(f.provider);
+    }
+
+    if (opts.task != null and opts.script_file != null) {
+        log.fatal(.app, "conflicting flags", .{
+            .hint = "--task runs a one-shot turn; drop the positional script or drop --task",
+        });
+        return error.ConflictingFlags;
+    }
+    if (opts.save) |save_path| {
+        if (opts.task == null) {
+            log.fatal(.app, "conflicting flags", .{
+                .hint = "--save synthesizes a script from the --task run; pass --task too",
+            });
+            return error.ConflictingFlags;
+        }
+        if (save_path.len == 0) {
+            log.fatal(.app, "invalid --save filename", .{
+                .hint = "--save needs a non-empty file name",
+            });
+            return error.InvalidFilename;
+        }
+    }
+    if (opts.trace_results and opts.trace == null) {
+        log.fatal(.app, "conflicting flags", .{
+            .hint = "--trace-results adds result text to the --trace file; pass --trace too",
+        });
+        return error.ConflictingFlags;
+    }
+    if (opts.no_llm and opts.provider != null) {
+        log.warn(.app, "ignoring --provider", .{ .reason = "--no-llm takes precedence" });
+    }
+    if (opts.task == null and opts.attach.items.len > 0) {
+        log.warn(.app, "ignoring --attach", .{ .reason = "no --task; attachments are only consumed in one-shot mode" });
+    }
+
+    const is_one_shot = opts.task != null;
+    const will_repl = !is_one_shot and opts.script_file == null;
+
+    // Load remembered selection up front so a saved null provider can flip the
+    // REPL into basic mode before resolution. Pure script runs need nothing.
+    var remembered_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer remembered_arena.deinit();
+    const remembered: ?settings.Remembered = if (will_repl or is_one_shot) settings.loadRemembered(allocator, remembered_arena.allocator()) else null;
+
+    // A remembered null provider means the user disabled the LLM via
+    // `/provider null`; honor it for the REPL only (one-shot --task and script
+    // runs always need a model). An explicit --provider overrides it.
+    const remembered_no_llm = will_repl and opts.provider == null and
+        remembered != null and remembered.?.provider == null;
+
+    // Basic-mode REPL (no LLM) must be opted into via --no-llm or a remembered
+    // null provider. Without it the REPL accepts natural language, so an absent
+    // API key would only surface at the first non-slash-command line — too late.
+    // Pure JavaScript script runs stay allowed: no REPL, no LLM.
+    const requires_llm = is_one_shot or (will_repl and !opts.no_llm and !remembered_no_llm);
+
+    // Skip resolve when no client is wanted — else resolveCredentials prints
+    // "No API key detected" for a run that does not need one.
+    const resolve = !opts.no_llm and requires_llm;
+
+    // Print the banner before resolution so it precedes the interactive picker.
+    // The Ollama-only path never prompts, so its banner is deferred (below) to
+    // avoid probing the local server a second time just to decide ordering.
+    const banner_before = will_repl and (!resolve or settings.hasDetectableKey(opts, remembered));
+    if (banner_before) welcome.print(resolve);
+
+    var resolved: ?settings.ResolvedProvider = if (resolve) try settings.resolveCredentials(allocator, opts, remembered, will_repl) else null;
+    // Before the ai_client errdefer, so on unwind the client goes first.
+    errdefer if (resolved) |*r| r.credential.deinit(allocator);
+
+    if (will_repl and !banner_before and resolved != null) welcome.print(resolve);
+
+    if (resolved == null and requires_llm) {
+        if (opts.no_llm) {
+            std.debug.print("--no-llm forbids LLM use; drop it to run this mode.\n", .{});
+        }
+        return error.MissingProvider;
+    }
+
+    var model = try allocator.dupe(u8, settings.resolveModelName(opts, resolved, remembered));
+    errdefer allocator.free(model);
+
+    // The REPL skips this network round trip for snappy startup; an invalid
+    // model surfaces on the first turn instead.
+    if (resolved) |*r| if (!will_repl) {
+        const remembered_matches = remembered != null and remembered.?.provider == r.credential.provider;
+        const explicit = opts.model != null or remembered_matches;
+        const resolved_model = try settings.reconcileModel(allocator, &r.credential, model, opts.base_url, explicit);
+        allocator.free(model);
+        model = resolved_model;
+    };
+
+    const effort = settings.resolveEffort(opts, remembered, will_repl, if (resolved) |r| r.credential.provider else null);
+    const verbosity = settings.resolveVerbosity(opts, remembered);
+    const stream_enabled = settings.resolveStream(remembered);
+    browser_tools.search_engine = opts.search_engine orelse settings.resolveSearchEngine(remembered);
+    // A keyless engine over its cap fails every search; silence reads as a bad
+    // agent rather than a missing key.
+    if (browser_tools.searchKeyStatus(browser_tools.search_engine)) |key| switch (key.state) {
+        .set => {},
+        .keyless => log.info(.app, "keyless search endpoint", .{ .env_var = key.env_var, .limit = "rate-limited per client IP" }),
+        .missing => log.warn(.app, "search key missing", .{ .env_var = key.env_var, .engine = @tagName(browser_tools.search_engine) }),
+    };
+
+    if (resolved) |r| {
+        if (r.source == .picked) {
+            settings.saveRemembered(.{ .provider = r.credential.provider, .model = model, .effort = effort, .verbosity = verbosity, .stream = stream_enabled, .search_engine = browser_tools.search_engine }) catch {};
+        }
+        // provider/model now live in the status bar; just space before the help
+        std.debug.print("\n", .{});
+    }
+
+    const system_prompt = try withCurrentDate(
+        allocator,
+        opts.system_prompt orelse default_system_prompt,
+        try lp.datetime.localTime(@intCast(lp.datetime.timestamp(.real))),
+        opts.locale,
+    );
+    errdefer allocator.free(system_prompt);
+
+    const self = try allocator.create(Agent);
+    errdefer allocator.destroy(self);
+
+    const history_paths: ?Terminal.HistoryPaths = if (will_repl)
+        .{ .normal = ".lp-history", .js = ".lp-history.js" }
+    else
+        null;
+
+    self.* = .{
+        .allocator = allocator,
+        .ai_client = null,
+        .credential = if (resolved) |r| r.credential else null,
+        .app_dir = app.app_dir_path,
+        .no_llm_persisted = remembered_no_llm,
+        .model_base_url = opts.base_url,
+        .model_completions = null,
+        .model_completion_arena = .init(allocator),
+        .ts = undefined,
+        .terminal = .init(allocator, history_paths, verbosity, will_repl),
+        .save_buffer = .init(allocator),
+        .save_path = null,
+        .conversation = .init(allocator, system_prompt),
+        .model = model,
+        .effort = effort,
+        .stream_enabled = stream_enabled,
+        .script_file = opts.script_file,
+        .start_url = opts.url,
+        .one_shot_task = opts.task,
+        .one_shot_save = opts.save,
+        .one_shot_attachments = if (opts.attach.items.len == 0) null else opts.attach.items,
+        .available_providers = available_providers,
+    };
+    errdefer self.terminal.deinit();
+    errdefer self.conversation.deinit();
+    self.terminal.installLogSink();
+    errdefer self.terminal.uninstallLogSink();
+
+    try self.ts.init(app);
+    errdefer self.ts.deinit();
+
+    self.ai_client = if (self.credential) |*c| try zenai.provider.Client.init(lp.io, allocator, c.provider, c.keySlice(), .{ .base_url = opts.base_url, .retry_policy = .long_running, .bill_to = hfBillTo(c.provider), .environ = lp.environ(), .account_id = c.accountId() }) else null;
+    errdefer if (self.ai_client) |c| c.deinit(allocator);
+
+    if (opts.trace) |path| {
+        self.trace = Trace.create(allocator, path, opts.trace_results) catch |err| {
+            log.fatal(.app, "cannot write trace", .{ .path = path, .err = err });
+            return err;
+        };
+        self.trace.?.run(if (self.credential) |c| @tagName(c.provider) else "none", self.model, opts.task);
+    }
+    errdefer if (self.trace) |*t| t.deinit();
+    self.installSessionHooks();
+    if (self.ai_client) |c| c.setInterrupt(&self.http_interrupt);
+
+    if (will_repl) {
+        self.terminal.attachCompleter(.{
+            .context = @ptrCast(self),
+            .providers = completionProviders,
+            .models = completionModels,
+        });
+        // The model-list cache fills lazily on the first `/model` completion,
+        // so startup never blocks on the network.
+        Terminal.setIdleCallback(&idlePump, @ptrCast(self));
+    }
+
+    return self;
+}
+
+pub fn deinit(self: *Agent) void {
+    if (self.trace) |*t| {
+        t.end(self.total_usage);
+        t.deinit();
+    }
+    self.terminal.uninstallLogSink();
+    self.save_buffer.deinit();
+    self.save_calls.deinit(self.allocator);
+    if (self.save_path) |p| self.allocator.free(p);
+    self.terminal.deinit();
+    self.allocator.free(self.conversation.system_prompt);
+    self.conversation.deinit();
+    self.model_completion_arena.deinit();
+    self.ts.deinit();
+    if (self.ai_client) |ai_client| ai_client.deinit(self.allocator);
+    if (self.credential) |*c| c.deinit(self.allocator);
+    self.allocator.free(self.model);
+    self.allocator.free(self.available_providers);
+    self.allocator.destroy(self);
+}
+
+/// isocline idle hook; returns the delay in ms before the next invocation.
+fn idlePump(arg: ?*anyopaque) callconv(.c) c_long {
+    const self: *Agent = @ptrCast(@alignCast(arg.?));
+    return self.ts.session.idleSlice();
+}
+
+/// Wire the session's cancel hook back to this agent so Ctrl-C aborts
+/// in-flight page work. Startup and `/reset`.
+fn installSessionHooks(self: *Agent) void {
+    self.ts.session.cancel_hook = .{ .context = @ptrCast(self), .check = checkCancel };
+    if (self.trace != null) self.ts.session.tool_observer = .{ .context = @ptrCast(self), .onCall = traceToolCall };
+}
+
+// Compile-time constant; projected once per process to avoid rebuilding per call.
+var global_tools_storage: [browser_tools.tool_defs.len]ProviderTool = undefined;
+var global_tools_once = lp.once(initGlobalTools);
+
+fn initGlobalTools() void {
+    for (Schema.all(), 0..) |s, i| {
+        global_tools_storage[i] = .{ .name = s.tool_name, .description = s.description, .parameters = s.parameters };
+    }
+}
+
+fn globalTools() []const ProviderTool {
+    global_tools_once.call();
+    return global_tools_storage[0..browser_tools.tool_defs.len];
+}
+
+/// Called from the sighandler thread. Flips `cancel_requested` for the LLM
+/// streaming/HTTP probe and any code polling `Session.isCancelled`, then asks
+/// V8 to bail out of whatever JS is running. Both hooks are thread-safe
+/// (`Env.terminate` takes a mutex); no terminal touches from this context.
+fn requestCancel(self: *Agent) void {
+    self.cancel_requested.store(true, .release);
+    self.http_interrupt.fire();
+    {
+        self.script_runtime_mutex.lockUncancelable(lp.io);
+        defer self.script_runtime_mutex.unlock(lp.io);
+        if (self.active_script_runtime) |runtime| {
+            runtime.terminate();
+        }
+    }
+    self.ts.browser.env.terminate();
+}
+
+/// Lives in main's stack so it can be registered with the sighandler before the
+/// agent thread exists. The agent attaches once constructed and detaches before
+/// deinit, so the sighandler-thread listener can fire safely whether or not an
+/// agent is currently up.
+pub const SigBridge = struct {
+    agent: std.atomic.Value(?*Agent) = .init(null),
+
+    pub fn attach(self: *SigBridge, agent: *Agent) void {
+        self.agent.store(agent, .release);
+    }
+
+    pub fn detach(self: *SigBridge) void {
+        self.agent.store(null, .release);
+    }
+
+    pub fn onSignal(self: *SigBridge) void {
+        const a = self.agent.load(.acquire) orelse return;
+        a.requestCancel();
+    }
+};
+
+fn beforeTurnRequest(ctx: *anyopaque) void {
+    const self: *Agent = @ptrCast(@alignCast(ctx));
+    self.conversation.compactForRequest();
+    beforeRequest(ctx);
+}
+
+fn beforeRequest(ctx: *anyopaque) void {
+    const self: *Agent = @ptrCast(@alignCast(ctx));
+    if (self.trace) |*t| t.modelStarted();
+}
+
+fn afterResponse(ctx: *anyopaque, result: *const zenai.provider.GenerateResult) void {
+    const self: *Agent = @ptrCast(@alignCast(ctx));
+    if (self.trace) |*t| t.modelCall(self.trace_phase, result);
+}
+
+fn traceToolCall(ctx: *anyopaque, tool_name: []const u8, arguments: ?std.json.Value, result: *const browser_tools.ToolResult, ms: u64, frame: ?*lp.Frame) void {
+    const self: *Agent = @ptrCast(@alignCast(ctx));
+    self.trace.?.toolCall(tool_name, arguments, result, ms, frame);
+}
+
+fn checkCancel(ctx: *anyopaque) bool {
+    const self: *Agent = @ptrCast(@alignCast(ctx));
+    return self.cancel_requested.load(.acquire);
+}
+
+/// Roll the agent back to `baseline` messages, clear the V8 termination flag,
+/// drop the cancel signal, and surface `error.UserCancelled`. Caller handles
+/// any spinner cleanup not already done on its path.
+fn drainCancellation(self: *Agent, baseline: usize) error{UserCancelled} {
+    self.resetAfterCancel(baseline);
+    return error.UserCancelled;
+}
+
+/// The side effects of `drainCancellation` without surfacing the error, for
+/// void callers (e.g. `/save` synthesis) that just need to clean up.
+fn resetAfterCancel(self: *Agent, baseline: usize) void {
+    self.endStreamedText();
+    self.conversation.rollback(baseline);
+    self.ts.browser.env.cancelTerminate();
+    self.cancel_requested.store(false, .release);
+    self.http_interrupt.reset();
+}
+
+/// On the first delta it pauses the spinner, whose stderr frames would
+/// otherwise interleave with this stdout text.
+fn streamAssistantDelta(ctx: *anyopaque, delta: []const u8) void {
+    const self: *Agent = @ptrCast(@alignCast(ctx));
+    if (delta.len == 0) return;
+    if (!self.stream_active) {
+        self.terminal.spinner.pause();
+        self.stream_active = true;
+    }
+    self.streamed_text = true;
+    self.terminal.printAssistantDelta(delta);
+}
+
+/// Close an in-progress streamed line with a newline. Idempotent, so every
+/// `runTools` exit path can call it unconditionally.
+fn endStreamedText(self: *Agent) void {
+    if (!self.stream_active) return;
+    self.terminal.endAssistantStream();
+    self.stream_active = false;
+}
+
+/// The text-delta hook, or null when `/stream off` — a null hook makes
+/// `runTools` fall back to a buffered response. Streaming is an interactive
+/// REPL affordance; one-shot (`--task`) and script modes keep stdout to the
+/// buffered final answer so wrappers can parse it cleanly.
+fn streamHook(self: *Agent) ?zenai.provider.Client.TextDeltaHook {
+    if (!self.stream_enabled or !self.terminal.isRepl()) return null;
+    return .{ .context = @ptrCast(self), .onText = streamAssistantDelta };
+}
+
+/// One agent turn: the prompt sent to the model, plus optional context — a
+/// recorder comment to write before the turn, file attachments to bundle into
+/// the first user message, and a display label used in error output.
+const TurnInput = struct {
+    prompt: []const u8,
+    record_comment: ?[]const u8 = null,
+    capture_for_save: bool = false,
+    suppress_answer: bool = false,
+    attachments: ?[]const []const u8 = null,
+    label: []const u8 = "Request",
+};
+
+/// Returns true on success.
+pub fn run(self: *Agent) bool {
+    if (self.start_url) |url| {
+        if (!self.gotoStart(url)) return false;
+    }
+    if (self.one_shot_task) |task| {
+        const saving = self.one_shot_save != null;
+        const ok = self.runTurn(.{
+            .prompt = task,
+            .attachments = self.one_shot_attachments,
+            .capture_for_save = saving,
+            .record_comment = if (saving) task else null,
+            .suppress_answer = saving,
+        });
+        // Synthesis is a second LLM call that adds to total_usage, so save
+        // before printing the cumulative summary.
+        if (ok and saving) self.saveOneShot();
+        self.printUsageSummary();
+        return ok;
+    }
+    if (self.script_file) |path| {
+        return self.runScript(path);
+    }
+    self.runRepl();
+    return true;
+}
+
+/// Opens `--url` through the tool layer, so a bad URL fails like any other
+/// tool call and `/save` replays the opening navigation.
+fn gotoStart(self: *Agent, url: [:0]const u8) bool {
+    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var object: std.json.ObjectMap = .empty;
+    object.put(a, "url", .{ .string = url }) catch return false;
+    const args: std.json.Value = .{ .object = object };
+    const result = browser_tools.call(a, self.ts.session, &self.ts.registry, "goto", args, .{ .source = .user }) catch |err| {
+        self.terminal.printError("could not open {s}: {s}", .{ url, browser_tools.errorMessage(err) });
+        return false;
+    };
+    // `call` reports a failed navigation in-band, not as an error.
+    if (result.is_error) {
+        self.terminal.printError("could not open {s}: {s}", .{ url, result.text });
+        return false;
+    }
+    self.recordSaveCommand(Command.fromToolCall(.goto, args));
+    return true;
+}
+
+/// Print single-line cumulative token usage to stderr, so wrappers driving
+/// `lightpanda agent --task ...` can capture per-task cost by `grep`-ing the
+/// `$usage` prefix. Stable key=value format:
+///   $usage prompt=N completion=N total=N cached=N cache_creation=N
+/// Fields emit 0 when the provider didn't report them.
+fn printUsageSummary(self: *Agent) void {
+    const t = Trace.Tokens.of(self.total_usage);
+    std.debug.print("$usage input={d} cached={d} cache_creation={d} output={d}\n", .{ t.input, t.cached, t.cache_creation, t.output });
+}
+
+fn runTurn(self: *Agent, input: TurnInput) bool {
+    const text = self.processUserMessage(input) catch |err| switch (err) {
+        error.UnsupportedAttachment, error.AttachmentReadFailed => return false,
+        error.UserCancelled => {
+            self.terminal.printInfo("Interrupted.", .{});
+            self.conversation.prune();
+            return false;
+        },
+        else => {
+            self.terminal.printError("{s} failed: {s}", .{ input.label, self.api_error_detail orelse @errorName(err) });
+            return false;
+        },
+    };
+    if (!input.suppress_answer) {
+        if (text) |t| {
+            // Streaming already emitted the text incrementally (plus a closing
+            // newline); only the buffered path needs to print it here. Safe as a
+            // turn-wide flag: the stream accumulator reconstructs `t` from the
+            // same deltas it emitted, and the synthesis fallback also streams, so
+            // `streamed_text` implies `t` was already shown in full.
+            if (!self.streamed_text) self.terminal.printMarkdown(t);
+        } else if (self.last_turn_refused)
+            self.terminal.printInfo("(model declined to respond — safety refusal)", .{})
+        else
+            self.terminal.printInfo("(no response from model)", .{});
+    }
+    self.conversation.prune();
+    return true;
+}
+
+fn runRepl(self: *Agent) void {
+    log.debug(.app, "tools loaded", .{ .count = globalTools().len });
+
+    if (self.ai_client != null) {
+        self.terminal.printSessionBanner(self.model, @tagName(self.effort), self.stream_enabled);
+    }
+
+    repl: while (true) {
+        std.debug.print("\n", .{});
+        const line = Terminal.readLine("") orelse break;
+        defer Terminal.freeLine(line);
+
+        // Slash commands and idle Ctrl-C set the cancel flag without clearing
+        // V8's terminate state; drain both before the next turn.
+        if (self.cancel_requested.swap(false, .acq_rel)) {
+            self.ts.browser.env.cancelTerminate();
+        }
+
+        const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            self.terminal.clearPromptFrame();
+            continue;
+        }
+        std.debug.print("\n", .{});
+
+        var arena: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        if (self.terminal.jsMode()) {
+            // `line` keeps the `$LP_*` placeholder so the secret never reaches
+            // the recorder; only the evaluated copy is expanded.
+            const script = browser_tools.substituteEnvVars(aa, line) catch line;
+            const result = browser_tools.evalScript(aa, self.ts.session, &self.ts.registry, script) catch |err| {
+                self.terminal.printError("{s}", .{switch (err) {
+                    error.OutOfMemory => "out of memory",
+                    error.FrameNotLoaded => "no page loaded — run /goto <url> first (Esc exits JS mode)",
+                    else => aa.print("evaluate failed: {s}", .{@errorName(err)}) catch "evaluate failed",
+                }});
+                continue :repl;
+            };
+            // Surface console output: slash commands (and thus /consoleLogs)
+            // are unreachable in JS mode, so a console must echo logs itself.
+            const logs = std.mem.trimEnd(u8, self.ts.session.drainConsoleMessages(), "\n");
+            if (logs.len > 0) self.printData(.consoleLogs, logs);
+            if (result.is_error) {
+                self.terminal.printError("{s}", .{result.text});
+            } else {
+                self.printData(.evaluate, result.text);
+                self.recordSaveRaw(line);
+            }
+            continue :repl;
+        }
+
+        // A slash command whose `'''…'''` body is still open continues on the
+        // following lines until the block closes (the multi-line /extract
+        // form). Ctrl-D on the continuation prompt abandons the command.
+        const command_text: []const u8 = if (trimmed[0] == '/' and Schema.hasUnclosedTripleQuote(trimmed))
+            Terminal.readContinuation(aa, trimmed) orelse continue :repl
+        else
+            trimmed;
+
+        const slash_split: ?Schema.Split = Schema.parseSlashCommand(command_text);
+        if (slash_split) |split| {
+            if (SlashCommand.findMeta(split.name)) |meta| {
+                if (self.handleMeta(aa, meta, split.rest)) break :repl;
+                continue :repl;
+            }
+        }
+
+        var diag: Schema.Diag = .{};
+        const cmd = Command.parseDiag(aa, command_text, &diag) catch |err| switch (err) {
+            error.NotASlashCommand => {
+                if (self.ai_client == null) {
+                    self.terminal.printError("Basic REPL (LLM disabled) accepts only commands. Try /help, or " ++ llm_setup_hint ++ " to enable natural-language prompts.", .{});
+                    continue :repl;
+                }
+                _ = self.runTurn(.{ .prompt = line, .record_comment = line, .capture_for_save = true });
+                continue :repl;
+            },
+            else => |e| {
+                const name = if (slash_split) |sp| sp.name else line;
+                self.terminal.printSlashParseError(e, name, &diag);
+                continue :repl;
+            },
+        };
+
+        switch (cmd) {
+            .comment => continue :repl,
+            .llm => |lc| {
+                var label_buf: [32]u8 = undefined;
+                const label = std.mem.print(&label_buf, "/{s}", .{@tagName(lc)}) catch "/?";
+                if (!self.requireLlm(label)) continue :repl;
+                _ = self.runTurn(.{ .prompt = lc.prompt(), .record_comment = line, .capture_for_save = true, .label = label });
+            },
+            .tool_call => |tc| {
+                self.terminal.beginTool(tc.name(), slash_split.?.rest);
+                const result = self.runCommand(aa, tc);
+                self.terminal.endTool();
+                self.printCommandResult(tc, result);
+                if (!result.is_error) {
+                    const replayable = Command.fromToolCall(tc.tool, withSelector(aa, tc.args, result.selector));
+                    self.recordSaveCommand(navigationGoto(aa, tc.tool, tc.args, result.navigated) orelse replayable);
+                }
+                self.recordSlashToolCall(command_text, tc.name(), tc.args, result) catch |err| {
+                    self.terminal.printWarning("LLM conversation out of sync (/{s}: {s}); next prompt may not see this action", .{ tc.name(), @errorName(err) });
+                };
+            },
+        }
+    }
+}
+
+/// Handle a REPL-only meta slash command — not a tool slash command, never
+/// reaches the browser tool dispatcher. Returns `true` if the user asked to quit.
+fn handleMeta(self: *Agent, arena: std.mem.Allocator, meta: *const SlashCommand.MetaCommand, rest: []const u8) bool {
+    switch (meta.tag) {
+        .quit => return true,
+        .help => self.printSlashHelp(arena, rest),
+        .verbosity => self.setEnumOption("verbosity", &self.terminal.verbosity, rest),
+        .effort => self.setEnumOption("effort", &self.effort, rest),
+        .stream => self.handleStream(rest),
+        .usage => self.handleUsage(),
+        .clear => self.handleClear(),
+        .reset => self.handleReset(),
+        .save => self.handleSave(arena, rest),
+        .load => self.handleLoad(rest),
+        .model => self.handleModel(arena, rest),
+        .provider => self.handleProvider(arena, rest),
+        .searchEngine => self.handleSearchEngine(rest),
+    }
+    return false;
+}
+
+/// Shared body of `/verbosity` and `/effort`: bare prints the current level; an
+/// argument is parsed against the enum, stored in `target`, and persisted.
+/// `name` drives the slash name, usage hint, and report label.
+fn setEnumOption(self: *Agent, comptime name: []const u8, target: anytype, rest: []const u8) void {
+    const T = @typeInfo(@TypeOf(target)).pointer.child;
+    if (rest.len == 0) {
+        self.terminal.printInfo(name ++ ": {s}", .{@tagName(target.*)});
+        return;
+    }
+    const level = std.meta.stringToEnum(T, rest) orelse {
+        self.terminal.printError("usage: /" ++ name ++ " " ++ Config.tagHint(T) ++ " (got {s})", .{rest});
+        return;
+    };
+    target.* = level;
+    self.reportSaved(name, @tagName(level));
+}
+
+/// `/stream`: bare prints the current state; `on`/`off` sets and persists it.
+fn handleStream(self: *Agent, rest: []const u8) void {
+    if (rest.len == 0) {
+        self.terminal.printInfo("stream: {s}", .{if (self.stream_enabled) "on" else "off"});
+        return;
+    }
+    const on = if (std.ascii.eqlIgnoreCase(rest, "on") or std.ascii.eqlIgnoreCase(rest, "true"))
+        true
+    else if (std.ascii.eqlIgnoreCase(rest, "off") or std.ascii.eqlIgnoreCase(rest, "false"))
+        false
+    else {
+        self.terminal.printError("usage: /stream [on|off] (got {s})", .{rest});
+        return;
+    };
+    self.stream_enabled = on;
+    self.reportSaved("stream", if (on) "on" else "off");
+}
+
+/// `/searchEngine`: bare prints the current engine; an argument sets and
+/// persists it, warning when the chosen engine's API key is unset.
+fn handleSearchEngine(self: *Agent, rest: []const u8) void {
+    self.setEnumOption("searchEngine", &browser_tools.search_engine, rest);
+    const selected = std.meta.stringToEnum(browser_tools.SearchEngine, rest) orelse return;
+    const key = browser_tools.searchKeyStatus(selected) orelse return;
+    switch (key.state) {
+        .set => {},
+        .keyless => self.terminal.printInfo("{s} is not set; using the keyless endpoint (rate-limited per client IP)", .{key.env_var}),
+        .missing => self.terminal.printWarning("{s} is not set; the search tool will fail until you export it", .{key.env_var}),
+    }
+}
+
+/// Print cumulative session token usage, broken down so the cache's effect is
+/// visible — the REPL otherwise never surfaces the `$usage` line `--task`
+/// prints. Reads `total_usage` (accumulated per turn by `processUserMessage`);
+/// fresh/cache split semantics live on `Usage`.
+fn handleUsage(self: *Agent) void {
+    const u = self.total_usage;
+    const input = u.inputTokens();
+    const output = u.completion_tokens orelse 0;
+    if (input == 0 and output == 0) {
+        self.terminal.printInfo("usage: no model turns yet this session", .{});
+        return;
+    }
+    self.terminal.printInfo(
+        "usage: input={d} (fresh={d} · cache read={d} · cache write={d}), output={d}",
+        .{ input, u.prompt_tokens orelse 0, u.cached_tokens orelse 0, u.cache_creation_tokens orelse 0, output },
+    );
+    if (input > 0) {
+        self.terminal.printInfo("cache: {d}% of input served from cache", .{u.cacheHitPercent()});
+    }
+}
+
+/// Drop everything tied to the conversation: history (system prompt re-seeds
+/// lazily next turn), cumulative usage, the recorded action buffer and its save
+/// destination, and DOM node IDs. Shared by `/clear` and `/reset`.
+fn clearConversation(self: *Agent) void {
+    self.conversation.rollback(0);
+    self.save_buffer.reset();
+    if (self.save_path) |p| self.allocator.free(p);
+    self.save_path = null;
+    self.total_usage = .{};
+    self.ts.registry.reset();
+}
+
+/// Forget the conversation while leaving the browser session live — loaded page
+/// stays put, cookies/logins preserved.
+fn handleClear(self: *Agent) void {
+    self.clearConversation();
+    self.terminal.printInfo("Cleared conversation, usage, and node IDs. Page and cookies kept.", .{});
+}
+
+/// Full clean slate: everything `/clear` drops, plus a fresh browser session,
+/// so the loaded page, cookies, storage, and history are gone too.
+fn handleReset(self: *Agent) void {
+    self.ts.restartSession() catch |err| {
+        self.terminal.printError("reset failed: {s}", .{@errorName(err)});
+        return;
+    };
+    self.installSessionHooks();
+    self.clearConversation();
+    self.terminal.printInfo("Reset conversation and browser session. Page, cookies, and storage cleared.", .{});
+}
+
+fn handleLoad(self: *Agent, rest: []const u8) void {
+    const path = std.mem.trim(u8, rest, &std.ascii.whitespace);
+    if (path.len == 0) {
+        self.terminal.printError("usage: /load <path>", .{});
+        return;
+    }
+    _ = self.runScript(path);
+}
+
+const api_keys_hint = settings.api_keys_hint;
+const llm_setup_hint = "set an API key (" ++ api_keys_hint ++ ") and run /provider <name>";
+
+/// `/provider <keyword>` disables the LLM and persists it; shared by command
+/// parser, autocomplete, and save report so they can't drift apart.
+const provider_off_keyword = "null";
+
+/// Keyless local providers (placeholder key), so reachability needs a live probe.
+/// Parallel to `local_completable`.
+const local_providers = [_]Config.AiProvider{ .ollama, .llama_cpp };
+
+fn requireLlm(self: *Agent, name: []const u8) bool {
+    if (self.credential == null) {
+        self.terminal.printError("{s} requires an LLM — " ++ llm_setup_hint ++ ".", .{name});
+        return false;
+    }
+    return true;
+}
+
+fn handleModel(self: *Agent, _: std.mem.Allocator, rest: []const u8) void {
+    if (!self.requireLlm("/model")) return;
+
+    const trimmed = std.mem.trim(u8, rest, &std.ascii.whitespace);
+    if (trimmed.len == 0) {
+        self.terminal.printInfo("Current model: {s}", .{self.model});
+        return;
+    }
+    const ids = completionModels(self, self.allocator);
+    // Empty list = fetch failed or unlisted local models; can't confirm, allow.
+    if (ids.len != 0 and !string.isOneOf(trimmed, ids)) {
+        self.terminal.printError("unknown model: {s}", .{trimmed});
+        return;
+    }
+    self.setModel(trimmed) catch |err| {
+        self.terminal.printError("failed to set model: {s}", .{@errorName(err)});
+    };
+}
+
+/// Persist provider/model/effort/verbosity to `.lp-agent.zon` and report it as
+/// "<label>: <value>", appending "(saved to …)" on write success. With no model
+/// credentials it persists `provider = null` only when that's an intentional
+/// preference (`no_llm_persisted`); a transient --no-llm run reports without saving.
+fn reportSaved(self: *Agent, label: []const u8, value: []const u8) void {
+    const provider: ?Config.AiProvider = if (self.credential) |c| c.provider else null;
+    // A transient --no-llm run has no provider and no intent to persist one;
+    // report without saving so we don't clobber the remembered selection.
+    if (provider == null and !self.no_llm_persisted) {
+        self.terminal.printInfo("{s}: {s}", .{ label, value });
+        return;
+    }
+    if (settings.saveRemembered(.{ .provider = provider, .model = self.model, .effort = self.effort, .verbosity = self.terminal.verbosity, .stream = self.stream_enabled, .search_engine = browser_tools.search_engine })) {
+        self.terminal.printInfo("{s}: {s} (saved to {s})", .{ label, value, settings.remembered_path });
+    } else |_| {
+        self.terminal.printInfo("{s}: {s}", .{ label, value });
+    }
+}
+
+fn setModel(self: *Agent, model: []const u8) !void {
+    const new_model = try self.allocator.dupe(u8, model);
+    self.allocator.free(self.model);
+    self.model = new_model;
+    self.reportSaved("model", self.model);
+}
+
+fn handleProvider(self: *Agent, _: std.mem.Allocator, rest: []const u8) void {
+    const trimmed = std.mem.trim(u8, rest, &std.ascii.whitespace);
+
+    if (trimmed.len == 0) {
+        if (self.credential) |c| {
+            self.terminal.printInfo("Current provider: {s}", .{@tagName(c.provider)});
+        } else {
+            self.terminal.printInfo("Current provider: null — LLM disabled", .{});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, trimmed, provider_off_keyword)) {
+        self.disableProvider();
+        return;
+    }
+
+    const provider = std.meta.stringToEnum(Config.AiProvider, trimmed) orelse {
+        self.terminal.printError("unknown provider: {s} (or 'null' to disable the LLM)", .{trimmed});
+        return;
+    };
+    // Re-selecting vertex (token refresh) or a subscription provider (the
+    // keep/login/logout menu) falls through instead of no-op'ing.
+    const vertex_project = provider == .vertex and settings.vertexProjectMode();
+    const sub_desc = auth.descriptorFor(provider);
+    if (self.credential) |current| if (provider == current.provider and !vertex_project and sub_desc == null) {
+        self.terminal.printInfo("provider: {s}", .{@tagName(provider)});
+        return;
+    };
+    if (vertex_project) {
+        const token = settings.gcloudAccessToken(self.allocator) catch |err| {
+            self.terminal.printError("could not obtain a Vertex access token: {s} (details above)", .{@errorName(err)});
+            return;
+        };
+        self.setProvider(.{ .provider = .vertex, .key = .{ .owned = token } }) catch |err| {
+            self.allocator.free(token);
+            self.terminal.printError("failed to set provider: {s}", .{@errorName(err)});
+        };
+        return;
+    }
+    // Subscription provider: menu over the stored session, or first-time login.
+    if (sub_desc) |desc| {
+        var owned = if (auth.sessionFor(self.allocator, provider) catch null) |stored|
+            self.promptStoredSubscription(desc, stored) orelse return
+        else
+            self.subscriptionLogin(desc) orelse return;
+        self.setProvider(.{ .provider = provider, .key = .{ .session = owned } }) catch |err| {
+            owned.deinit();
+            self.terminal.printError("failed to set provider: {s}", .{@errorName(err)});
+        };
+        return;
+    }
+    const key = zenai.provider.envApiKey(lp.environ(), provider) orelse {
+        if (provider == .vertex) {
+            self.terminal.printError("vertex needs VERTEX_API_KEY (express mode) or GOOGLE_CLOUD_PROJECT (project mode, token via gcloud)", .{});
+            return;
+        }
+        self.terminal.printError("no API key for {s}; set {s}", .{ @tagName(provider), zenai.provider.envVarName(provider) });
+        return;
+    };
+    // Ollama's key is a placeholder, so probe the server instead of trusting it.
+    if (provider == .ollama and settings.detectLocalProvider(self.allocator, .ollama, self.model_base_url) == null) {
+        self.terminal.printError("no Ollama server with a pulled model at {s}", .{self.model_base_url orelse zenai.provider.ollama_default_base_url});
+        return;
+    }
+    if (provider == .llama_cpp and settings.detectLocalProvider(self.allocator, .llama_cpp, self.model_base_url) == null) {
+        self.terminal.printError("no llama.cpp server with a loaded model at {s}", .{self.model_base_url orelse zenai.provider.llama_cpp_default_base_url});
+        return;
+    }
+    self.setProvider(.{ .provider = provider, .key = .{ .env = key } }) catch |err| {
+        self.terminal.printError("failed to set provider: {s}", .{@errorName(err)});
+    };
+}
+
+/// Interactive device-code login; cancellation/failure is reported here.
+fn subscriptionLogin(self: *Agent, desc: *const auth.Descriptor) ?auth.Session {
+    return auth.login(self.allocator, desc, &self.http_interrupt) catch |err| {
+        if (err == error.LoginCancelled) {
+            // Undo `requestCancel`'s side effects before the next turn.
+            self.resetAfterCancel(self.conversation.messages.items.len);
+            self.terminal.printInfo("{s} login cancelled", .{desc.label});
+            return null;
+        }
+        self.terminal.printError("{s} login failed: {s}", .{ desc.label, @errorName(err) });
+        return null;
+    };
+}
+
+/// Menu for re-selecting an already-logged-in subscription provider: keep the
+/// stored login, re-run it (switch accounts), or log out. Null when there is
+/// nothing to activate.
+fn promptStoredSubscription(self: *Agent, desc: *const auth.Descriptor, stored: auth.Session) ?auth.Session {
+    var session = stored;
+    var header_buf: [128]u8 = undefined;
+    const header = std.mem.print(&header_buf, "Already logged in with your {s}. Pick:", .{desc.label}) catch
+        "Already logged in. Pick:";
+    const idx = picker.promptNumberedChoice(header, &.{
+        "keep — use the stored login",
+        "login — run the login again (e.g. to switch accounts)",
+        "logout — forget the stored login",
+    }, 0) catch {
+        session.deinit();
+        return null;
+    };
+    if (idx == 0) return session;
+    session.deinit();
+    if (idx == 1) return self.subscriptionLogin(desc);
+    auth.logout(self.allocator, desc) catch |err| {
+        self.terminal.printError("could not remove the stored login: {s}", .{@errorName(err)});
+        return null;
+    };
+    self.terminal.printInfo("{s} logged out.", .{desc.label});
+    if (self.credential) |c| if (c.provider == desc.provider) self.disableProvider();
+    return null;
+}
+
+/// Tear down the LLM client and persist a null provider so the next REPL launch
+/// starts in basic mode without re-prompting. Inverse of `setProvider`.
+fn disableProvider(self: *Agent) void {
+    if (self.ai_client) |client| client.deinit(self.allocator);
+    self.ai_client = null;
+    if (self.credential) |*c| c.deinit(self.allocator);
+    self.credential = null;
+    self.model_completions = null;
+    self.no_llm_persisted = true;
+    self.reportSaved("provider", provider_off_keyword);
+}
+
+/// `HF_BILL_TO` org for routed requests; null for non-HF providers. Without it,
+/// requests bill the token owner's personal account instead of the org.
+fn hfBillTo(provider: Config.AiProvider) ?[]const u8 {
+    if (provider != .huggingface) return null;
+    const v = std.c.getenv("HF_BILL_TO") orelse return null;
+    return std.mem.span(v);
+}
+
+/// `credential` transfers ownership of its key resources on success; on error
+/// the caller still owns them. The previous credential is released only after
+/// the old client is gone.
+fn setProvider(self: *Agent, credential: settings.Credential) !void {
+    const new_client = try zenai.provider.Client.init(lp.io, self.allocator, credential.provider, credential.keySlice(), .{ .base_url = self.model_base_url, .retry_policy = .long_running, .bill_to = hfBillTo(credential.provider), .environ = lp.environ(), .account_id = credential.accountId() });
+    errdefer new_client.deinit(self.allocator);
+
+    // A same-provider re-select (vertex token refresh) must not reset the model.
+    const same_provider = if (self.credential) |c| c.provider == credential.provider else false;
+    const new_model = try self.allocator.dupe(u8, if (same_provider) self.model else zenai.provider.defaultModel(credential.provider));
+    if (self.ai_client) |client| client.deinit(self.allocator);
+    if (self.credential) |*c| c.deinit(self.allocator);
+    self.credential = credential;
+    new_client.setInterrupt(&self.http_interrupt);
+    self.ai_client = new_client;
+    self.no_llm_persisted = false;
+    self.model_completions = null;
+    self.allocator.free(self.model);
+    self.model = new_model;
+    if (auth.descriptorFor(credential.provider)) |d| {
+        self.terminal.printInfo("provider: {s} ({s})", .{ @tagName(credential.provider), d.label });
+    } else {
+        self.terminal.printInfo("provider: {s}", .{@tagName(credential.provider)});
+    }
+    if (zenai.provider.defaultEffort(credential.provider)) |e| if (e != self.effort) {
+        self.effort = e;
+        self.terminal.printInfo("effort: {s} ({s} default)", .{ @tagName(e), @tagName(credential.provider) });
+    };
+    self.reportSaved("model", self.model);
+    // Prime the completion cache on the command, not on a `/model` keystroke.
+    _ = completionModels(self, self.allocator);
+}
+
+/// Keep a subscription (bearer) token current before a model request: when the
+/// active session's token is near expiry, re-import from the source and repoint
+/// the client at the fresh token (`keySlice` readers see it automatically).
+/// A no-op for API-key auth. Runs between turns on the single agent thread, so
+/// the client is repointed before the next request borrows the token.
+fn refreshAuthIfNeeded(self: *Agent) void {
+    const cred = if (self.credential) |*c| c else return;
+    if (cred.key != .session) return;
+    const session = &cred.key.session;
+    const refreshed = session.ensureFresh() catch |err| {
+        self.terminal.printError("could not refresh the subscription token: {s}", .{@errorName(err)});
+        return;
+    };
+    if (refreshed) if (self.ai_client) |client| client.setApiKey(session.tokens.access_token);
+}
+
+const PathAndMode = struct { path: []const u8, mode: save.Mode };
+
+const SavedCall = struct {
+    selector: ?[]const u8 = null,
+    navigated: bool = false,
+};
+
+fn resolveSavePathAndMode(self: *Agent, arena: std.mem.Allocator, filename: ?[]const u8) ?PathAndMode {
+    if (self.save_path) |saved| {
+        if (filename) |name| {
+            if (!std.mem.eql(u8, saved, name)) {
+                self.terminal.printError("already saving to {s}; use /save without a filename to update it", .{saved});
+                return null;
+            }
+        }
+        // A repeat save reuses the destination without re-asking: revision
+        // when a model can merge, plain append for the verbatim dump.
+        return .{ .path = saved, .mode = if (self.ai_client != null) .update else .append };
+    } else if (filename) |name| {
+        const exists = save.fileExists(name) catch |err| {
+            self.terminal.printError("failed to inspect {s}: {s}", .{ name, @errorName(err) });
+            return null;
+        };
+        const mode = if (exists)
+            self.promptSaveMode(name) orelse return null
+        else
+            .replace;
+        return .{ .path = name, .mode = mode };
+    } else {
+        const path = save.randomFilename(arena) catch |err| {
+            self.terminal.printError("failed to choose save filename: {s}", .{@errorName(err)});
+            return null;
+        };
+        return .{ .path = path, .mode = .replace };
+    }
+}
+
+fn handleSave(self: *Agent, arena: std.mem.Allocator, rest: []const u8) void {
+    const parsed = save.parseCommand(arena, rest) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.UnterminatedQuote => "unterminated filename quote",
+            error.EmptyFilename => "filename cannot be empty",
+            error.OutOfMemory => "out of memory",
+        };
+        self.terminal.printError("{s}", .{msg});
+        return;
+    };
+
+    if (self.ai_client != null) {
+        self.synthesizeSave(arena, parsed.filename, parsed.prompt);
+        return;
+    }
+
+    if (parsed.prompt != null) {
+        self.terminal.printWarning("prompt ignored without an LLM; saving the recorded commands as-is", .{});
+    }
+    const resolved = self.resolveSavePathAndMode(arena, parsed.filename) orelse return;
+
+    save.writeContentFile(resolved.path, self.save_buffer.bytes(), resolved.mode) catch |err| {
+        self.terminal.printError("failed to save {s}: {s}", .{ resolved.path, @errorName(err) });
+        return;
+    };
+
+    self.rememberSavePath(resolved.path) catch |err| {
+        self.terminal.printWarning("failed to remember save destination {s}: {s}", .{ resolved.path, @errorName(err) });
+    };
+    const saved_lines = self.save_buffer.lines;
+    self.save_buffer.reset();
+    self.terminal.printInfo("Saved {d} line(s) to {s}", .{ saved_lines, resolved.path });
+}
+
+fn promptSaveMode(self: *Agent, path: []const u8) ?save.Mode {
+    var header_buf: [256]u8 = undefined;
+    const header = std.mem.print(&header_buf, "{s} already exists. Pick save mode:", .{path}) catch
+        "File already exists. Pick save mode:";
+    const with_llm = self.ai_client != null;
+    const modes: []const save.Mode = if (with_llm)
+        &.{ .update, .append, .replace }
+    else
+        &.{ .append, .replace };
+    const labels: []const [:0]const u8 = if (with_llm)
+        &.{
+            "update — revise the saved script with this session's actions and the prompt",
+            "append — keep the file as-is and add the new script at the end",
+            "replace — discard the file and write a fresh script",
+        }
+    else
+        &.{
+            "append — add the recorded commands at the end",
+            "replace — overwrite with the recorded commands",
+        };
+    const idx = picker.promptNumberedChoice(header, labels, 0) catch {
+        self.terminal.printInfo("Save cancelled.", .{});
+        return null;
+    };
+    return modes[idx];
+}
+
+fn failSave(self: *Agent, reason: []const u8) void {
+    self.terminal.printError("save failed: {s}", .{reason});
+}
+
+/// Roll the in-flight save turn back out of the conversation, then report the
+/// failure — so a doomed `/save` synthesis never leaks its messages into history.
+fn abortSave(self: *Agent, baseline: usize, reason: []const u8) void {
+    self.conversation.rollback(baseline);
+    self.failSave(reason);
+}
+
+/// Save synthesis warrants more reasoning than a normal turn. `.null` and
+/// `.none` are kept as chosen.
+fn bumpedEffort(effort: Config.Effort) Config.Effort {
+    return switch (effort) {
+        .null => .null,
+        .none => .none,
+        .minimal => .low,
+        .low => .medium,
+        .medium => .high,
+        .high, .xhigh => .xhigh,
+    };
+}
+
+/// LLM-synthesized `/save`: hand the model the builtin catalog, the full
+/// conversation, and the deterministic record of what ran, then write the
+/// idiomatic script it returns.
+fn synthesizeSave(self: *Agent, arena: std.mem.Allocator, filename: ?[]const u8, prompt: ?[]const u8) void {
+    // With nothing recorded and no prompt, a re-synthesis has nothing to act
+    // on — it would just re-roll the previous output.
+    if (self.save_buffer.bytes().len == 0 and prompt == null) {
+        if (self.save_path) |saved| {
+            self.terminal.printWarning("nothing ran since the last save; run more commands or give a prompt to revise {s}, e.g. /save <what to change>", .{saved});
+        } else {
+            self.terminal.printWarning("nothing to save yet; run some commands or give a prompt, e.g. /save <what the script should do>", .{});
+        }
+        return;
+    }
+
+    const resolved = self.resolveSavePathAndMode(arena, filename) orelse return;
+    self.synthesizeSaveTo(arena, resolved.path, resolved.mode, prompt);
+}
+
+/// One-shot `--task ... --save`: overwrites the destination without the REPL's
+/// interactive file-exists prompt. The task doubles as the synthesis prompt so
+/// the empty-buffer guard in `synthesizeSaveTo` never trips.
+fn saveOneShot(self: *Agent) void {
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const path = save.ensureJsExtension(arena.allocator(), self.one_shot_save.?) catch self.one_shot_save.?;
+    self.synthesizeSaveTo(arena.allocator(), path, .replace, self.one_shot_task.?);
+}
+
+/// LLM synthesis + write for an already-resolved destination. Shared by the
+/// interactive `/save` and one-shot `--save`.
+fn synthesizeSaveTo(self: *Agent, arena: std.mem.Allocator, path: []const u8, mode: save.Mode, prompt: ?[]const u8) void {
+    const provider_client = self.ai_client.?;
+    self.refreshAuthIfNeeded();
+
+    // Only update feeds the saved script back to the model; append stays
+    // blind — the script is synthesized from this session alone and written
+    // after the existing content.
+    const previous_script: ?[]const u8 = if (mode == .update)
+        save.readScript(arena, path) catch |err| {
+            self.terminal.printError("failed to read {s}: {s}", .{ path, @errorName(err) });
+            return;
+        }
+    else
+        null;
+
+    self.conversation.ensureSystemPrompt() catch return self.failSave("out of memory");
+
+    // Swap the dedicated save_system_prompt in as the system prompt for this one turn;
+    // regular turns keep the driver prompt. (`messages[0]` is the system
+    // message — rollback and prune never touch it.)
+    const plain_system = self.conversation.messages.items[0].content;
+    self.conversation.messages.items[0].content = savePrompt(previous_script != null);
+    defer self.conversation.messages.items[0].content = plain_system;
+
+    const ma = self.conversation.arena.allocator();
+    const baseline = self.conversation.messages.items.len;
+
+    const user_msg = self.buildSaveSynthesisMessage(ma, path, previous_script, prompt) catch return self.failSave("out of memory");
+    self.conversation.messages.append(self.allocator, .{ .role = .user, .content = user_msg }) catch return self.failSave("out of memory");
+
+    self.http_interrupt.reset();
+    self.terminal.spinner.start();
+    self.trace_phase = "save";
+    defer self.trace_phase = "turn";
+    var result = ModelCall.run(
+        self.ts.session,
+        provider_client,
+        self.model,
+        &self.conversation.messages,
+        self.allocator,
+        ma,
+        .{ .context = @ptrCast(self), .callFn = handleToolCall },
+        .{
+            .tools = &.{},
+            .max_turns = 1,
+            .max_tokens = 8192,
+            .tool_choice = .none,
+            .effort = bumpedEffort(self.effort),
+            .cancel = .{ .context = @ptrCast(self), .checkFn = checkCancel },
+            .before_request = .{ .context = @ptrCast(self), .callFn = beforeRequest },
+            .after_response = .{ .context = @ptrCast(self), .callFn = afterResponse },
+        },
+    ) catch |err| {
+        self.terminal.spinner.cancel();
+        if (self.cancel_requested.load(.acquire)) {
+            self.resetAfterCancel(baseline);
+            return;
+        }
+        log.err(.app, "AI save synthesis error", .{ .err = err });
+        return self.abortSave(baseline, @errorName(err));
+    };
+    self.terminal.spinner.stop();
+    defer result.deinit();
+    self.total_usage.add(result.usage);
+
+    if (result.cancelled) {
+        self.resetAfterCancel(baseline);
+        return;
+    }
+
+    // `stripCodeFence` accepts an unclosed block, so a truncated script is
+    // indistinguishable from a complete one once it is on disk.
+    if (result.finish_reason == .max_tokens) {
+        return self.abortSave(baseline, "the model ran out of output tokens mid-script");
+    }
+
+    const raw = result.text orelse return self.abortSave(baseline, "the model returned no script");
+
+    // `result.text` lives in the conversation arena, freed by the rollback
+    // below; copy into the command arena first (scrubbing may return its input
+    // as-is).
+    const owned = arena.dupe(u8, save.stripCodeFence(raw)) catch return self.abortSave(baseline, "out of memory");
+    const script = browser_tools.reverseSubstituteEnvVars(arena, owned) catch return self.abortSave(baseline, "out of memory");
+
+    // The save turn is a meta-action; keep it out of the ongoing conversation.
+    self.conversation.rollback(baseline);
+
+    save.writeContentFile(path, script, mode) catch |err| {
+        self.terminal.printError("failed to save {s}: {s}", .{ path, @errorName(err) });
+        return;
+    };
+
+    self.rememberSavePath(path) catch |err| {
+        self.terminal.printWarning("failed to remember save destination {s}: {s}", .{ path, @errorName(err) });
+    };
+    self.save_buffer.reset();
+    self.terminal.printInfo("Saved synthesized script to {s}", .{path});
+}
+
+/// Persist `path` as the destination reused by a subsequent bare `/save`.
+fn rememberSavePath(self: *Agent, path: []const u8) !void {
+    if (self.save_path) |old| {
+        if (std.mem.eql(u8, old, path)) return;
+    }
+    const dup = try self.allocator.dupe(u8, path);
+    if (self.save_path) |old| self.allocator.free(old);
+    self.save_path = dup;
+}
+
+fn buildSaveSynthesisMessage(self: *Agent, arena: std.mem.Allocator, path: []const u8, previous_script: ?[]const u8, prompt: ?[]const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    if (previous_script) |script| {
+        try w.print("\nThe previously saved script in {s}, the base you are revising:\n", .{path});
+        try w.writeAll(script);
+    }
+    const recorded = self.save_buffer.bytes();
+    if (recorded.len > 0) {
+        const since: []const u8 = if (previous_script != null) " since the last save" else " this session";
+        try w.print("\nCommands and JS that actually ran{s}:\n", .{since});
+        try w.writeAll(recorded);
+    }
+    if (prompt) |p| {
+        try w.writeAll("\nThe user's instruction for this script:\n");
+        try w.writeAll(p);
+    }
+    return out.written();
+}
+
+fn logSaveBufferError(self: *Agent, err: anyerror) void {
+    self.terminal.printError("save buffer disabled: {s}", .{@errorName(err)});
+}
+
+/// Swap a call's ephemeral `backendNodeId` for the selector the tool layer
+/// resolved, so the call can be replayed.
+fn withSelector(arena: std.mem.Allocator, args: ?std.json.Value, selector: ?[]const u8) ?std.json.Value {
+    const sel = selector orelse return args;
+    const original = args orelse return args;
+    if (original != .object) return args;
+    if (!original.object.contains("backendNodeId")) return args;
+
+    var rewritten = original.object.clone(arena) catch return args;
+    _ = rewritten.swapRemove("backendNodeId");
+    rewritten.put(arena, "selector", .{ .string = sel }) catch return args;
+    return .{ .object = rewritten };
+}
+
+fn recordSaveCommand(self: *Agent, cmd: Command) void {
+    self.save_buffer.record(cmd) catch |err| self.logSaveBufferError(err);
+}
+
+/// Synthesize the `goto` a navigating read tool performed (`markdown {url}`, …)
+/// so `/save` can replay it; null when it didn't navigate. The result borrows
+/// `args`/`arena` — record it before either is freed.
+fn navigationGoto(arena: std.mem.Allocator, tool: BrowserTool, args: ?std.json.Value, navigated: bool) ?Command {
+    if (!navigated or !tool.navigatesToUrl()) return null;
+    const a = args orelse return null;
+    if (a != .object) return null;
+    const url = a.object.get("url") orelse return null;
+    if (url != .string or url.string.len == 0) return null;
+    var obj: std.json.ObjectMap = .empty;
+    obj.put(arena, "url", url) catch return null;
+    return Command.fromToolCall(.goto, .{ .object = obj });
+}
+
+fn recordSaveComment(self: *Agent, comment: []const u8) void {
+    self.save_buffer.recordComment(comment) catch |err| self.logSaveBufferError(err);
+}
+
+fn recordSaveRaw(self: *Agent, line: []const u8) void {
+    self.save_buffer.recordRaw(line) catch |err| self.logSaveBufferError(err);
+}
+
+fn printSlashHelp(self: *Agent, arena: std.mem.Allocator, target: []const u8) void {
+    if (target.len == 0) {
+        const all = Schema.all();
+        const browser = arena.alloc(SlashCommand.Help, all.len) catch return;
+        for (all, browser) |*s, *e| e.* = .{ .name = s.tool_name, .description = s.summary };
+        self.terminal.printHelpSection("Browser commands:", browser);
+
+        if (self.ai_client != null) {
+            const llm = arena.alloc(SlashCommand.Help, SlashCommand.llm_commands.len) catch return;
+            @memcpy(llm, &SlashCommand.llm_commands);
+            self.terminal.printHelpSection("\nLLM commands:", llm);
+        }
+
+        const meta = arena.alloc(SlashCommand.Help, SlashCommand.meta_commands.len) catch return;
+        for (SlashCommand.meta_commands, meta) |m, *e| e.* = .{ .name = m.name, .description = m.description };
+        self.terminal.printHelpSection("\nMeta commands:", meta);
+        return;
+    }
+    if (SlashCommand.findMeta(target)) |meta| {
+        switch (meta.tag) {
+            .help => self.terminal.printInfo("/help [name] — show help for a command, or list all when [name] is omitted", .{}),
+            .quit => self.terminal.printInfo("/quit — exit the REPL", .{}),
+            .verbosity => self.terminal.printInfo(
+                "/verbosity " ++ Config.tagHint(Config.AgentVerbosity) ++ " — set REPL agent verbosity (currently: {s}). Bare /verbosity prints the level.",
+                .{@tagName(self.terminal.verbosity)},
+            ),
+            .effort => self.terminal.printInfo(
+                "/effort " ++ Config.tagHint(Config.Effort) ++ " — set per-turn reasoning effort (currently: {s}); saved to {s}. Bare /effort prints the level.",
+                .{ @tagName(self.effort), settings.remembered_path },
+            ),
+            .stream => self.terminal.printInfo(
+                "/stream [on|off] — stream assistant text as it's generated (currently: {s}); saved to {s}. Bare /stream prints the state.",
+                .{ if (self.stream_enabled) "on" else "off", settings.remembered_path },
+            ),
+            .usage => self.terminal.printInfo(
+                "/usage — show cumulative token usage and cache hit rate for this session",
+                .{},
+            ),
+            .clear => self.terminal.printInfo(
+                "/clear — forget the conversation (history, usage, recorded actions, node IDs); keeps the loaded page and cookies",
+                .{},
+            ),
+            .reset => self.terminal.printInfo(
+                "/reset — full reset: everything /clear does plus a new browser session, dropping the page, cookies, storage, and history",
+                .{},
+            ),
+            .save => self.terminal.printInfo(
+                "/save [filename.js] [prompt] — save the session to [filename.js] (a random session-*.js if omitted). With an LLM, synthesizes an idiomatic script from the session and the optional prompt, and a repeat /save with a prompt revises the saved script; with --no-llm, dumps the recorded actions verbatim.",
+                .{},
+            ),
+            .load => self.terminal.printInfo(
+                "/load <path> — read a script from disk and run it against the current session; Tab completes file paths",
+                .{},
+            ),
+            .model => self.terminal.printInfo(
+                "/model [name] — change the model; Tab completes the provider's models, bare /model shows the current one",
+                .{},
+            ),
+            .provider => self.terminal.printInfo(
+                "/provider [name|null] — change the provider, or 'null' to disable the LLM (persisted, so the next launch starts in basic mode); Tab completes detected providers, bare /provider shows the current one",
+                .{},
+            ),
+            .searchEngine => self.terminal.printInfo(
+                "/searchEngine " ++ Config.tagHint(browser_tools.SearchEngine) ++ " — set the web search engine behind the search tool (currently: {s}); saved to {s}. 'auto' " ++ browser_tools.search_cascade_prose ++ "; an explicit engine is used alone. Bare /searchEngine prints the engine.",
+                .{ @tagName(browser_tools.search_engine), settings.remembered_path },
+            ),
+        }
+        return;
+    }
+    if (self.ai_client != null) {
+        for (SlashCommand.llm_commands) |row| {
+            if (std.ascii.eqlIgnoreCase(row.name, target)) {
+                self.terminal.printInfo("/{s} — {s}", .{ row.name, row.description });
+                return;
+            }
+        }
+    }
+    const tool_schema = Schema.findByName(target) orelse {
+        if (SlashCommand.closestCommand(target)) |near| {
+            self.terminal.printError("unknown command: {s}. Did you mean " ++ Terminal.highlightCmd("/help {s}") ++ "?", .{ target, near });
+        } else {
+            self.terminal.printError("unknown command: {s}", .{target});
+        }
+        return;
+    };
+    self.terminal.printInfo("/{s} — {s}", .{ tool_schema.tool_name, tool_schema.description });
+}
+
+fn runCommand(self: *Agent, arena: std.mem.Allocator, tc: Command.ToolCall) browser_tools.ToolResult {
+    // The terminal can't show an image, but the conversation can.
+    return browser_tools.call(arena, self.ts.session, &self.ts.registry, tc.name(), tc.args, .{ .inline_image = self.ai_client != null, .record = true, .nav_note = true, .source = .user }) catch |err| .{
+        .text = switch (err) {
+            error.OutOfMemory => "out of memory",
+            error.FrameNotLoaded => "no page loaded — run /goto <url> first",
+            else => arena.print("{s} failed: {s}", .{ tc.name(), browser_tools.errorMessage(err) }) catch "tool failed",
+        },
+        .is_error = true,
+    };
+}
+
+/// Data output (/extract, /evaluate, /markdown, /tree, …) → plain stdout on
+/// success so a caller can pipe it. Everything else routes through
+/// `printToolOutcome`, which lays down the green ● / red ● dot shared with the
+/// LLM tool-call path.
+fn printCommandResult(self: *Agent, tc: Command.ToolCall, result: browser_tools.ToolResult) void {
+    if (tc.tool.producesData() and !result.is_error) {
+        self.printData(tc.tool, result.text);
+        return;
+    }
+    self.terminal.printToolOutcome(tc.name(), result.text, result.is_error);
+}
+
+/// Only `markdown` is rendered as markdown; the rest is JSON (re-indented
+/// here, MCP keeps renderJson's compact form) or verbatim text.
+fn printData(self: *Agent, tool: browser_tools.Tool, text: []const u8) void {
+    if (tool == .markdown) return self.terminal.printMarkdown(text);
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    self.terminal.printPlain(Terminal.reindentJson(arena.allocator(), text) orelse text);
+}
+
+/// Tracks whether a `/load`-run script emitted any `console.*` output, deciding
+/// how `runScript` ends: one that printed nothing freezes the spinner into a
+/// `/goto`-style bullet; one that printed leaves its output as the result.
+const ScriptOutput = struct {
+    terminal: *Terminal,
+    emitted: bool = false,
+
+    /// `Runtime.ConsoleObserver` callback: on the first line, clear the live
+    /// spinner so output starts clean instead of colliding with the indicator.
+    fn observe(context: *anyopaque) void {
+        const self: *ScriptOutput = @ptrCast(@alignCast(context));
+        if (self.emitted) return;
+        self.emitted = true;
+        self.terminal.endTool();
+    }
+};
+
+/// Upper bound on script source, whether read from a file or piped in.
+const max_script_bytes = 10 * 1024 * 1024;
+
+/// `lightpanda run -` reads the script from stdin.
+const stdin_script_path = "-";
+
+fn runScript(self: *Agent, path: []const u8) bool {
+    var script_arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer script_arena.deinit();
+
+    const from_stdin = std.mem.eql(u8, path, stdin_script_path);
+    const name = if (from_stdin) "<stdin>" else path;
+    const content = readScriptSource(script_arena.allocator(), path, from_stdin) catch |err| {
+        self.terminal.printError("Failed to read script '{s}': {s}", .{ name, @errorName(err) });
+        return false;
+    };
+
+    const runtime = ScriptRuntime.init(self.allocator, self.ts.browser.app, self.ts.session, &self.ts.registry) catch |err| {
+        self.terminal.printError("Failed to initialize script runtime: {s}", .{@errorName(err)});
+        return false;
+    };
+    defer runtime.deinit();
+    self.script_runtime_mutex.lockUncancelable(lp.io);
+    self.active_script_runtime = runtime;
+    self.script_runtime_mutex.unlock(lp.io);
+    defer {
+        self.script_runtime_mutex.lockUncancelable(lp.io);
+        self.active_script_runtime = null;
+        self.script_runtime_mutex.unlock(lp.io);
+        runtime.cancelTerminate();
+        self.ts.browser.env.cancelTerminate();
+        self.cancel_requested.store(false, .release);
+    }
+
+    var output: ScriptOutput = .{ .terminal = &self.terminal };
+    runtime.console_observer = .{ .context = @ptrCast(&output), .notify = ScriptOutput.observe };
+    self.terminal.beginTool("script", name);
+    const result = runtime.runSource(content, name);
+    self.terminal.endTool();
+
+    if (result catch |err| {
+        self.terminal.printError("Script failed: {s}", .{@errorName(err)});
+        return false;
+    }) |message| {
+        self.terminal.printError("{s}", .{message});
+        return false;
+    }
+
+    // A script that printed nothing leaves no trace, so freeze the spinner into
+    // a green bullet (like /goto); one that printed already showed its result.
+    if (!output.emitted) self.terminal.printScriptDone("script", name);
+    return true;
+}
+
+fn readScriptSource(allocator: std.mem.Allocator, path: []const u8, from_stdin: bool) ![]u8 {
+    if (!from_stdin) {
+        return std.Io.Dir.cwd().readFileAlloc(lp.io, path, allocator, .limited(max_script_bytes));
+    }
+    var buf: [64 * 1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().readerStreaming(lp.io, &buf);
+    return stdin.interface.allocRemaining(allocator, .limited(max_script_bytes));
+}
+
+/// Mirror a user-typed slash command into `self.conversation.messages` as if the
+/// LLM had called the tool itself, so the next natural-language turn sees the
+/// same conversation shape either way.
+fn recordSlashToolCall(
+    self: *Agent,
+    user_input: []const u8,
+    tool_name: []const u8,
+    args: ?std.json.Value,
+    result: browser_tools.ToolResult,
+) !void {
+    if (self.ai_client == null) return;
+    try self.conversation.ensureSystemPrompt();
+
+    const ma = self.conversation.arena.allocator();
+    self.synthetic_tool_call_id += 1;
+
+    const user_content = try ma.dupe(u8, user_input);
+
+    const tool_calls = try ma.alloc(zenai.provider.ToolCall, 1);
+    tool_calls[0] = .{
+        .id = try ma.print("lp-slash-{d}", .{self.synthetic_tool_call_id}),
+        .name = try ma.dupe(u8, tool_name),
+        .arguments = if (args) |v| try zenai.json.dupeValue(ma, v) else null,
+    };
+
+    // capToolOutput returns its input unchanged under the cap; dupe so content
+    // doesn't alias the caller's per-iteration arena.
+    const capped = capToolOutput(ma, tool_name, result.text);
+    const content = if (capped.ptr == result.text.ptr) try ma.dupe(u8, capped) else capped;
+
+    const tool_results = try ma.alloc(zenai.provider.ToolResult, 1);
+    tool_results[0] = .{
+        .id = try ma.dupe(u8, tool_calls[0].id),
+        .name = try ma.dupe(u8, tool_calls[0].name),
+        .content = content,
+        .parts = if (result.image) |image| try imageParts(ma, content, &image) else null,
+        .is_error = result.is_error,
+    };
+
+    const baseline = self.conversation.messages.items.len;
+    errdefer self.conversation.messages.shrinkRetainingCapacity(baseline);
+    // User turn before the assistant tool_call satisfies Gemini's rule
+    // that a function call must follow a user or function-response turn.
+    try self.conversation.messages.append(self.allocator, .{
+        .role = .user,
+        .content = user_content,
+    });
+    try self.conversation.messages.append(self.allocator, .{
+        .role = .assistant,
+        .tool_calls = tool_calls,
+    });
+    try self.conversation.messages.append(self.allocator, .{
+        .role = .tool,
+        .tool_results = tool_results,
+    });
+}
+
+/// Format the client's last failure into `api_error_buf`: HTTP status+message,
+/// or the raw error name when there's no status (transport/parse failures).
+fn formatApiError(self: *Agent, client: zenai.provider.Client, err: anyerror) []const u8 {
+    const e = client.lastError();
+    const status = e.status orelse return @errorName(err);
+    const owned_key = if (self.credential) |c| c.key == .owned else false;
+    const hint = if (status == 401 and client == .vertex)
+        if (owned_key)
+            " (Vertex token may have expired; run /provider vertex to refresh)"
+        else
+            " (Vertex express mode needs an express API key — a Gemini Developer key won't work)"
+    else
+        "";
+    if (e.message) |m| {
+        if (std.mem.print(&self.api_error_buf, "HTTP {d} — {s}{s}", .{ status, m, hint })) |s| return s else |_| {}
+    }
+    return std.mem.print(&self.api_error_buf, "HTTP {d}{s}", .{ status, hint }) catch @errorName(err);
+}
+
+/// Returned text lives in `conversation.arena`, valid only until the next prune.
+/// Caller must call `conversation.prune()` after consuming it — pruning earlier
+/// frees the arena the slice points into. `null` means the model emitted nothing
+/// even after the synthesis turn.
+fn processUserMessage(self: *Agent, input: TurnInput) !?[]const u8 {
+    const ma = self.conversation.arena.allocator();
+    self.api_error_detail = null;
+    self.streamed_text = false;
+    // Defensive: if an exit path ever missed `endStreamedText`, a stale-true
+    // `stream_active` would skip the spinner pause on the next turn's first
+    // delta and let frames interleave with the text. Reset it at the source.
+    self.stream_active = false;
+    self.http_interrupt.reset();
+
+    try self.conversation.ensureSystemPrompt();
+
+    // Attachments only ride on the first user turn (just after the system prompt).
+    const turn_attachments: ?[]const []const u8 =
+        if (self.conversation.messages.items.len == 1) input.attachments else null;
+
+    // Roll-back baseline: on API failure the failed user turn would otherwise
+    // stay in history and replay on the next attempt.
+    const msg_baseline = self.conversation.messages.items.len;
+
+    if (turn_attachments) |paths| {
+        const parts = try self.buildUserMessageParts(ma, input.prompt, paths);
+        try self.conversation.messages.append(self.allocator, .{
+            .role = .user,
+            .parts = parts,
+        });
+    } else {
+        try self.conversation.messages.append(self.allocator, .{
+            .role = .user,
+            .content = try ma.dupe(u8, input.prompt),
+        });
+    }
+
+    const provider_client = self.ai_client orelse return error.NoAiClient;
+    self.refreshAuthIfNeeded();
+
+    self.capturing_for_save = input.capture_for_save;
+    defer self.capturing_for_save = false;
+    self.save_calls.clearRetainingCapacity();
+
+    self.terminal.spinner.start();
+    var result = ModelCall.run(
+        self.ts.session,
+        provider_client,
+        self.model,
+        &self.conversation.messages,
+        self.allocator,
+        ma,
+        .{ .context = @ptrCast(self), .callFn = handleToolCall },
+        .{
+            .tools = globalTools(),
+            .before_request = .{ .context = @ptrCast(self), .callFn = beforeTurnRequest },
+            .after_response = .{ .context = @ptrCast(self), .callFn = afterResponse },
+            .max_turns = 100,
+            .max_tool_calls = 200,
+            .max_tokens = 4096,
+            .tool_choice = .auto,
+            // Per-turn reasoning budget; resolved from --effort / .lp-agent.zon
+            // / mode default, adjustable at runtime via /effort. Ignored by
+            // non-thinking models.
+            .effort = self.effort,
+            .cancel = .{ .context = @ptrCast(self), .checkFn = checkCancel },
+            // Suppressed turns (e.g. `--save` capture) must keep stdout clean;
+            // streaming would bypass the `suppress_answer` guard in `runTurn`.
+            .stream = if (input.suppress_answer) null else self.streamHook(),
+        },
+    ) catch |err| {
+        self.endStreamedText();
+        self.terminal.spinner.cancel();
+        // Ctrl-C can land while runTools unwinds an HTTP error — surface
+        // UserCancelled, not ApiError, so the user sees the outcome they asked for.
+        if (self.cancel_requested.load(.acquire)) return self.drainCancellation(msg_baseline);
+        log.err(.app, "AI API error", .{ .err = err });
+        self.api_error_detail = self.formatApiError(provider_client, err);
+        self.conversation.rollback(msg_baseline);
+        return error.ApiError;
+    };
+    self.endStreamedText();
+    self.terminal.spinner.stop();
+    defer result.deinit();
+    self.total_usage.add(result.usage);
+
+    if (result.cancelled) return self.drainCancellation(msg_baseline);
+
+    if (input.capture_for_save) {
+        // When the LLM tries multiple `extract` schemas in one turn, only the
+        // last successful one is the answer; earlier probes are noise.
+        var last_extract_idx: ?usize = null;
+        for (result.tool_calls_made, 0..) |tc, i| {
+            const t = std.meta.stringToEnum(BrowserTool, tc.name) orelse continue;
+            if (!tc.is_error and t == .extract) last_extract_idx = i;
+        }
+
+        var recorded_any = false;
+        for (result.tool_calls_made, 0..) |tc, i| {
+            if (tc.is_error) continue;
+            const tool = std.meta.stringToEnum(BrowserTool, tc.name) orelse continue;
+            if (last_extract_idx) |idx| {
+                if (tool == .extract and idx != i) continue;
+            }
+            const ca = self.conversation.arena.allocator();
+            const args = browser_tools.normalizeArgKeys(ca, tool, tc.arguments) catch tc.arguments;
+            // Fall back to the navigation a read tool performed, so a
+            // markdown/tree-driven turn isn't lost from `/save`.
+            const saved: SavedCall = if (i < self.save_calls.items.len) self.save_calls.items[i] else .{};
+            const replayable = withSelector(ca, args, saved.selector);
+            const cmd = Command.fromToolCall(tool, replayable);
+            const to_record = if (cmd.isRecorded())
+                cmd
+            else
+                navigationGoto(ca, tool, replayable, saved.navigated) orelse continue;
+            if (!recorded_any) {
+                if (input.record_comment) |c| self.recordSaveComment(c);
+                recorded_any = true;
+            }
+            self.recordSaveCommand(to_record);
+        }
+    }
+
+    // Dupe into the conversation arena — RunToolsResult arenas deinit below.
+    self.last_turn_refused = result.finish_reason == .safety;
+    const final_text: ?[]const u8 = blk: {
+        if (result.text) |text| {
+            if (std.mem.trim(u8, text, " \t\r\n").len > 0) break :blk try ma.dupe(u8, text);
+        }
+
+        // A refusal is deterministic; re-prompting just refuses again.
+        if (self.last_turn_refused) break :blk null;
+
+        // Without a synthesis turn forbidding tools+pretraining, models
+        // confabulate when the page was blocked or empty.
+        log.info(.app, "synthesizing final answer", .{});
+        const synth_baseline = self.conversation.messages.items.len;
+        try self.conversation.messages.append(self.allocator, .{
+            .role = .user,
+            .content = try ma.dupe(u8, synthesis_prompt),
+        });
+
+        self.trace_phase = "synthesis";
+        defer self.trace_phase = "turn";
+        var synth = ModelCall.run(
+            self.ts.session,
+            provider_client,
+            self.model,
+            &self.conversation.messages,
+            self.allocator,
+            ma,
+            .{ .context = @ptrCast(self), .callFn = handleToolCall },
+            .{
+                .tools = &.{},
+                .max_turns = 1,
+                .max_tokens = 4096,
+                .tool_choice = .none,
+                // .low caps thinking so reasoning models still emit an answer;
+                // `.null` and `.none` are kept as chosen.
+                .effort = switch (self.effort) {
+                    .null, .none => self.effort,
+                    else => .low,
+                },
+                .cancel = .{ .context = @ptrCast(self), .checkFn = checkCancel },
+                .before_request = .{ .context = @ptrCast(self), .callFn = beforeRequest },
+                .after_response = .{ .context = @ptrCast(self), .callFn = afterResponse },
+                .stream = if (input.suppress_answer) null else self.streamHook(),
+            },
+        ) catch |err| {
+            self.endStreamedText();
+            if (self.cancel_requested.load(.acquire)) return self.drainCancellation(msg_baseline);
+            log.err(.app, "AI synthesis error", .{ .err = err });
+            self.conversation.rollback(synth_baseline);
+            break :blk null;
+        };
+        self.endStreamedText();
+        defer synth.deinit();
+        self.total_usage.add(synth.usage);
+
+        if (synth.cancelled) return self.drainCancellation(msg_baseline);
+
+        break :blk if (synth.text) |text| try ma.dupe(u8, text) else null;
+    };
+
+    // NB: pruning is deferred to the caller. `final_text` is in the conversation
+    // arena, and `conversation.prune()` may rebuild that arena — running it here
+    // would hand the caller a dangling slice.
+    return final_text;
+}
+
+/// Build a `parts`-based user message when `--attach` was given. Text-ish files
+/// are inlined into the text prefix (surrounded by clear markers); binary files
+/// (image/audio/pdf) are base64-encoded as provider inline-data parts. Unknown
+/// extensions error out so the caller fails loudly instead of silently dropping
+/// the attachment.
+fn buildUserMessageParts(
+    self: *Agent,
+    ma: std.mem.Allocator,
+    user_input: []const u8,
+    paths: []const []const u8,
+) ![]const zenai.provider.ContentPart {
+    var text_prefix: std.ArrayList(u8) = .empty;
+    var inline_parts: std.ArrayList(zenai.provider.ContentPart) = .empty;
+
+    for (paths) |path| {
+        const mime = zenai.provider.inferInlineMimeType(path) orelse {
+            log.err(.app, "unsupported attachment", .{ .path = path });
+            self.terminal.printError("unsupported attachment type: {s}", .{path});
+            return error.UnsupportedAttachment;
+        };
+
+        const is_text = std.mem.startsWith(u8, mime, "text/");
+        const limit: usize = if (is_text) 512 * 1024 else 20 * 1024 * 1024;
+        const content = std.Io.Dir.cwd().readFileAlloc(lp.io, path, ma, .limited(limit)) catch |err| {
+            log.err(.app, "read attachment failed", .{ .path = path, .err = err });
+            self.terminal.printError("could not read attachment: {s}", .{path});
+            return error.AttachmentReadFailed;
+        };
+
+        if (is_text) {
+            try text_prefix.print(
+                ma,
+                "[Attached file: {s}]\n{s}\n[End of attachment]\n\n",
+                .{ path, content },
+            );
+        } else {
+            const b64 = try ma.alloc(u8, std.base64.standard.Encoder.calcSize(content.len));
+            _ = std.base64.standard.Encoder.encode(b64, content);
+            try inline_parts.append(ma, .{ .image = .{
+                .data = b64,
+                .mime_type = try ma.dupe(u8, mime),
+            } });
+        }
+    }
+
+    try text_prefix.appendSlice(ma, user_input);
+    try inline_parts.insert(ma, 0, .{ .text = try text_prefix.toOwnedSlice(ma) });
+    return inline_parts.toOwnedSlice(ma);
+}
+
+// Tool results are re-sent with every subsequent turn, so an unscoped read of
+// a huge page is paid once per remaining turn — the cap bounds that growth.
+// `extract` is exempt up to the loose backstop: its output is schema-shaped
+// JSON the model explicitly asked for, and truncation would corrupt it.
+const tool_output_max_bytes: usize = 64 * 1024;
+const extract_output_max_bytes: usize = 1024 * 1024;
+
+fn toolOutputCap(tool_name: []const u8) usize {
+    return if (std.mem.eql(u8, tool_name, "extract")) extract_output_max_bytes else tool_output_max_bytes;
+}
+
+fn capToolOutput(allocator: std.mem.Allocator, tool_name: []const u8, output: []const u8) []const u8 {
+    const cap = toolOutputCap(tool_name);
+    if (output.len <= cap) return output;
+    const prefix = string.truncateUtf8(output, cap);
+    var suffix_buf: [128]u8 = undefined;
+    const suffix = std.mem.print(&suffix_buf, "\n...[truncated, original {d} bytes — re-read scoped (selector/backendNodeId)]", .{output.len}) catch return prefix;
+    return std.mem.concat(allocator, u8, &.{ prefix, suffix }) catch prefix;
+}
+
+fn handleToolCall(ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8, arguments: ?std.json.Value) zenai.provider.Client.ToolHandler.Result {
+    const self: *Agent = @ptrCast(@alignCast(ctx));
+    // Close any assistant text streamed this turn before the tool spinner shows.
+    self.endStreamedText();
+    // The spinner doesn't render args, and `agentToolDone` skips the body line
+    // at low verbosity — don't pay for the stringify when nobody reads it.
+    const needs_args = self.terminal.spinner.isEnabled() or self.terminal.verbosity != .low;
+    // Stringify the pre-substitution args so $LP_* placeholders the model
+    // emitted stay redacted in the UI.
+    const args_str: []const u8 = if (needs_args) (if (arguments) |v|
+        std.json.Stringify.valueAlloc(allocator, v, .{}) catch ""
+    else
+        "") else "";
+    self.terminal.spinner.setTool(tool_name, args_str);
+    defer self.terminal.spinner.setThinking();
+
+    var saved: SavedCall = .{};
+    const outcome = self.toolOutcome(allocator, tool_name, arguments, &saved) catch |err| zenai.provider.Client.ToolHandler.Result{
+        .content = allocator.print("Error: {s}", .{browser_tools.errorMessage(err)}) catch "Error: tool execution failed",
+        .is_error = true,
+    };
+    if (self.capturing_for_save) {
+        // One entry per call, errors included, so the index lines up with
+        // `RunToolsResult.tool_calls_made`. The conversation arena outlives the
+        // turn that reads them; `allocator` here is zenai's per-call arena.
+        const ca = self.conversation.arena.allocator();
+        const kept = if (saved.selector) |sel| ca.dupe(u8, sel) catch null else null;
+        self.save_calls.append(self.allocator, .{ .selector = kept, .navigated = saved.navigated }) catch {};
+    }
+
+    self.terminal.agentToolDone(tool_name, args_str, !outcome.is_error);
+    if (self.terminal.verbosity == .high) self.terminal.printToolOutcome(tool_name, outcome.content, outcome.is_error);
+    return outcome;
+}
+
+/// The text plus the rendered PNG, for backends that can show the model an image.
+fn toolOutcome(self: *Agent, allocator: std.mem.Allocator, tool_name: []const u8, arguments: ?std.json.Value, saved: *SavedCall) browser_tools.ToolError!zenai.provider.Client.ToolHandler.Result {
+    const result = try browser_tools.call(allocator, self.ts.session, &self.ts.registry, tool_name, arguments, .{
+        .inline_image = true,
+        .record = self.capturing_for_save,
+        .nav_note = true,
+        .source = .llm,
+    });
+    saved.* = .{ .selector = result.selector, .navigated = result.navigated };
+    const content = capToolOutput(allocator, tool_name, result.text);
+    return .{
+        .content = content,
+        .is_error = result.is_error,
+        .parts = if (result.image) |image| try imageParts(allocator, content, &image) else null,
+    };
+}
+
+fn imageParts(arena: std.mem.Allocator, text: []const u8, image: *const lp.screenshot.Prepared) browser_tools.ToolError![]const zenai.provider.ContentPart {
+    const data = image.base64Alloc(arena) catch return error.InternalError;
+    return try arena.dupe(zenai.provider.ContentPart, &.{ .{ .text = text }, .{ .image = .{ .data = data, .mime_type = "image/png" } } });
+}
+
+/// One-shot for `--list-models`: resolve provider+key, fetch chat-capable model
+/// IDs, print to stdout one per line.
+pub fn listModels(allocator: std.mem.Allocator, opts: Config.Agent) !void {
+    if (opts.no_llm) {
+        log.fatal(.app, "list-models needs LLM", .{
+            .hint = "--no-llm and --list-models conflict; drop --no-llm",
+        });
+        return error.ConflictingFlags;
+    }
+    if (opts.task != null or opts.script_file != null) {
+        log.fatal(.app, "list-models is exclusive", .{
+            .hint = "--list-models only takes --provider/--model/--base-url",
+        });
+        return error.ConflictingFlags;
+    }
+    var resolved = (try settings.resolveCredentials(allocator, opts, null, false)) orelse return error.MissingProvider;
+    defer resolved.credential.deinit(allocator);
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    // A subscription provider can't list models via the provider API; use the
+    // free models.dev catalog.
+    const ids: []const []const u8 = if (auth.descriptorFor(resolved.credential.provider)) |desc|
+        models_dev.modelIds(arena.allocator(), desc.models_dev_id, auth.dataDir(arena.allocator()))
+    else
+        zenai.provider.listChatModelIds(lp.io, allocator, arena.allocator(), resolved.credential.provider, resolved.credential.keySlice(), .{ .base_url = opts.base_url, .environ = lp.environ() }) catch |err| {
+            if (resolved.credential.provider == .vertex and !settings.vertexProjectMode()) {
+                std.debug.print("Vertex express mode cannot list models (the endpoint requires OAuth); set GOOGLE_CLOUD_PROJECT for project mode.\n", .{});
+            }
+            return err;
+        };
+
+    var stdout_file = std.Io.File.stdout().writerStreaming(lp.io, &.{});
+    const w = &stdout_file.interface;
+    for (ids) |id| try w.print("{s}\n", .{id});
+    try w.flush();
+}
+
+const ModelCompletions = struct {
+    provider: Config.AiProvider,
+    /// Empty when the fetch failed — cached so the per-keystroke hinter doesn't
+    /// re-hit the network each press.
+    ids: []const []const u8,
+};
+
+/// `CompletionSource.providers`. Reuses pre-detected available providers to
+/// avoid reading environment variables on each autocomplete keypress.
+fn completionProviders(context: *anyopaque, arena: std.mem.Allocator) []const []const u8 {
+    const self: *Agent = @ptrCast(@alignCast(context));
+    // A local server joins completions only when it answers (placeholder key).
+    var reachable: [local_providers.len]bool = undefined;
+    var extra: usize = 0;
+    for (local_providers, 0..) |tag, i| {
+        reachable[i] = self.local_completable[i] orelse blk: {
+            const v = settings.detectLocalProvider(self.allocator, tag, self.model_base_url) != null;
+            self.local_completable[i] = v;
+            break :blk v;
+        };
+        if (reachable[i]) extra += 1;
+    }
+    const names = arena.alloc([]const u8, self.available_providers.len + auth.registry.len + 1 + extra) catch return &.{};
+    @memcpy(names[0..self.available_providers.len], self.available_providers);
+    var n = self.available_providers.len;
+    // Subscription providers complete even without a stored token — selecting
+    // one is what starts the login.
+    for (auth.registry) |desc| {
+        const name = @tagName(desc.provider);
+        if (!string.isOneOf(name, self.available_providers)) {
+            names[n] = name;
+            n += 1;
+        }
+    }
+    for (local_providers, reachable) |tag, r| if (r) {
+        names[n] = @tagName(tag);
+        n += 1;
+    };
+    names[n] = provider_off_keyword;
+    return names[0 .. n + 1];
+}
+
+/// `CompletionSource.models`. Blocks on a one-time fetch per provider, caching
+/// success or empty so the per-keystroke hinter pays the round-trip once.
+fn completionModels(context: *anyopaque, _: std.mem.Allocator) []const []const u8 {
+    const self: *Agent = @ptrCast(@alignCast(context));
+    const cred = if (self.credential) |*c| c else return &.{};
+    if (self.model_completions) |c| if (c.provider == cred.provider) return c.ids;
+
+    _ = self.model_completion_arena.reset(.retain_capacity);
+    const arena = self.model_completion_arena.allocator();
+    // A subscription provider can't hit the provider's `/models` endpoint, so
+    // list from the free, unauthenticated models.dev catalog instead.
+    const ids = if (auth.descriptorFor(cred.provider)) |desc|
+        models_dev.modelIds(arena, desc.models_dev_id, self.app_dir)
+    else
+        zenai.provider.listChatModelIds(
+            lp.io,
+            self.allocator,
+            arena,
+            cred.provider,
+            cred.keySlice(),
+            .{ .base_url = self.model_base_url, .environ = lp.environ() },
+        ) catch &.{};
+    self.model_completions = .{ .provider = cred.provider, .ids = ids };
+    return ids;
+}
+
+test {
+    _ = save;
+    _ = settings;
+    _ = picker;
+    _ = Conversation;
+    _ = Terminal;
+    _ = Trace;
+}
+
+test "savePrompt: save instructions followed by the rendered script skill" {
+    const prompt = savePrompt(false);
+    try std.testing.expect(std.mem.startsWith(u8, prompt, browser_tools.save_synthesis_prompt));
+    try std.testing.expect(std.mem.endsWith(u8, prompt, lp.skill.text()));
+
+    const revision = savePrompt(true);
+    try std.testing.expect(std.mem.find(u8, revision, save_revision_note) != null);
+    try std.testing.expect(std.mem.endsWith(u8, revision, lp.skill.text()));
+}
+
+test "withCurrentDate: appends weekday, ISO date, UTC offset, zone and locale" {
+    var tm = std.mem.zeroes(lp.datetime.LibcTm);
+    tm.tm_year = 126;
+    tm.tm_mon = 9;
+    tm.tm_mday = 4;
+    tm.tm_wday = 0;
+    tm.tm_gmtoff = -7 * 3600;
+    tm.tm_zone = "PDT";
+    const prompt = try withCurrentDate(std.testing.allocator, "base", tm, "en-US");
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expectEqualStrings("base\nToday is Sunday, 2026-10-04 (UTC-07:00, PDT); browser locale en-US. Resolve relative dates against it.\n", prompt);
+}
+
+test "capToolOutput: passes through when under cap" {
+    const ta = std.testing.allocator;
+    const out = capToolOutput(ta, "markdown", "short");
+    try std.testing.expectEqualStrings("short", out);
+}
+
+// Boundary correctness lives in string.zig's `truncateUtf8` tests; here we only
+// assert the agent-specific policy: an over-cap body keeps valid UTF-8 and gains
+// the truncation marker.
+test "capToolOutput: appends a marker when truncating" {
+    const ta = std.testing.allocator;
+
+    // 3-byte Hangul codepoint (U+D55C '한' = 0xED 0x95 0x9C) straddling the cap.
+    const cap = tool_output_max_bytes;
+    const buf = try ta.alloc(u8, cap + 8);
+    defer ta.free(buf);
+    @memset(buf[0 .. cap - 1], 'a');
+    buf[cap - 1] = 0xED;
+    buf[cap + 0] = 0x95;
+    buf[cap + 1] = 0x9C;
+    @memset(buf[cap + 2 ..], 'b');
+
+    const out = capToolOutput(ta, "markdown", buf);
+    defer if (out.ptr != buf.ptr) ta.free(out);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    try std.testing.expect(std.mem.find(u8, out, "truncated") != null);
+}
+
+test "capToolOutput: extract is exempt from the default cap" {
+    const ta = std.testing.allocator;
+
+    const buf = try ta.alloc(u8, tool_output_max_bytes + 8);
+    defer ta.free(buf);
+    @memset(buf, 'a');
+
+    const out = capToolOutput(ta, "extract", buf);
+    try std.testing.expect(out.ptr == buf.ptr);
+
+    try std.testing.expectEqual(extract_output_max_bytes, toolOutputCap("extract"));
+    try std.testing.expectEqual(tool_output_max_bytes, toolOutputCap("html"));
+}

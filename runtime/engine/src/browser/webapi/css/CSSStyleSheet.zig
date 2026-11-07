@@ -1,0 +1,241 @@
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("../../js/js.zig");
+const Frame = @import("../../Frame.zig");
+const Parser = @import("../../css/Parser.zig");
+const StyleManager = @import("../../StyleManager.zig");
+
+const Element = @import("../Element.zig");
+
+const CSSRuleList = @import("CSSRuleList.zig");
+const CSSRule = @import("CSSRule.zig");
+const CSSStyleRule = @import("CSSStyleRule.zig");
+
+const log = lp.log;
+
+const CSSStyleSheet = @This();
+
+const CSSError = error{
+    OutOfMemory,
+    IndexSizeError,
+    WriteFailed,
+    StringTooLarge,
+    SyntaxError,
+};
+
+_href: ?[]const u8 = null,
+_title: []const u8 = "",
+_disabled: bool = false,
+_css_rules: ?*CSSRuleList = null,
+_owner_rule: ?*CSSRule = null,
+_owner_node: ?*Element = null,
+
+pub fn init(frame: *Frame) !*CSSStyleSheet {
+    return frame._factory.create(CSSStyleSheet{});
+}
+
+pub fn initWithOwner(owner: *Element, frame: *Frame) !*CSSStyleSheet {
+    return frame._factory.create(CSSStyleSheet{ ._owner_node = owner });
+}
+
+pub fn getOwnerNode(self: *const CSSStyleSheet) ?*Element {
+    return self._owner_node;
+}
+
+fn ownerStyleManager(self: *const CSSStyleSheet, frame: *Frame) ?*StyleManager {
+    const owner = self._owner_node orelse return null;
+    return &(owner.ownerFrame(frame) orelse return null)._style_manager;
+}
+
+pub fn getHref(self: *const CSSStyleSheet) ?[]const u8 {
+    return self._href;
+}
+
+pub fn getTitle(self: *const CSSStyleSheet) []const u8 {
+    return self._title;
+}
+
+fn getDisabled(self: *const CSSStyleSheet) bool {
+    return self._disabled;
+}
+
+fn setDisabled(self: *CSSStyleSheet, disabled: bool) void {
+    self._disabled = disabled;
+}
+
+fn getCssRules(self: *CSSStyleSheet, frame: *Frame) !*CSSRuleList {
+    if (self._css_rules) |rules| return rules;
+
+    const rules = try CSSRuleList.init(frame);
+    self._css_rules = rules;
+
+    if (self.getOwnerNode()) |owner| {
+        if (owner.is(Element.Html.Style)) |style| {
+            // Same cascade as the text StyleManager already parsed: no notify.
+            const text = try style.asNode().getTextContentAlloc(frame.local_arena);
+            try self.parseInto(text, frame);
+        }
+    }
+
+    return rules;
+}
+
+fn getOwnerRule(self: *const CSSStyleSheet) ?*CSSRule {
+    return self._owner_rule;
+}
+
+pub fn insertRule(self: *CSSStyleSheet, rule: []const u8, maybe_index: ?u32, frame: *Frame) !u32 {
+    const requested_index = maybe_index orelse 0;
+    var it = Parser.parseStylesheet(rule);
+    const parsed_rule = it.next() orelse return error.SyntaxError;
+
+    if (it.next() != null) return error.SyntaxError;
+
+    const inserted: *CSSRule = switch (parsed_rule) {
+        .style => |s| blk: {
+            const style_rule = try CSSStyleRule.init(frame);
+            try style_rule.setSelectorText(s.selector, frame);
+
+            const style_props = try style_rule.getStyle(frame);
+            const style = style_props.asCSSStyleDeclaration();
+            try style.replaceStyleBlock(s.block, frame);
+            break :blk style_rule._proto;
+        },
+        // Opaque placeholder for at-rules. The CSS engine doesn't apply
+        // these (`@keyframes`, `@media`, ...) but JS-side reads must see
+        // them via `cssRules` so CSS-in-JS libraries don't fall back to
+        // per-render `<style>` injection. See #2459.
+        .at_rule => |a| try CSSRule.initAtRule(atRuleTypeFor(a.keyword), a.text, frame),
+    };
+
+    const rules = try self.getCssRules(frame);
+
+    // Per spec, an index > rules.length should throw IndexSizeError. But because
+    // we don't process @import and @font-face, indexes that code hard-codes can
+    // be off. As a workaround, we clamp to the tail.
+    // See #2214 (and the sibling #1970 / #1972 tolerance for at-rules).
+    const length = rules.length();
+    const index = if (requested_index > length) length else requested_index;
+    if (index != requested_index) {
+        log.debug(.not_implemented, "insertRule clamped index", .{});
+    }
+    try rules.insert(index, inserted, frame);
+    if (self.ownerStyleManager(frame)) |style_manager| {
+        style_manager.ruleInserted(self, inserted);
+    }
+
+    return index;
+}
+
+/// Map an at-rule keyword (without `@`) to the matching `CSSRule.Type`
+/// variant. Vendor prefixes are stripped before matching
+/// (`-webkit-keyframes` -> `keyframes`). Unrecognized keywords fall back
+/// to `.unknown`: which maps to 0 for rule.type.
+fn atRuleTypeFor(keyword_with_prefix: []const u8) CSSRule.Type {
+    var keyword = keyword_with_prefix;
+    inline for (.{ "-webkit-", "-moz-", "-ms-", "-o-" }) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(keyword, prefix)) {
+            keyword = keyword[prefix.len..];
+            break;
+        }
+    }
+
+    const eql = std.ascii.eqlIgnoreCase;
+    if (eql(keyword, "media")) return .media;
+    if (eql(keyword, "keyframes")) return .keyframes;
+    if (eql(keyword, "supports")) return .supports;
+    if (eql(keyword, "font-face")) return .font_face;
+    if (eql(keyword, "import")) return .import;
+    if (eql(keyword, "charset")) return .charset;
+    if (eql(keyword, "namespace")) return .namespace;
+    if (eql(keyword, "page")) return .frame;
+    if (eql(keyword, "counter-style")) return .counter_style;
+    if (eql(keyword, "font-feature-values")) return .font_feature_values;
+    if (eql(keyword, "viewport")) return .viewport;
+    if (eql(keyword, "document")) return .document;
+    if (eql(keyword, "layer")) return .layer;
+    return .unknown;
+}
+
+fn deleteRule(self: *CSSStyleSheet, index: u32, frame: *Frame) !void {
+    const rules = try self.getCssRules(frame);
+    try rules.remove(index);
+
+    // Notify StyleManager that rules have changed
+    if (self.ownerStyleManager(frame)) |style_manager| {
+        style_manager.sheetModified();
+    }
+}
+
+pub fn replace(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!js.Promise {
+    try self.replaceSync(text, frame);
+    return frame.js.local.?.resolvePromise(self);
+}
+
+pub fn replaceSync(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
+    const rules = try self.getCssRules(frame);
+    rules.clear();
+    try self.parseInto(text, frame);
+    if (self.ownerStyleManager(frame)) |style_manager| {
+        style_manager.sheetModified();
+    }
+}
+
+fn parseInto(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
+    const rules = try self.getCssRules(frame);
+    var it = Parser.parseStylesheet(text);
+    var index: u32 = 0;
+    while (it.next()) |parsed_rule| {
+        const inserted: *CSSRule = switch (parsed_rule) {
+            .style => |s| blk: {
+                const style_rule = try CSSStyleRule.init(frame);
+                try style_rule.setSelectorText(s.selector, frame);
+
+                const style_props = try style_rule.getStyle(frame);
+                const style = style_props.asCSSStyleDeclaration();
+                try style.replaceStyleBlock(s.block, frame);
+                break :blk style_rule._proto;
+            },
+            .at_rule => |a| try CSSRule.initAtRule(atRuleTypeFor(a.keyword), a.text, frame),
+        };
+
+        try rules.insert(index, inserted, frame);
+        index += 1;
+    }
+}
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(CSSStyleSheet);
+
+    pub const Meta = struct {
+        pub const name = "CSSStyleSheet";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const constructor = bridge.constructor(CSSStyleSheet.init, .{});
+    pub const ownerNode = bridge.accessor(CSSStyleSheet.getOwnerNode, null, .{ .null_as_undefined = true });
+    pub const href = bridge.accessor(CSSStyleSheet.getHref, null, .{ .null_as_undefined = true });
+    pub const title = bridge.accessor(CSSStyleSheet.getTitle, null, .{});
+    pub const disabled = bridge.accessor(CSSStyleSheet.getDisabled, CSSStyleSheet.setDisabled, .{});
+    pub const cssRules = bridge.accessor(CSSStyleSheet.getCssRules, null, .{});
+    pub const ownerRule = bridge.accessor(CSSStyleSheet.getOwnerRule, null, .{});
+    pub const insertRule = bridge.function(CSSStyleSheet.insertRule, .{});
+    pub const deleteRule = bridge.function(CSSStyleSheet.deleteRule, .{});
+    pub const replace = bridge.function(CSSStyleSheet.replace, .{});
+    pub const replaceSync = bridge.function(CSSStyleSheet.replaceSync, .{});
+};
+
+const testing = @import("../../../testing.zig");
+test "WebApi: CSSStyleSheet" {
+    testing.silenceLog(&.{.js});
+    try testing.htmlRunner("css/stylesheet.html", .{});
+}
+
+test "WebApi: layer @-rule cascade" {
+    try testing.htmlRunner("css/layer_at_rule_cascade.html", .{});
+}
+
+test "WebApi: layer order cascade" {
+    try testing.htmlRunner("css/layer_order_cascade.html", .{});
+}

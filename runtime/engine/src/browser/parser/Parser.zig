@@ -1,0 +1,1085 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+const h5e = @import("html5ever.zig");
+
+const js = @import("../js/js.zig");
+const Frame = @import("../Frame.zig");
+const Node = @import("../webapi/Node.zig");
+const Element = @import("../webapi/Element.zig");
+const CData = @import("../webapi/CData.zig");
+
+pub const QualName = h5e.QualName;
+pub const AttributeIterator = h5e.AttributeIterator;
+
+const Allocator = std.mem.Allocator;
+
+const CHECKPOINT_INTERVAL = 1024;
+const TERMINATE_CHECK_INTERVAL = 1024;
+
+// Mirrored in src/rust/html5ever/sink
+pub const ParsedNode = extern struct {
+    node: *Node,
+
+    // Data associated with this element to be passed back to html5ever as needed
+    // We only have this for Elements. For other types, like comments, it's null.
+    // html5ever should never ask us for this data on a non-element.
+    data: ?*anyopaque,
+
+    // Set once html5ever has put the node in the tree or given it children.
+    // Until then the node is unobservable and its document is only a guess.
+    placed: bool = false,
+
+    // Memo of the node's root, valid while page.dom_version == root_version.
+    root: ?*Node = null,
+    root_version: usize = 0,
+};
+
+// Attributes of an element the parser rebuilds (see settleDocument): the ones
+// html5ever gave the original, read back from it. node_factory treats this
+// like AttributeIterator, i.e. as a creation by the parser.
+pub const RebuiltAttributes = struct {
+    list: *const Element.Attribute.List,
+};
+
+// html5ever's tokenizer flushes the script-data character buffer on every '<'
+// (script-data-less-than-sign-state transition), which produces a separate
+// AppendText callback per chunk. Merging via String.concat in the previous
+// implementation was O(N^2/chunk_size) on the page-lifetime arena, blowing
+// memory on inline JS that contains embedded HTML strings (issue #2397).
+// Instead, we keep a single Parser-level buf and accumulate same-parent
+// chunks into it, committing once on flush.
+const PendingText = struct {
+    parent: *Node,
+    text_node: *CData,
+};
+
+const Parser = @This();
+
+frame: *Frame,
+err: ?Error,
+arena: Allocator,
+container: ParsedNode,
+document: *Node.Document,
+// The document new nodes are created in. The spec creates an element for a
+// token in its intended parent's document, and a <template>'s content belongs
+// to the inert template contents owner document (Document.templateContentsOwner)
+// where custom elements are never constructed and nothing runs or loads.
+// html5ever creates an element before it says where it goes, so this is the
+// document of the last insertion point it did tell us about.
+creation_document: *Node.Document,
+strings: std.StringHashMapUnmanaged(void),
+pending_text: ?PendingText,
+// One buffer reused across every text run in this parser. clearRetainingCapacity
+// on flush keeps the largest capacity ever needed, so total dead memory on the
+// parser arena is bounded to one peak-run-sized allocation regardless of how
+// many text runs the parse contains. Matters for Streaming, whose arena is the
+// page-lifetime frame.page_arena (individual frees are no-ops there).
+//
+// Single-chunk text runs leave this buf empty: the chunk lives only in
+// CData._data via createTextNode. The buf is seeded from _data.str() on the
+// second chunk of a run, so the common case stays at one copy.
+buf: std.ArrayList(u8),
+
+// Whether `<template shadowrootmode>` is parsed into a real shadow root.
+// True for document navigation, document.write, and setHTMLUnsafe; false for
+// innerHTML and DOMParser (per spec). Set from Options at init.
+allow_declarative_shadow: bool = false,
+
+// Fragment-parse context element when it isn't the container. html5ever picks
+// the insertion mode and tokenizer state from the context's name. For example
+// a <template> context is processed "in template" mode which has specific
+// behavior.
+context: ?*Element = null,
+
+// // Fragment parsing doesn't run custom element constructor synchronously
+fragment: bool = false,
+
+xml_error: bool = false,
+terminated: bool = false,
+appends_until_terminate_check: u16 = TERMINATE_CHECK_INTERVAL,
+inserted_since_checkpoint: u16 = 0,
+
+pub const Options = struct {
+    allow_declarative_shadow: bool = false,
+    context: ?*Element = null,
+};
+
+pub fn init(arena: Allocator, node: *Node, frame: *Frame, opts: Options) Parser {
+    const document = node.getDocument(frame);
+    return .{
+        .err = null,
+        .frame = frame,
+        .document = document,
+        .creation_document = document,
+        .strings = .empty,
+        .arena = arena,
+        .container = ParsedNode{
+            .data = null,
+            .node = node,
+            .placed = true,
+        },
+        .pending_text = null,
+        .buf = .empty,
+        .allow_declarative_shadow = opts.allow_declarative_shadow,
+        .context = opts.context,
+    };
+}
+
+pub fn flushPendingText(self: *Parser) !void {
+    const pt = self.pending_text orelse return;
+    self.pending_text = null;
+    // Single-chunk run: data already lives on _data via createTextNode.
+    if (self.buf.items.len == 0) return;
+    defer self.buf.clearRetainingCapacity();
+    pt.text_node._data = try lp.String.init(
+        self.frame.page_arena,
+        self.buf.items,
+        .{ .dupe = true },
+    );
+}
+
+fn appendTextChunk(self: *Parser, parent: *Node, txt: []const u8) !void {
+    if (self.pending_text) |pt| {
+        if (pt.parent == parent and parent.lastChild() == pt.text_node.asNode()) {
+            // Second+ chunk of the same run. If buf is still empty, promote
+            // from the single-chunk fast path by seeding from _data first.
+            if (self.buf.items.len == 0) {
+                const existing = pt.text_node.getData().str();
+                try self.buf.ensureTotalCapacity(self.arena, existing.len + txt.len);
+                self.buf.appendSliceAssumeCapacity(existing);
+            }
+            try self.buf.appendSlice(self.arena, txt);
+            return;
+        }
+        try self.flushPendingText();
+    }
+
+    if (parent.lastChild()) |sibling| {
+        if (sibling.is(CData.Text)) |tn| {
+            // Existing text sibling without a matching pending_text. Seed the
+            // buf from its _data and register pending so subsequent chunks
+            // accumulate cheaply.
+            const cdata = tn.asCData();
+            const existing = cdata.getData().str();
+            try self.buf.ensureTotalCapacity(self.arena, existing.len + txt.len);
+            self.buf.appendSliceAssumeCapacity(existing);
+            self.buf.appendSliceAssumeCapacity(txt);
+            self.pending_text = .{ .parent = parent, .text_node = cdata };
+            return;
+        }
+    }
+
+    // Fresh text run: the first chunk lives on _data only. buf stays empty
+    // until (and unless) a second chunk arrives.
+    const new_text = try Frame.node_factory.createTextNode(parent.getDocument(self.frame), txt);
+    try self.frame.appendNew(parent, new_text, null);
+    self.inserted_since_checkpoint +|= 1;
+    self.pending_text = .{
+        .parent = parent,
+        .text_node = new_text.is(CData.Text).?.asCData(),
+    };
+}
+
+const Error = struct {
+    err: anyerror,
+    source: Source,
+
+    const Source = enum {
+        pop,
+        append,
+        create_element,
+        create_comment,
+        create_processing_instruction,
+        append_doctype_to_document,
+        add_attrs_if_missing,
+        get_template_content,
+        remove_from_parent,
+        reparent_children,
+        append_before_sibling,
+        append_based_on_parent_node,
+        attach_declarative_shadow,
+    };
+};
+
+pub const PrescanResource = h5e.PrescanResource;
+const PrescanCallback = h5e.PrescanCallback;
+
+// Preload scanner: a tokenizer-only pass over a buffered document, reporting
+// fetchable script resources (and the first <base href>) through `callback`.
+// Builds no tree; purely a hint source.
+pub fn prescan(html: []const u8, charset: []const u8, ctx: *anyopaque, callback: PrescanCallback) void {
+    h5e.html5ever_prescan(html.ptr, html.len, charset.ptr, charset.len, ctx, callback);
+}
+
+pub fn parse(self: *Parser, html: []const u8) void {
+    h5e.html5ever_parse_document(
+        html.ptr,
+        html.len,
+        &self.container,
+        self,
+        createElementCallback,
+        appendCallback,
+        parseErrorCallback,
+        popCallback,
+        createCommentCallback,
+        createProcessingInstruction,
+        appendDoctypeToDocument,
+        addAttrsIfMissingCallback,
+        getTemplateContentsCallback,
+        removeFromParentCallback,
+        reparentChildrenCallback,
+        appendBeforeSiblingCallback,
+        appendBasedOnParentNodeCallback,
+        attachDeclarativeShadowCallback,
+        self.allow_declarative_shadow,
+    );
+    self.flushPendingText() catch |err| {
+        if (self.err == null) self.err = .{ .err = err, .source = .append };
+    };
+}
+
+/// Parse HTML with encoding conversion. Converts from charset to UTF-8 before parsing.
+pub fn parseWithEncoding(self: *Parser, html: []const u8, charset: []const u8) void {
+    h5e.html5ever_parse_document_with_encoding(
+        html.ptr,
+        html.len,
+        charset.ptr,
+        charset.len,
+        &self.container,
+        self,
+        createElementCallback,
+        appendCallback,
+        parseErrorCallback,
+        popCallback,
+        createCommentCallback,
+        createProcessingInstruction,
+        appendDoctypeToDocument,
+        addAttrsIfMissingCallback,
+        getTemplateContentsCallback,
+        removeFromParentCallback,
+        reparentChildrenCallback,
+        appendBeforeSiblingCallback,
+        appendBasedOnParentNodeCallback,
+        attachDeclarativeShadowCallback,
+        self.allow_declarative_shadow,
+    );
+    self.flushPendingText() catch |err| {
+        if (self.err == null) self.err = .{ .err = err, .source = .append };
+    };
+}
+
+pub fn parseXML(self: *Parser, xml: []const u8) void {
+    h5e.xml5ever_parse_document(
+        xml.ptr,
+        xml.len,
+        &self.container,
+        self,
+        createXMLElementCallback,
+        appendCallback,
+        xmlParseErrorCallback,
+        popCallback,
+        createCommentCallback,
+        createProcessingInstruction,
+        appendDoctypeToDocument,
+        addAttrsIfMissingCallback,
+        getTemplateContentsCallback,
+        removeFromParentCallback,
+        reparentChildrenCallback,
+        appendBeforeSiblingCallback,
+        appendBasedOnParentNodeCallback,
+        attachDeclarativeShadowCallback,
+        false,
+    );
+    self.flushPendingText() catch |err| {
+        if (self.err == null) self.err = .{ .err = err, .source = .append };
+    };
+}
+
+pub fn isWellFormedXML(xml: []const u8) bool {
+    var has_error = false;
+    h5e.xml5ever_validate_document(xml.ptr, xml.len, &has_error, validateErrorCallback);
+    return has_error == false;
+}
+
+pub fn parseFragment(self: *Parser, html: []const u8) void {
+    self.fragment = true;
+    const context_el = self.context orelse self.container.node.is(Element);
+    const context_name: []const u8 = if (context_el) |el| el.getLocalName() else "";
+    const context_ns: h5e.ContextNamespace = if (context_el) |el| switch (el._namespace) {
+        .svg => .svg,
+        .mathml => .mathml,
+        else => .html,
+    } else .html;
+
+    h5e.html5ever_parse_fragment(
+        html.ptr,
+        html.len,
+        context_name.ptr,
+        context_name.len,
+        context_ns,
+        &self.container,
+        self,
+        createElementCallback,
+        createContextElementCallback,
+        appendCallback,
+        parseErrorCallback,
+        popCallback,
+        createCommentCallback,
+        createProcessingInstruction,
+        appendDoctypeToDocument,
+        addAttrsIfMissingCallback,
+        getTemplateContentsCallback,
+        removeFromParentCallback,
+        reparentChildrenCallback,
+        appendBeforeSiblingCallback,
+        appendBasedOnParentNodeCallback,
+        attachDeclarativeShadowCallback,
+        self.allow_declarative_shadow,
+    );
+    self.flushPendingText() catch |err| {
+        if (self.err == null) self.err = .{ .err = err, .source = .append };
+    };
+}
+
+pub const Streaming = struct {
+    parser: Parser,
+    handle: ?*anyopaque,
+
+    // True while html5ever is inside a feed/finish call. A <script> popped by
+    // the tokenizer runs synchronously during the feed and can call
+    // document.write(), which re-enters read(). html5ever's streaming parser
+    // is NOT re-entrant — feeding it while it's still inside
+    // process_to_completion corrupts its tree-builder state and we get a panic.
+    feeding: bool = false,
+
+    // Bytes queued by document.write() calls that happened while `feeding`.
+    // Drained by the active read() loop. Lives on the parser arena.
+    pending_input: std.ArrayList(u8) = .empty,
+
+    pub fn init(arena: Allocator, node: *Node, frame: *Frame, opts: Options) Streaming {
+        return .{
+            .handle = null,
+            .parser = Parser.init(arena, node, frame, opts),
+        };
+    }
+
+    pub fn deinit(self: *Streaming) void {
+        if (self.handle) |handle| {
+            h5e.html5ever_streaming_parser_destroy(handle);
+        }
+    }
+
+    pub fn start(self: *Streaming) !void {
+        lp.assert(self.handle == null, "Parser.start non-null handle", .{});
+
+        self.handle = h5e.html5ever_streaming_parser_create(
+            &self.parser.container,
+            &self.parser,
+            createElementCallback,
+            appendCallback,
+            parseErrorCallback,
+            popCallback,
+            createCommentCallback,
+            createProcessingInstruction,
+            appendDoctypeToDocument,
+            addAttrsIfMissingCallback,
+            getTemplateContentsCallback,
+            removeFromParentCallback,
+            reparentChildrenCallback,
+            appendBeforeSiblingCallback,
+            appendBasedOnParentNodeCallback,
+            attachDeclarativeShadowCallback,
+            self.parser.allow_declarative_shadow,
+        ) orelse return error.ParserCreationFailed;
+    }
+
+    pub fn read(self: *Streaming, data: []const u8) !void {
+        if (self.feeding) {
+            // Re-entrant document.write() from a script running inside the
+            // current feed. Append at the insertion point; the active feed
+            // loop below drains it rather than recursing into feed().
+            return self.pending_input.appendSlice(self.parser.arena, data);
+        }
+
+        self.feeding = true;
+        defer self.feeding = false;
+
+        var input = data;
+        while (true) {
+            try self.feed(input);
+            if (self.pending_input.items.len == 0) {
+                // document.write's text must be visible when it returns,
+                return self.parser.flushPendingText();
+            }
+            // Scripts that ran during the feed queued more markup via
+            // re-entrant read(). This swaps the buffers, and ensures that
+            // any new writes to pending_input don't invalidate the input
+            input = try self.pending_input.toOwnedSlice(self.parser.arena);
+        }
+    }
+
+    fn feed(self: *Streaming, data: []const u8) !void {
+        const result = h5e.html5ever_streaming_parser_feed(
+            self.handle.?,
+            data.ptr,
+            data.len,
+        );
+
+        if (result != 0) {
+            // Parser panicked - clean up and return error
+            // Note: deinit will destroy the handle if it exists
+            if (self.handle) |handle| {
+                h5e.html5ever_streaming_parser_destroy(handle);
+                self.handle = null;
+            }
+            return error.ParserPanic;
+        }
+    }
+
+    pub fn done(self: *Streaming) !void {
+        // Null the handle before finish() so a flushPendingText failure can't
+        // leave a finished-but-still-referenced handle behind for deinit to
+        // double-free. flushPendingText doesn't touch the html5ever handle —
+        // it only reads pending_text and writes to a text node's _data — so
+        // running it after finish is safe.
+        const handle = self.handle.?;
+        self.handle = null;
+
+        self.feeding = true;
+        defer self.feeding = false;
+
+        h5e.html5ever_streaming_parser_finish(handle);
+        if (self.pending_input.items.len != 0) {
+            lp.log.debug(.dom, "write during finish dropped", .{ .len = self.pending_input.items.len });
+            self.pending_input.clearRetainingCapacity();
+        }
+        try self.parser.flushPendingText();
+    }
+};
+
+fn parseErrorCallback(ctx: *anyopaque, err: h5e.StringSlice) callconv(.c) void {
+    _ = ctx;
+    _ = err;
+    // std.debug.print("PEC: {s}\n", .{err.slice()});
+}
+
+// xml5ever xml error callback indicating a well-formedness violating.
+fn xmlParseErrorCallback(ctx: *anyopaque, err: h5e.StringSlice) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (isWellFormednessError(err.slice())) {
+        self.xml_error = true;
+    }
+}
+
+fn validateErrorCallback(ctx: *anyopaque, err: h5e.StringSlice) callconv(.c) void {
+    const has_error: *bool = @ptrCast(@alignCast(ctx));
+    if (isWellFormednessError(err.slice())) {
+        has_error.* = true;
+    }
+}
+
+fn isWellFormednessError(msg: []const u8) bool {
+    if (std.mem.startsWith(u8, msg, "Bad character") and msg.len > "Bad character".len) {
+        // discouraged by legal code point
+        return false;
+    }
+    if (std.mem.startsWith(u8, msg, "Invalid character reference")) {
+        // xml5ever doesn't know about this entity, but it could be valid
+        return false;
+    }
+    return true;
+}
+
+fn popCallback(ctx: *anyopaque, node_ref: *anyopaque) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.terminated) {
+        return;
+    }
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    self._popCallback(getNode(node_ref)) catch |err| {
+        self.err = .{ .err = err, .source = .pop };
+    };
+}
+
+fn _popCallback(self: *Parser, node: *Node) !void {
+    // Flush before any nodeComplete so Build.complete (and any custom-element
+    // callbacks reachable from it) observe the final text data.
+    try self.flushPendingText();
+    try self.frame.nodeComplete(node);
+}
+
+fn createElementCallback(ctx: *anyopaque, data: *anyopaque, qname: h5e.QualName, attributes: h5e.AttributeIterator) callconv(.c) ?*anyopaque {
+    return _createElementCallbackWithDefaultnamespace(ctx, data, qname, attributes, .unknown);
+}
+
+fn createXMLElementCallback(ctx: *anyopaque, data: *anyopaque, qname: h5e.QualName, attributes: h5e.AttributeIterator) callconv(.c) ?*anyopaque {
+    // An XML element outside any xmlns declaration is in no namespace (null namespace)
+    return _createElementCallbackWithDefaultnamespace(ctx, data, qname, attributes, .null);
+}
+
+// html5ever_parse_fragment materializes the fragment's context element through
+// this dedicated callback, never through createElementCallback. The context
+// element is a throwaway: html5ever only queries its name (and, for a
+// <template> context, its content), it is never inserted into the tree. It
+// must be built bare — running a custom element constructor here is unbounded
+// recursion when the constructor sets innerHTML: that re-parse needs a context
+// element of the same custom tag, reconstructing forever (stack overflow). No
+// _ce_reactions window is needed: nothing can enqueue reactions on a bare
+// create.
+fn createContextElementCallback(ctx: *anyopaque, data: *anyopaque, qname: h5e.QualName, attributes: h5e.AttributeIterator) callconv(.c) ?*anyopaque {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    const frame = self.document._frame orelse self.frame;
+    const previous_creation = frame._custom_element_creation;
+    frame._custom_element_creation = .bare_context;
+    defer frame._custom_element_creation = previous_creation;
+    return self._createElementCallback(data, qname, attributes, .unknown) catch |err| {
+        self.err = .{ .err = err, .source = .create_element };
+        return null;
+    };
+}
+
+fn _createElementCallbackWithDefaultnamespace(ctx: *anyopaque, data: *anyopaque, qname: h5e.QualName, attributes: h5e.AttributeIterator, default_namespace: Element.Namespace) ?*anyopaque {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.fragment) {
+        const frame = self.document._frame orelse self.frame;
+        const previous_creation = frame._custom_element_creation;
+        frame._custom_element_creation = .{ .upgrade = self.frame };
+        defer frame._custom_element_creation = previous_creation;
+        return self._createElementCallback(data, qname, attributes, default_namespace) catch |err| {
+            self.err = .{ .err = err, .source = .create_element };
+            return null;
+        };
+    }
+
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    return self._createElementCallback(data, qname, attributes, default_namespace) catch |err| {
+        self.err = .{ .err = err, .source = .create_element };
+        return null;
+    };
+}
+fn _createElementCallback(self: *Parser, data: *anyopaque, qname: h5e.QualName, attributes: h5e.AttributeIterator, default_namespace: Element.Namespace) !*anyopaque {
+    const frame = self.frame;
+    const local = qname.local.slice();
+    // Elements are keyed by qualified name (prefix/localName split on ':'),
+    // like createElementNS. html5ever never sets a prefix; xml5ever does.
+    const name = if (qname.prefix.unwrap()) |prefix| blk: {
+        if (prefix.len == 0) break :blk local;
+        break :blk try frame.local_arena.print("{s}:{s}", .{ prefix.slice(), local });
+    } else local;
+    const namespace_string = qname.ns.slice();
+    const namespace = if (namespace_string.len == 0) default_namespace else Element.Namespace.parse(namespace_string);
+    const node = try Frame.node_factory.createElementNS(self.creation_document, namespace, name, attributes);
+    if (namespace == .unknown and namespace_string.len > 0) {
+        // Same as Document.createElementNS: keep the URI so namespaceURI and
+        // lookupNamespaceURI can return it.
+        const page = self.document._page;
+        try page.element_namespace_uris.put(page.arena, node.as(Element), try frame.dupeString(namespace_string));
+    }
+
+    const pn = try self.arena.create(ParsedNode);
+    pn.* = .{
+        .data = data,
+        .node = node,
+    };
+    return pn;
+}
+
+fn createCommentCallback(ctx: *anyopaque, str: h5e.StringSlice) callconv(.c) ?*anyopaque {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    return self._createCommentCallback(str.slice()) catch |err| {
+        self.err = .{ .err = err, .source = .create_comment };
+        return null;
+    };
+}
+fn _createCommentCallback(self: *Parser, str: []const u8) !*anyopaque {
+    const node = try Frame.node_factory.createComment(self.creation_document, str);
+    const pn = try self.arena.create(ParsedNode);
+    pn.* = .{
+        .data = null,
+        .node = node,
+    };
+    return pn;
+}
+
+fn createProcessingInstruction(ctx: *anyopaque, target: h5e.StringSlice, data: h5e.StringSlice) callconv(.c) ?*anyopaque {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    return self._createProcessingInstruction(target.slice(), data.slice()) catch |err| {
+        self.err = .{ .err = err, .source = .create_processing_instruction };
+        return null;
+    };
+}
+fn _createProcessingInstruction(self: *Parser, target: []const u8, data: []const u8) !*anyopaque {
+    const node = try Frame.node_factory.createProcessingInstruction(self.creation_document, target, data);
+    const pn = try self.arena.create(ParsedNode);
+    pn.* = .{
+        .data = null,
+        .node = node,
+    };
+    return pn;
+}
+
+fn appendDoctypeToDocument(ctx: *anyopaque, name: h5e.StringSlice, public_id: h5e.StringSlice, system_id: h5e.StringSlice) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.terminated) {
+        return;
+    }
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    self._appendDoctypeToDocument(name.slice(), public_id.slice(), system_id.slice()) catch |err| {
+        self.err = .{ .err = err, .source = .append_doctype_to_document };
+    };
+}
+fn _appendDoctypeToDocument(self: *Parser, name: []const u8, public_id: []const u8, system_id: []const u8) !void {
+    const frame = self.frame;
+
+    // Create the DocumentType node
+    const DocumentType = @import("../webapi/DocumentType.zig");
+    const doctype = try frame._factory.node(self.document, DocumentType{
+        ._proto = undefined,
+        ._name = try frame.dupeString(name),
+        ._public_id = try frame.dupeString(public_id),
+        ._system_id = try frame.dupeString(system_id),
+    });
+
+    // Append it to the document
+    try frame.appendNew(self.container.node, doctype.asNode(), null);
+}
+
+fn addAttrsIfMissingCallback(ctx: *anyopaque, target_ref: *anyopaque, attributes: h5e.AttributeIterator) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.terminated) {
+        return;
+    }
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    self._addAttrsIfMissingCallback(getNode(target_ref), attributes) catch |err| {
+        self.err = .{ .err = err, .source = .add_attrs_if_missing };
+    };
+}
+fn _addAttrsIfMissingCallback(self: *Parser, node: *Node, attributes: h5e.AttributeIterator) !void {
+    const element = node.as(Element);
+    const frame = self.frame;
+
+    const attr_list = &element._attributes;
+    while (attributes.next()) |attr| {
+        const name = attr.name.local.slice();
+        const value = attr.value.slice();
+        if (try attr_list.putNew(name, value, frame)) {
+            // attribute didn't previously exist
+            if (std.mem.eql(u8, name, "id") and node.isConnected()) {
+                try frame.addElementId(node._parent.?, element, element.getId().?);
+            }
+            if (element.is(Element.Html)) |html| {
+                try html.eventHandlerAttributeChanged(name, element.getAttributeSafe(.wrap(name)), frame);
+            }
+        }
+    }
+    element.noteStyleAttribute();
+}
+
+fn getTemplateContentsCallback(ctx: *anyopaque, target_ref: *anyopaque) callconv(.c) ?*anyopaque {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    return self._getTemplateContentsCallback(getNode(target_ref)) catch |err| {
+        self.err = .{ .err = err, .source = .get_template_content };
+        return null;
+    };
+}
+
+fn _getTemplateContentsCallback(self: *Parser, node: *Node) !*anyopaque {
+    const element = node.as(Element);
+    const template = element.subtype(Element.Html).is(Element.Html.Template) orelse unreachable;
+    const content_node = template.getContent().asNode();
+
+    // html5ever asks for this to insert there next.
+    self.creation_document = content_node.getDocument(self.frame);
+
+    // Create a ParsedNode wrapper for the content DocumentFragment
+    const pn = try self.arena.create(ParsedNode);
+    pn.* = .{
+        .data = null,
+        .node = content_node,
+        .placed = true,
+    };
+    return pn;
+}
+
+// Called for `<template shadowrootmode>` when declarative shadow roots are
+// allowed. Attaches a shadow root to `host` and redirects the (stack-only)
+// template's contents into it, so html5ever parses the template's children
+// straight into the shadow root. Returns 1 on success, 0 to tell html5ever to
+// fall back to inserting the template as a normal light-DOM element.
+fn attachDeclarativeShadowCallback(ctx: *anyopaque, host_ref: *anyopaque, template_ref: *anyopaque, mode_is_open: u8) callconv(.c) u8 {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.terminated) return 0;
+    return self._attachDeclarativeShadowCallback(getNode(host_ref), getNode(template_ref), mode_is_open != 0) catch |err| {
+        self.err = .{ .err = err, .source = .attach_declarative_shadow };
+        return 0;
+    };
+}
+
+fn _attachDeclarativeShadowCallback(self: *Parser, host_node: *Node, template_node: *Node, mode_is_open: bool) !u8 {
+    // guaranteed by html5ever
+    const host = host_node.as(Element);
+    const template_el = template_node.as(Element);
+    const shadow = host.attachShadow(.{
+        .declarative = true,
+        .mode = if (mode_is_open) .open else .closed,
+        .delegates_focus = template_el.hasAttributeSafe(.wrap("shadowrootdelegatesfocus")),
+        .clonable = template_el.hasAttributeSafe(.wrap("shadowrootclonable")),
+        .serializable = template_el.hasAttributeSafe(.wrap("shadowrootserializable")),
+    }, self.frame) catch |err| switch (err) {
+        error.NotSupported => return 0,
+        else => return err,
+    };
+
+    const template = template_el.is(Element.Html.Template) orelse return 0;
+    template._content = shadow.asDocumentFragment();
+    return 1;
+}
+
+fn appendCallback(ctx: *anyopaque, parent_ref: *anyopaque, node_or_text: h5e.NodeOrText) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.pollTerminate()) {
+        return;
+    }
+
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    self._appendCallback(getParsed(parent_ref), node_or_text) catch |err| {
+        self.err = .{ .err = err, .source = .append };
+    };
+}
+fn _appendCallback(self: *Parser, parent_pn: *ParsedNode, node_or_text: h5e.NodeOrText) !void {
+    // child node is guaranteed not to belong to another parent
+    switch (node_or_text.toUnion()) {
+        .node => |cpn| {
+            // Inserting a non-text child terminates any pending text run; flush
+            // before the insertion so that connectedCallback (etc.) sees the
+            // final data on the preceding text sibling.
+            try self.flushPendingText();
+            self.maybeCheckpoint();
+            self.inserted_since_checkpoint +|= 1;
+            const parent = parent_pn.node;
+            const child_pn = getParsed(cpn);
+            if (leftWhereScriptPutIt(child_pn)) {
+                return;
+            }
+            if (wouldCycle(child_pn.node, parent)) {
+                // Inserting would build a cycle (script moved it inside the adopting node)
+                return;
+            }
+            const child = try self.settleDocument(parent_pn, child_pn);
+            const root = self.rootOf(parent_pn);
+            try self.frame.appendNew(parent, child, root);
+            child_pn.root = root;
+            child_pn.root_version = parent_pn.root_version;
+        },
+        .text => |txt| {
+            const parent = parent_pn.node;
+            self.creation_document = parent.getDocument(self.frame);
+            try self.appendTextChunk(parent, txt);
+        },
+        .failed => {},
+    }
+}
+
+// Avoids walking to the root for every parsed element. When the parser inserts
+// new node, the root node of existing nodes doesn't change and we don't bump
+// dom_version, so we can cache this.
+fn rootOf(self: *Parser, pn: *ParsedNode) *Node {
+    const version = self.frame.page.dom_version;
+    if (pn.root) |root| {
+        if (pn.root_version == version) {
+            return root;
+        }
+    }
+    const root = pn.node.getRootNode(.{});
+    pn.root = root;
+    pn.root_version = version;
+    return root;
+}
+
+fn settleDocument(self: *Parser, parent_pn: *ParsedNode, child_pn: *ParsedNode) !*Node {
+    const frame = self.frame;
+    const parent = parent_pn.node;
+    const child = child_pn.node;
+
+    var document = parent.getDocument(frame);
+    const child_document = child.getDocument(frame);
+    if (child_document != document) {
+        if (child_pn.placed == false) {
+            child_pn.node = try self.rebuildIn(child, document);
+        } else if (parent_pn.placed == false) {
+            try frame.adoptNodeTree(parent, document, child_document);
+            document = child_document;
+        } else {
+            try frame.adoptNodeTree(child, child_document, document);
+        }
+    }
+
+    parent_pn.placed = true;
+    child_pn.placed = true;
+    self.creation_document = document;
+    return child_pn.node;
+}
+
+// A copy of the never-placed `node` in `document`, created like the parser
+// created `node`, in the wrong document.
+fn rebuildIn(self: *Parser, node: *Node, document: *Node.Document) !*Node {
+    const frame = self.frame;
+    const element = node.is(Element) orelse {
+        // A comment or processing instruction: nothing to construct or load.
+        try frame.adoptNodeTree(node, node.getDocument(frame), document);
+        return node;
+    };
+
+    const copy = try Frame.node_factory.createElementNS(document, element._namespace, element.getTagNameDump(), RebuiltAttributes{ .list = &element._attributes });
+    if (element._namespace == .unknown) {
+        // The URI lives in a side table, see _createElementCallback.
+        const page = self.document._page;
+        if (page.element_namespace_uris.fetchRemove(element)) |entry| {
+            try page.element_namespace_uris.put(page.arena, copy.as(Element), entry.value);
+        }
+    }
+    return copy;
+}
+
+fn removeFromParentCallback(ctx: *anyopaque, target_ref: *anyopaque) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.terminated) {
+        return;
+    }
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    self._removeFromParentCallback(getNode(target_ref)) catch |err| {
+        self.err = .{ .err = err, .source = .remove_from_parent };
+    };
+}
+fn _removeFromParentCallback(self: *Parser, node: *Node) !void {
+    // Removing a node mid-parse can detach the pending text node or its
+    // parent; either way the pending invariant breaks. Flush first so the
+    // accumulated bytes land on a still-attached text node (and pending_text
+    // is cleared before any subsequent chunk targets a fresh node).
+    try self.flushPendingText();
+    const parent = node.parentNode() orelse return;
+    _ = try parent.removeChild(node, self.frame);
+}
+
+fn reparentChildrenCallback(ctx: *anyopaque, node_ref: *anyopaque, new_parent_ref: *anyopaque) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.terminated) {
+        return;
+    }
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    self._reparentChildrenCallback(getParsed(node_ref), getParsed(new_parent_ref)) catch |err| {
+        self.err = .{ .err = err, .source = .reparent_children };
+    };
+}
+fn _reparentChildrenCallback(self: *Parser, node_pn: *ParsedNode, new_parent_pn: *ParsedNode) !void {
+    // Reparenting can move the pending text node out from under us — the
+    // node's _parent changes but pending_text.parent does not. Flush so the
+    // accumulator commits before the tree is rearranged.
+    try self.flushPendingText();
+
+    // The new parent is a fresh element (adoption agency algorithm); the
+    // children it takes settle its document, not the other way around.
+    const node = node_pn.node;
+    const new_parent = new_parent_pn.node;
+    const document = node.getDocument(self.frame);
+    if (new_parent_pn.placed == false) {
+        const new_parent_document = new_parent.getDocument(self.frame);
+        if (new_parent_document != document) {
+            try self.frame.adoptNodeTree(new_parent, new_parent_document, document);
+        }
+        new_parent_pn.placed = true;
+    }
+    try self.frame.appendAllChildren(node, new_parent);
+}
+
+fn appendBeforeSiblingCallback(ctx: *anyopaque, sibling_ref: *anyopaque, node_or_text: h5e.NodeOrText) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.pollTerminate()) {
+        return;
+    }
+
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    self._appendBeforeSiblingCallback(getParsed(sibling_ref), node_or_text) catch |err| {
+        self.err = .{ .err = err, .source = .append_before_sibling };
+    };
+}
+fn _appendBeforeSiblingCallback(self: *Parser, sibling_pn: *ParsedNode, node_or_text: h5e.NodeOrText) !void {
+    // Foster parenting / before-sibling insertions interrupt any pending text
+    // run (the new node lands at a different position from the pending text's
+    // tail). Flush before reading the parent's structure.
+    try self.flushPendingText();
+    const sibling = sibling_pn.node;
+    const parent = sibling.parentNode() orelse return error.NoParent;
+    const node: *Node = switch (node_or_text.toUnion()) {
+        .node => |cpn| blk: {
+            const child_pn = getParsed(cpn);
+            if (leftWhereScriptPutIt(child_pn)) {
+                return;
+            }
+            if (wouldCycle(child_pn.node, parent)) {
+                // See _appendCallback: the would-be cycle drops the node.
+                return;
+            }
+            var parent_pn = ParsedNode{ .node = parent, .data = null, .placed = true };
+            break :blk try self.settleDocument(&parent_pn, child_pn);
+        },
+        .text => |txt| blk: {
+            self.creation_document = parent.getDocument(self.frame);
+            break :blk try Frame.node_factory.createTextNode(self.creation_document, txt);
+        },
+        .failed => return,
+    };
+    try self.frame.insertNodeRelative(parent, node, .{ .before = sibling }, .{});
+}
+
+fn appendBasedOnParentNodeCallback(ctx: *anyopaque, element_ref: *anyopaque, prev_element_ref: *anyopaque, node_or_text: h5e.NodeOrText) callconv(.c) void {
+    const self: *Parser = @ptrCast(@alignCast(ctx));
+    if (self.pollTerminate()) {
+        return;
+    }
+
+    const cp = self.frame._ce_reactions.push();
+    defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
+    self._appendBasedOnParentNodeCallback(getParsed(element_ref), getParsed(prev_element_ref), node_or_text) catch |err| {
+        self.err = .{ .err = err, .source = .append_based_on_parent_node };
+    };
+}
+fn _appendBasedOnParentNodeCallback(self: *Parser, element_pn: *ParsedNode, prev_element_pn: *ParsedNode, node_or_text: h5e.NodeOrText) !void {
+    if (element_pn.node.parentNode()) |_| {
+        try self._appendBeforeSiblingCallback(element_pn, node_or_text);
+    } else {
+        try self._appendCallback(prev_element_pn, node_or_text);
+    }
+}
+
+// A custom element's constructor or attributeChangedCallback runs between
+// the element's creation and its insertion. If the callback gives it a parent,
+// then the parser must leave it there and is considered placed into the tree.
+fn leftWhereScriptPutIt(node_pn: *ParsedNode) bool {
+    if (node_pn.node._parent == null) {
+        return false;
+    }
+    node_pn.placed = true;
+    return true;
+}
+
+fn wouldCycle(node: *Node, parent: *Node) bool {
+    if (node == parent) {
+        return true;
+    }
+    // we can optimize this a bit and avoid calling `isHostIncludingInclusiveAncestorOf`
+    // in some cases
+    if (node.firstChild() == null) {
+        const element = node.is(Element) orelse return false;
+        if (element._flags.shadow_host == false) {
+            const template = element.is(Element.Html.Template) orelse return false;
+            if (template._content.asNode().firstChild() == null) {
+                // the node has no child and it isn't a template with children
+                // (it can't contain parent then)
+                return false;
+            }
+        }
+    }
+    return node.isHostIncludingInclusiveAncestorOf(parent);
+}
+
+fn getParsed(ref: *anyopaque) *ParsedNode {
+    return @ptrCast(@alignCast(ref));
+}
+
+fn getNode(ref: *anyopaque) *Node {
+    return getParsed(ref).node;
+}
+
+fn asUint(comptime string: anytype) @Int(
+    .unsigned,
+    @bitSizeOf(@TypeOf(string.*)) - 8, // (- 8) to exclude sentinel 0
+) {
+    const byteLength = @sizeOf(@TypeOf(string.*)) - 1;
+    const expectedType = *const [byteLength:0]u8;
+    if (@TypeOf(string) != expectedType) {
+        @compileError("expected : " ++ @typeName(expectedType) ++ ", got: " ++ @typeName(@TypeOf(string)));
+    }
+
+    return @bitCast(@as(*const [byteLength]u8, string).*);
+}
+
+fn maybeCheckpoint(self: *Parser) void {
+    if (self.inserted_since_checkpoint < CHECKPOINT_INTERVAL) {
+        return;
+    }
+
+    // only the navigation parse, and only at an empty JS stack: a fragment
+    // parse, document.write or a parse run by a script must not drain the
+    // queue mid-task.
+    const frame = self.frame;
+    if (frame.js.call_depth != 0 or frame._load_state != .parsing or frame._parse_mode != .document) {
+        return;
+    }
+    self.inserted_since_checkpoint = 0;
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    ls.local.runMicrotasks();
+}
+
+// v8's terminate isn't pre-emptive. A parse of unbounded input
+// (this.innerHTML += this.innerHTML) has to poll the terminate flag itself.
+// We'll poll this (atomic) variable every TERMINATE_CHECK_INTERVAL append.
+fn pollTerminate(self: *Parser) bool {
+    if (self.terminated) {
+        return true;
+    }
+
+    const next_check = self.appends_until_terminate_check - 1;
+    if (next_check > 0) {
+        self.appends_until_terminate_check = next_check;
+        return false;
+    }
+    self.appends_until_terminate_check = TERMINATE_CHECK_INTERVAL;
+
+    const terminated = self.frame.js.env.terminatePending();
+    self.terminated = terminated;
+    return terminated;
+}
+
+const testing = @import("../../testing.zig");
+test "Parser: isWellFormedXML" {
+    try testing.expectEqual(true, isWellFormedXML("<?xml version=\"1.0\"?><a><b/>&nbsp;&amp;</a>"));
+    try testing.expectEqual(true, isWellFormedXML("<!DOCTYPE svg [ <!ENTITY x \"y\"> ]><svg/>"));
+    try testing.expectEqual(false, isWellFormedXML("<a><b></a>"));
+    try testing.expectEqual(false, isWellFormedXML("<a>unclosed"));
+    try testing.expectEqual(false, isWellFormedXML("<a x=1/>"));
+    try testing.expectEqual(false, isWellFormedXML("<?xml version=\"2.0\"?><a/>"));
+}

@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<script id=basic_echo type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    ws.send('msg1');
+  });
+
+  ws.addEventListener('close', (e) => {
+    received.push(['close', e.code, e.reason]);
+    state.resolve();
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data);
+    ws.close(1000, 'bye');
+  });
+
+  await state.done(() => {
+    testing.expectEqual([
+      'echo-msg1',
+      ['close', 1000, 'bye'],
+    ], received);
+  });
+}
+</script>
+
+<script id=multiple_messages type=module>
+{
+  const state = await testing.async();
+  let received = [];
+  let sendCount = 0;
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    ws.send('first');
+    ws.send('second');
+    ws.send('third');
+    sendCount = 3;
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data);
+    if (received.length === sendCount) {
+      ws.close();
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([
+      'echo-first',
+      'echo-second',
+      'echo-third',
+    ], received);
+  });
+}
+</script>
+
+<script id=empty_message type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    ws.send('');
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data);
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    // Empty message echoed with "echo-" prefix
+    testing.expectEqual(['echo-'], received);
+  });
+}
+</script>
+
+<script id=boundary_125 type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    // 120 bytes + "echo-" prefix = 125 bytes response (single-byte length)
+    ws.send('A'.repeat(120));
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data.length);
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([125], received);
+  });
+}
+</script>
+
+<script id=boundary_16bit type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    // 200 bytes message
+    ws.send('B'.repeat(200));
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data.length);
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([205], received); // 200 + "echo-".length
+  });
+}
+</script>
+
+<script id=receive_large type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    // Ask server to send us a 10000 byte message
+    ws.send('send-large:10000');
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data.length);
+    // Verify pattern (A-Z repeating)
+    const expected_start = 'ABCDEFGHIJ';
+    received.push(e.data.substring(0, 10) === expected_start);
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([10000, true], received);
+  });
+}
+</script>
+
+<script id=send_large type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    // Send 5000 byte message
+    ws.send('X'.repeat(5000));
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data.length);
+    // Check it starts with echo- and then our Xs
+    received.push(e.data.startsWith('echo-XXXXX'));
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([5005, true], received); // 5000 + "echo-".length
+  });
+}
+</script>
+
+<script id=binary_uint8array type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+  ws.binaryType = 'arraybuffer';
+
+  ws.addEventListener('open', () => {
+    const data = new Uint8Array([1, 2, 3, 4, 5]);
+    ws.send(data);
+  });
+
+  ws.addEventListener('message', (e) => {
+    const arr = new Uint8Array(e.data);
+    // Server prepends 0xEE marker to binary responses
+    received.push(arr[0]); // 0xEE marker
+    received.push(arr.length);
+    received.push(arr[1]); // Our first byte
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([0xEE, 6, 1], received);
+  });
+}
+</script>
+
+<script id=binary_arraybuffer type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+  ws.binaryType = 'arraybuffer';
+
+  ws.addEventListener('open', () => {
+    const buffer = new ArrayBuffer(4);
+    const view = new Uint8Array(buffer);
+    view[0] = 10;
+    view[1] = 20;
+    view[2] = 30;
+    view[3] = 40;
+    ws.send(buffer);
+  });
+
+  ws.addEventListener('message', (e) => {
+    const arr = new Uint8Array(e.data);
+    received.push(arr.length);
+    received.push(arr[1]); // First byte of our data (after 0xEE marker)
+    received.push(arr[4]); // Last byte of our data
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([5, 10, 40], received);
+  });
+}
+</script>
+
+<script id=binary_int32array type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+  ws.binaryType = 'arraybuffer';
+
+  ws.addEventListener('open', () => {
+    const arr = new Int32Array([0x01020304, 0x05060708]);
+    ws.send(arr);
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data.byteLength);
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    // 1 marker byte + 8 bytes (2 x 4-byte int32)
+    testing.expectEqual([9], received);
+  });
+}
+</script>
+
+<script id=binary_blob type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+  ws.binaryType = 'arraybuffer';
+
+  ws.addEventListener('open', () => {
+    const blob = new Blob(['hello'], { type: 'text/plain' });
+    ws.send(blob);
+  });
+
+  ws.addEventListener('message', (e) => {
+    const arr = new Uint8Array(e.data);
+    received.push(arr.length);
+    received.push(arr[0]); // 0xEE marker
+    // 'h' = 104, 'e' = 101, 'l' = 108
+    received.push(arr[1]); // 'h'
+    received.push(arr[2]); // 'e'
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([6, 0xEE, 104, 101], received);
+  });
+}
+</script>
+
+<script id=server_close type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    ws.send('close:1001:going away');
+  });
+
+  ws.addEventListener('close', (e) => {
+    received.push(e.code);
+    received.push(e.reason);
+    received.push(e.wasClean);
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([1001, 'going away', true], received);
+  });
+}
+</script>
+
+<script id=force_close type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    ws.send('force-close');
+  });
+
+  ws.addEventListener('close', (e) => {
+    received.push('closed');
+    received.push(e.wasClean);
+    state.resolve();
+  });
+
+  ws.addEventListener('error', () => {
+    received.push('error');
+  });
+
+  await state.done(() => {
+    // Connection was not cleanly closed - error fires before close
+    testing.expectEqual(['error', 'closed', false], received);
+  });
+}
+</script>
+
+<script id=ready_state type=module>
+{
+  const state = await testing.async();
+  let states = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+  states.push(ws.readyState); // CONNECTING = 0
+
+  ws.addEventListener('open', () => {
+    states.push(ws.readyState); // OPEN = 1
+    ws.close();
+    states.push(ws.readyState); // CLOSING = 2
+  });
+
+  ws.addEventListener('close', () => {
+    states.push(ws.readyState); // CLOSED = 3
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([0, 1, 2, 3], states);
+  });
+}
+</script>
+
+<script id=buffered_amount type=module>
+{
+  const state = await testing.async();
+  let results = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    results.push(ws.bufferedAmount); // Should be 0 initially
+    ws.send('test');
+    // bufferedAmount might be non-zero right after send
+    // but will go to 0 after message is sent
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([0], results);
+  });
+}
+</script>
+
+<script id=handler_properties type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.onopen = () => {
+    ws.send('handler-test');
+  };
+
+  ws.onmessage = (e) => {
+    received.push(e.data);
+    ws.close();
+  };
+
+  ws.onclose = () => {
+    received.push('closed');
+    state.resolve();
+  };
+
+  await state.done(() => {
+    testing.expectEqual(['echo-handler-test', 'closed'], received);
+  });
+}
+</script>
+
+<script id=binary_type type=module>
+{
+  const state = await testing.async();
+  let results = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    results.push(ws.binaryType); // Default is 'blob'
+    ws.binaryType = 'arraybuffer';
+    results.push(ws.binaryType);
+    ws.binaryType = 'blob';
+    results.push(ws.binaryType);
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['blob', 'arraybuffer', 'blob'], results);
+  });
+}
+</script>
+
+<script id=url_property type=module>
+{
+  const state = await testing.async();
+  let result = null;
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/path');
+
+  ws.addEventListener('open', () => {
+    result = ws.url;
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual('ws://127.0.0.1:9584/path', result);
+  });
+}
+</script>
+
+<script id=receive_binary_as_blob type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+  // binaryType defaults to 'blob'
+
+  ws.addEventListener('open', () => {
+    // Send binary data - server will echo with 0xEE marker
+    const data = new Uint8Array([1, 2, 3, 4, 5]);
+    ws.send(data);
+  });
+
+  ws.addEventListener('message', async (e) => {
+    // e.data should be a Blob
+    received.push(e.data instanceof Blob);
+    received.push(e.data.size);
+
+    // Read the Blob using FileReader
+    const reader = new FileReader();
+    reader.onload = () => {
+      const arr = new Uint8Array(reader.result);
+      received.push(arr[0]); // 0xEE marker
+      received.push(arr[1]); // Our first byte
+      ws.close();
+    };
+    reader.readAsArrayBuffer(e.data);
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([true, 6, 0xEE, 1], received);
+  });
+}
+</script>
+
+<script id=url_with_fragment_rejected>
+{
+  testing.expectError('SyntaxError', () => {
+    new WebSocket('ws://127.0.0.1:9584/#fragment');
+  });
+}
+</script>
+
+<script id=url_scheme_normalization>
+{
+  // http(s) is an accepted spelling of ws(s), and the url is resolved against
+  // the document base before its scheme is looked at — so a relative url is
+  // as valid as an absolute one.
+  const dir = new URL('.', location);
+  const cases = [
+    ['http://127.0.0.1:9584/chat', 'ws://127.0.0.1:9584/chat'],
+    ['https://127.0.0.1:9584/chat', 'wss://127.0.0.1:9584/chat'],
+    ['ws://127.0.0.1:9584/chat', 'ws://127.0.0.1:9584/chat'],
+    ['chat', 'ws://' + dir.host + dir.pathname + 'chat'],
+    ['?x=1', 'ws://' + dir.host + location.pathname + '?x=1'],
+  ];
+  for (const [input, expected] of cases) {
+    const ws = new WebSocket(input);
+    testing.expectEqual(expected, ws.url);
+    ws.close();
+  }
+
+  // the document's charset never applies: a websocket url percent-encodes
+  // as UTF-8 no matter what the page is in
+  const euro = new WebSocket('ws://127.0.0.1:9584/?€');
+  testing.expectEqual('ws://127.0.0.1:9584/?%E2%82%AC', euro.url);
+  euro.close();
+
+  // every other scheme is a SyntaxError, as is a url the parser rejects
+  for (const input of ['ftp://127.0.0.1:9584/', 'about:blank', 'mailto:a@b.org', 'ws://foo bar.com/']) {
+    testing.expectError('SyntaxError', () => new WebSocket(input));
+  }
+}
+</script>
+
+<script id=blocked_port type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  // 22 (ssh) is a bad port; the constructor still returns an object in
+  // CONNECTING and the connection is failed asynchronously.
+  let ws = new WebSocket('ws://127.0.0.1:22/');
+  received.push(ws.readyState);
+  ws.addEventListener('open', () => { received.push('open'); });
+  ws.addEventListener('error', () => { received.push('error'); });
+  ws.addEventListener('close', (e) => {
+    received.push(['close', e.code, e.wasClean]);
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([0, 'error', ['close', 1006, false]], received);
+  });
+}
+</script>
+
+<script id=close_while_connecting type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+  ws.addEventListener('open', () => { received.push('open'); });
+  ws.addEventListener('close', (e) => {
+    received.push(['close', e.code, e.reason, e.wasClean]);
+    state.resolve();
+  });
+
+  ws.close(3000, 'changed my mind');
+  received.push(ws.readyState); // CLOSED = 3, immediately
+
+  await state.done(() => {
+    // open never fires; the close event is delivered asynchronously with
+    // the values close() was given and wasClean=false.
+    testing.expectEqual([3, ['close', 3000, 'changed my mind', false]], received);
+  });
+}
+</script>
+
+<script id=ws_within_callback type=module>
+{
+  const state = await testing.async();
+  let nested = false;
+  let ws1 = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws1.addEventListener('open', () => {
+    let ws2 = new WebSocket('ws://127.0.0.1:9584/');
+    ws2.addEventListener('open', state.resolve);
+  });
+
+  await state.done(() => {
+    // this case used to fail, so just reaching here is a success!
+    testing.expectTrue(true);
+  });
+}
+</script>
+
+<script id=cookies_on_upgrade type=module>
+{
+  // Cookies set on the page should ride along with the WebSocket
+  // upgrade request as a Cookie header — same as any other same-origin
+  // HTTP request. Without this, cookie-authenticated WS endpoints
+  // (Phoenix LiveView, anything session-gated) reject the upgrade.
+  //
+  // RFC 6455 §4.1: the upgrade is an HTTP/1.1 request and follows
+  // normal HTTP cookie semantics.
+  // RFC 6265 §5.4: cookies attach to "any HTTP request" matching
+  // the cookie's domain/path; ports are not part of cookie scope, so
+  // a cookie set on 127.0.0.1:9582 attaches to a 127.0.0.1:9584 WS.
+  // Set with path=/ so the cookie applies to the WS server's "/" path
+  // (without an explicit Path attribute, default-path uses the page's
+  // directory which doesn't match the WS endpoint).
+  document.cookie = 'ws_token=session_xyz; path=/';
+
+  // Sanity-check the cookie did land in the jar before opening the WS.
+  testing.expectEqual(true, document.cookie.includes('ws_token=session_xyz'));
+
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    ws.send('get-cookie');
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data);
+    ws.close();
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['cookie:ws_token=session_xyz'], received);
+  });
+
+  // Clean up so other tests on this fixture don't see this cookie.
+  document.cookie = 'ws_token=; path=/; Max-Age=0';
+}
+</script>
+
+<script id=cookies_on_upgrade_path_scoped_out type=module>
+{
+  // Path scoping: a cookie scoped to /restricted MUST NOT attach to
+  // a WS upgrade for "/". Guards against the patch over-sending cookies.
+  // Each test starts by clearing all cookies on path=/ since this
+  // fixture's <script> blocks share a single page/cookie jar.
+  for (const pair of document.cookie.split(';')) {
+    const name = pair.split('=')[0].trim();
+    if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
+  }
+  document.cookie = 'restricted=nope; path=/restricted';
+
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => { ws.send('get-cookie'); });
+  ws.addEventListener('message', (e) => { received.push(e.data); ws.close(); });
+  ws.addEventListener('close', () => { state.resolve(); });
+
+  await state.done(() => {
+    // Server should report an empty Cookie header.
+    testing.expectEqual(['cookie:'], received);
+  });
+
+  document.cookie = 'restricted=; path=/restricted; Max-Age=0';
+}
+</script>
+
+<script id=cookies_on_upgrade_samesite_strict type=module>
+{
+  // SameSite=Strict on a same-site upgrade (origin and target share
+  // host 127.0.0.1) MUST attach. The upgrade is a .subresource lookup;
+  // the cookie jar's SameSite logic only blocks Strict cookies when
+  // the request is cross-site, regardless of navigation status. This
+  // test pins the same-site path so a regression that breaks same-site
+  // detection on WS upgrades fails loudly.
+  for (const pair of document.cookie.split(';')) {
+    const name = pair.split('=')[0].trim();
+    if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
+  }
+  document.cookie = 'strict_token=s; path=/; SameSite=Strict';
+
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => { ws.send('get-cookie'); });
+  ws.addEventListener('message', (e) => { received.push(e.data); ws.close(); });
+  ws.addEventListener('close', () => { state.resolve(); });
+
+  await state.done(() => {
+    testing.expectEqual(['cookie:strict_token=s'], received);
+  });
+
+  document.cookie = 'strict_token=; path=/; Max-Age=0';
+}
+</script>
+
+<script id=cookies_on_upgrade_empty_jar type=module>
+{
+  // With no matching cookies, no Cookie header should be added.
+  // The patch has a `if (cookie_buf.written().len > 0)` guard;
+  // this test exercises the false branch so a regression that
+  // sends an empty `Cookie: ` header is caught.
+  for (const pair of document.cookie.split(';')) {
+    const name = pair.split('=')[0].trim();
+    if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
+  }
+
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => { ws.send('get-cookie'); });
+  ws.addEventListener('message', (e) => { received.push(e.data); ws.close(); });
+  ws.addEventListener('close', () => { state.resolve(); });
+
+  await state.done(() => {
+    // Server's get-cookie returns "cookie:" with whatever Cookie header
+    // value it captured — empty string means no header was sent.
+    testing.expectEqual(['cookie:'], received);
+  });
+}
+</script>
+
+<script id=cookies_on_upgrade_multiple type=module>
+{
+  // Multiple matching cookies must be joined with "; " per RFC 6265 §5.4.
+  for (const pair of document.cookie.split(';')) {
+    const name = pair.split('=')[0].trim();
+    if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
+  }
+  document.cookie = 'a=1; path=/';
+  document.cookie = 'b=2; path=/';
+
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => { ws.send('get-cookie'); });
+  ws.addEventListener('message', (e) => { received.push(e.data); ws.close(); });
+  ws.addEventListener('close', () => { state.resolve(); });
+
+  await state.done(() => {
+    // Order in the Cookie header isn't strictly specified by RFC 6265
+    // but the jar iterates insertion order, so a=1 lands first.
+    testing.expectEqual(['cookie:a=1; b=2'], received);
+  });
+
+  document.cookie = 'a=; path=/; Max-Age=0';
+  document.cookie = 'b=; path=/; Max-Age=0';
+}
+</script>
+
+<script id=origin_on_upgrade type=module>
+{
+  // The upgrade request must carry the document's origin in an Origin
+  // header — RFC 6455 §4.1 requires it for browser clients. Origin-checking
+  // endpoints (CSRF protection on WS servers) reject upgrades that arrive
+  // without it, before the handshake ever completes.
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => { ws.send('get-origin'); });
+  ws.addEventListener('message', (e) => { received.push(e.data); ws.close(); });
+  ws.addEventListener('close', () => { state.resolve(); });
+
+  await state.done(() => {
+    // The origin is the document's (fixture HTTP server, port 9582) —
+    // not the WS endpoint's 9584.
+    testing.expectEqual(['origin:http://127.0.0.1:9582'], received);
+  });
+}
+</script>
+
+<script id=send_non_buffer_object type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    // Anything that isn't a buffer is sent as its string, iterable or not
+    ws.send(new Set([1]));
+    ws.send([1, 2]);
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data);
+    if (received.length === 2) {
+      ws.close();
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['echo-[object Set]', 'echo-1,2'], received);
+  });
+}
+</script>
+
+<script id=protocols>
+{
+  // `optional (DOMString or sequence<DOMString>) protocols`
+  testing.expectError('SyntaxError', () => new WebSocket('ws://127.0.0.1:9584/', 'a b'));
+  testing.expectError('SyntaxError', () => new WebSocket('ws://127.0.0.1:9584/', ['ok', 'a b']));
+  testing.expectError('SyntaxError', () => new WebSocket('ws://127.0.0.1:9584/', new Set(['a b'])));
+  testing.expectEqual(1, WebSocket.length);
+}
+</script>

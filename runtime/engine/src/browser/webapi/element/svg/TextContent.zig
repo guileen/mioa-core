@@ -1,0 +1,133 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+const js = @import("../../../js/js.zig");
+const Frame = @import("../../../Frame.zig");
+const text_measure = @import("../../../text_measure.zig");
+const StyleManager = @import("../../../StyleManager.zig");
+
+const Node = @import("../../Node.zig");
+const Element = @import("../../Element.zig");
+const Factory = @import("../../../Factory.zig");
+
+const AnimatedEnumeration = @import("../../svg/AnimatedEnumeration.zig");
+const AnimatedLength = @import("../../svg/AnimatedLength.zig");
+
+const Graphics = @import("Graphics.zig");
+
+pub const TextPositioning = @import("TextPositioning.zig");
+pub const TextPath = @import("TextPath.zig");
+
+const TextContent = @This();
+
+pub const Proto = Graphics;
+_type: Type,
+_proto_canary: if (lp.IS_DEBUG) *Graphics else void = undefined,
+
+pub const Type = enum(u8) {
+    positioning,
+    text_path,
+};
+
+pub fn Subtype(comptime tag: Type) type {
+    return switch (tag) {
+        .positioning => TextPositioning,
+        .text_path => TextPath,
+    };
+}
+
+pub fn subtype(self: *const TextContent, comptime T: type) *T {
+    const offset = comptime Factory.chainOffsetOf(T, T) - Factory.chainOffsetOf(T, TextContent);
+    const sub: *T = @ptrFromInt(@intFromPtr(self) + offset);
+    if (comptime lp.IS_DEBUG) {
+        // This pointer dance only works because the factory allocates the chain
+        // in a contiguous block of memory. In debug, we assert this holds via
+        // the _proto_canary back pointer.
+        std.debug.assert(Factory.protoOf(sub) == self);
+    }
+    return sub;
+}
+
+pub fn is(self: *TextContent, comptime T: type) ?*T {
+    switch (self._type) {
+        inline else => |tag| {
+            if (Subtype(tag) == T) {
+                return self.subtype(T);
+            }
+        },
+    }
+    if (self._type == .positioning) return self.subtype(TextPositioning).is(T);
+    return null;
+}
+
+pub fn asElement(self: *TextContent) *Element {
+    return Factory.protoOf(self).asElement();
+}
+pub fn asNode(self: *TextContent) *Node {
+    return self.asElement().asNode();
+}
+
+fn text(self: *TextContent, frame: *Frame) []const u8 {
+    return self.asNode().getTextContentAlloc(frame.local_arena) catch "";
+}
+
+fn fontSize(self: *TextContent, frame: *Frame) f64 {
+    const element = self.asElement();
+    const owner = element.ownerFrame(frame) orelse return StyleManager.DEFAULT_FONT_SIZE;
+    return owner._style_manager.computedFontSize(element);
+}
+
+fn getTextLength(self: *TextContent, frame: *Frame) !*AnimatedLength {
+    return AnimatedLength.getOrCreate(self.asElement(), .text_length, frame);
+}
+
+fn getLengthAdjust(self: *TextContent, frame: *Frame) !*AnimatedEnumeration {
+    return AnimatedEnumeration.getOrCreate(self.asElement(), .length_adjust, frame);
+}
+
+fn getNumberOfChars(self: *TextContent, frame: *Frame) u32 {
+    return text_measure.utf16Length(self.text(frame));
+}
+
+fn getComputedTextLength(self: *TextContent, frame: *Frame) f64 {
+    return text_measure.width(self.text(frame), self.fontSize(frame));
+}
+
+fn getSubStringLength(self: *TextContent, charnum: u32, nchars: u32, frame: *Frame) !f64 {
+    return text_measure.substringWidth(self.text(frame), charnum, nchars, self.fontSize(frame));
+}
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(TextContent);
+    pub const Meta = struct {
+        pub const name = "SVGTextContentElement";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const LENGTHADJUST_UNKNOWN = bridge.property(0, .{ .template = true });
+    pub const LENGTHADJUST_SPACING = bridge.property(1, .{ .template = true });
+    pub const LENGTHADJUST_SPACINGANDGLYPHS = bridge.property(2, .{ .template = true });
+
+    pub const textLength = bridge.accessor(TextContent.getTextLength, null, .{});
+    pub const lengthAdjust = bridge.accessor(TextContent.getLengthAdjust, null, .{});
+    pub const getNumberOfChars = bridge.function(TextContent.getNumberOfChars, .{});
+    pub const getComputedTextLength = bridge.function(TextContent.getComputedTextLength, .{});
+    pub const getSubStringLength = bridge.function(TextContent.getSubStringLength, .{});
+};

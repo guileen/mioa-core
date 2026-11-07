@@ -1,0 +1,1011 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+const js = @import("../../js/js.zig");
+
+const http = @import("../../../network/http.zig");
+const Transfer = @import("../../../network/HttpClient.zig").Transfer;
+
+const URL = @import("../../URL.zig");
+const Mime = @import("../../Mime.zig");
+const Page = @import("../../Page.zig");
+const Frame = @import("../../Frame.zig");
+
+const Blob = @import("../Blob.zig");
+const Node = @import("../Node.zig");
+const Event = @import("../Event.zig");
+const EventTarget = @import("../EventTarget.zig");
+
+const Headers = @import("Headers.zig");
+const BodyInit = @import("body_init.zig").BodyInit;
+const XMLHttpRequestEventTarget = @import("XMLHttpRequestEventTarget.zig");
+const XMLHttpRequestUpload = @import("XMLHttpRequestUpload.zig");
+
+const log = lp.log;
+const Execution = js.Execution;
+
+const XMLHttpRequest = @This();
+
+pub const Proto = XMLHttpRequestEventTarget;
+_rc: lp.RC = .{},
+_exec: *const Execution,
+_proto: *XMLHttpRequestEventTarget,
+_upload: ?*XMLHttpRequestUpload = null,
+_arena: *lp.Arena,
+_http_transfer: ?*Transfer = null,
+
+// number of inflight requests, we can have multiple, e.g. xhr calling its own
+// send from the onload callback
+_active_requests: u8 = 0,
+_send_flag: bool = false,
+
+_url: [:0]const u8 = "",
+_method: http.Method = .GET,
+_request_headers: *Headers,
+_request_body: ?[]const u8 = null,
+
+_async: bool = true,
+
+_response: ?Response = null,
+_response_data: std.ArrayList(u8) = .empty,
+_response_status: u16 = 0,
+_response_status_text: ?[]const u8 = null,
+_response_len: ?usize = 0,
+_response_url: [:0]const u8 = "",
+_override_mime: ?Mime = null,
+_response_mime: ?Mime = null,
+_override_mime_raw: ?[]const u8 = null,
+_response_mime_raw: ?[]const u8 = null,
+_response_xml: ?*Node.Document = null,
+_response_headers: std.ArrayList(http.Header) = .empty,
+_response_type: ResponseType = .default,
+
+_ready_state: ReadyState = .unsent,
+_with_credentials: bool = false,
+_timeout: u32 = 0,
+
+const ReadyState = enum(u8) {
+    unsent = 0,
+    opened = 1,
+    headers_received = 2,
+    loading = 3,
+    done = 4,
+};
+
+const Response = union(enum) {
+    text: []const u8,
+    json: js.Value.Global,
+    document: *Node.Document,
+    arraybuffer: js.ArrayBuffer,
+    blob: *Blob,
+};
+
+const ResponseType = enum {
+    default, // behaves like `text`, but its string representation is ""
+    text,
+    json,
+    document,
+    arraybuffer,
+    blob,
+
+    pub fn toString(self: ResponseType) []const u8 {
+        return switch (self) {
+            .default => "",
+            else => @tagName(self),
+        };
+    }
+};
+
+pub fn init(exec: *const Execution) !*XMLHttpRequest {
+    const arena = try exec.getPinnedArena(.large, "XMLHttpRequest");
+    errdefer arena.release();
+    const self = try exec._factory.xhrEventTarget(arena.allocator(), XMLHttpRequest{
+        ._exec = exec,
+        ._arena = arena,
+        ._proto = undefined,
+        ._request_headers = try Headers.initGuarded(null, .request, exec),
+    });
+    return self;
+}
+
+fn clearResponse(self: *XMLHttpRequest, page: *Page) void {
+    if (self._response) |res| {
+        switch (res) {
+            .blob => |b| b.releaseRef(page),
+            .json => |js_val| js_val.release(),
+            else => {},
+        }
+        self._response = null;
+    }
+}
+
+pub fn deinit(self: *XMLHttpRequest, page: *Page) void {
+    if (self._http_transfer) |resp| {
+        resp.cancel();
+        self._http_transfer = null;
+    }
+
+    self.clearResponse(page);
+
+    if (self._upload) |upload| {
+        page.removeTarget(upload.asEventTarget());
+    }
+    page.removeTarget(self.asEventTarget());
+    self._arena.release();
+}
+
+fn releaseSelfRef(self: *XMLHttpRequest) void {
+    if (self._active_requests == 0) {
+        return;
+    }
+    self._active_requests -= 1;
+    if (self._active_requests == 0) {
+        self._arena.report();
+    }
+    self.releaseRef(self._exec.page);
+}
+
+pub fn releaseRef(self: *XMLHttpRequest, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *XMLHttpRequest) void {
+    self._rc.acquire();
+}
+
+pub fn asEventTarget(self: *XMLHttpRequest) *EventTarget {
+    return self._proto._proto;
+}
+
+fn getWithCredentials(self: *const XMLHttpRequest) bool {
+    return self._with_credentials;
+}
+
+fn setWithCredentials(self: *XMLHttpRequest, value: bool) !void {
+    if (self._ready_state != .unsent and self._ready_state != .opened) {
+        return error.InvalidStateError;
+    }
+    self._with_credentials = value;
+}
+
+fn getTimeout(self: *const XMLHttpRequest) u32 {
+    return self._timeout;
+}
+
+pub fn setTimeout(self: *XMLHttpRequest, value: u32, exec: *const Execution) !void {
+    // https://xhr.spec.whatwg.org/#the-timeout-attribute
+    if (!self._async and exec.js.global == .frame) {
+        return error.InvalidAccessError;
+    }
+
+    self._timeout = value;
+}
+
+// TODO: this takes an optional 3 more parameters
+// TODO: url should be a union, as it can be multiple things
+pub fn open(self: *XMLHttpRequest, method_: []const u8, url: [:0]const u8, async_: ?bool) !void {
+    // Abort any in-progress request
+    if (self._http_transfer) |transfer| {
+        transfer.cancel();
+        self._http_transfer = null;
+    }
+    self._send_flag = false;
+
+    // Reset internal state. _override_mime intentionally survives open()
+    // per https://xhr.spec.whatwg.org/#the-overridemimetype()-method.
+    self.clearResponse(self._exec.page);
+    self._response_xml = null;
+    self._response_data.clearRetainingCapacity();
+    self._response_status = 0;
+    self._response_status_text = null;
+    self._response_len = 0;
+    self._response_url = "";
+    self._response_mime = null;
+    self._response_mime_raw = null;
+    self._response_headers.clearRetainingCapacity();
+    self._request_body = null;
+    self._async = async_ orelse true;
+
+    // https://xhr.spec.whatwg.org/#the-timeout-attribute
+    // Throw if the request is sync OR if it is already sent.
+    if (self._timeout != 0 and !self._async) {
+        return error.InvalidAccessError;
+    }
+
+    const exec = self._exec;
+    self._method = try parseMethod(method_);
+    self._url = try URL.resolve(self._arena.allocator(), exec.base(), url, .{ .encoding = exec.charset.* });
+    try self.stateChanged(.opened, exec);
+}
+
+fn setRequestHeader(self: *XMLHttpRequest, name: []const u8, value: []const u8, exec: *const Execution) !void {
+    if (self._ready_state != .opened) {
+        return error.InvalidStateError;
+    }
+
+    if (isByteString(name) == false or isByteString(value) == false) {
+        // A code point above U+00FF is a TypeError, ...
+        return error.TypeError;
+    }
+    return self._request_headers.append(name, value, exec) catch |err| switch (err) {
+        error.TypeError => {
+            // ... but a valid "string" is a SyntaxError if it isn't a valid
+            // header name or value
+            return error.SyntaxError;
+        },
+        else => err,
+    };
+}
+
+fn isByteString(s: []const u8) bool {
+    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp > 0xFF) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// https://xhr.spec.whatwg.org/#the-overridemimetype()-method
+fn overrideMimeType(self: *XMLHttpRequest, mime: []const u8) !void {
+    if (self._ready_state == .loading or self._ready_state == .done) {
+        return error.InvalidStateError;
+    }
+    if (Mime.parse(mime)) |parsed| {
+        self._override_mime = parsed;
+        self._override_mime_raw = try self._arena.dupe(u8, std.mem.trim(u8, mime, &std.ascii.whitespace));
+    } else |_| {
+        // An unparseable override is application/octet-stream.
+        self._override_mime = .octet_stream;
+        self._override_mime_raw = "application/octet-stream";
+    }
+}
+
+pub fn send(self: *XMLHttpRequest, body_: ?BodyInit, exec_: *const Execution) !void {
+    if (comptime lp.IS_DEBUG) {
+        log.debug(.http, "XMLHttpRequest.send", .{ .url = self._url });
+    }
+    if (self._ready_state != .opened or self._send_flag) {
+        return error.InvalidStateError;
+    }
+
+    if (!self._async and exec_.js.global == .frame and
+        (self._timeout != 0 or self._response_type != .default))
+    {
+        return error.InvalidAccessError;
+    }
+
+    if (body_) |b| {
+        if (self._method != .GET and self._method != .HEAD) {
+            const extracted = try b.extract(self._arena.allocator());
+            self._request_body = extracted.bytes;
+            // Per XHR §4.7.6 "send()" step 4, the default Content-Type only
+            // applies if the author hasn't already set one via
+            // setRequestHeader.
+            if (extracted.content_type) |ct| {
+                if (try self._request_headers.has("content-type", exec_) == false) {
+                    try self._request_headers.append("content-type", ct, exec_);
+                }
+            }
+        }
+    }
+
+    const exec = self._exec;
+
+    self.acquireRef();
+    self._active_requests += 1;
+    self._send_flag = true;
+
+    const transfer = exec.newRequest(.{
+        .ctx = self,
+        .url = self._url,
+        .method = self._method,
+        .body = self._request_body,
+        .credentials_mode = if (self._with_credentials) .include else .same_origin,
+        .request_mode = .cors,
+        .origin = exec.origin(),
+        .resource_type = .xhr,
+        .timeout_ms = self._timeout,
+        .header_callback = httpHeaderDoneCallback,
+        .data_callback = httpDataCallback,
+        .done_callback = httpDoneCallback,
+        .error_callback = httpErrorCallback,
+        .shutdown_callback = httpShutdownCallback,
+        .body_outlives_request = true,
+    }) catch |err| {
+        self.releaseSelfRef();
+        self._send_flag = false;
+        return err;
+    };
+
+    {
+        errdefer {
+            transfer.deinit();
+            self.releaseSelfRef();
+            self._send_flag = false;
+        }
+        try self._request_headers.populateRequestHeaders(transfer);
+
+        if (transfer.req.credentialsAllowed()) {
+            try exec.headersForRequest(transfer, .{});
+        }
+    }
+
+    if (comptime lp.IS_DEBUG) {
+        log.debug(.http, "request start", .{ .method = self._method, .url = self._url, .source = "xhr" });
+    }
+
+    if (self._async) {
+        // Held for abort() / open() / deinit; the error, shutdown and done
+        // callbacks clear it.
+        self._http_transfer = transfer;
+
+        transfer.submit() catch |err| {
+            // don't releaseSelfRef, submit() has taken ownership and will call
+            // our error callback
+            self._send_flag = false;
+            return err;
+        };
+        return;
+    }
+
+    var resp = transfer.submitSync(.{ .copy_headers = true }) catch |err| {
+        log.debug(.http, "sync request failed", .{
+            .source = "xhr",
+            .url = self._url,
+            .err = err,
+        });
+        self._ready_state = .done;
+        self._send_flag = false;
+        self.releaseSelfRef();
+        return error.NetworkError;
+    };
+    defer resp.deinit();
+    defer self.releaseSelfRef();
+
+    self._response_status = resp.status;
+    if (resp.status_text.get()) |st| {
+        self._response_status_text = try self._arena.dupe(u8, st);
+    }
+    self._response_url = self._url;
+    self._response_len = resp.body.items.len;
+
+    for (resp.headers) |hdr| {
+        if (std.mem.eql(u8, hdr.name, "content-type")) {
+            self.applyContentType(hdr.value) catch |e| {
+                log.info(.http, "invalid content type", .{
+                    .content_Type = hdr.value,
+                    .err = e,
+                    .url = self._url,
+                });
+            };
+            break;
+        }
+    }
+    try self.applyResponseHeaders(resp.headers);
+
+    try self._response_data.appendSlice(self._arena.allocator(), resp.body.items);
+
+    var ls: js.Local.Scope = undefined;
+    exec.js.localScope(&ls);
+    defer ls.deinit();
+
+    try self.stateChanged(.done, exec);
+    const loaded = self._response_data.items.len;
+    try self._proto.dispatch(.load, .{ .total = loaded, .loaded = loaded, .length_computable = true }, exec);
+    try self._proto.dispatch(.load_end, .{ .total = loaded, .loaded = loaded, .length_computable = true }, exec);
+
+    log.info(.http, "request complete", .{
+        .source = "xhr",
+        .url = self._url,
+        .status = self._response_status,
+        .len = self._response_data.items.len,
+    });
+}
+
+// https://xhr.spec.whatwg.org/#the-upload-attribute
+// The XMLHttpRequestUpload object is created lazily and cached: scripts expect
+// the same instance on every access so their event listeners stick.
+fn getUpload(self: *XMLHttpRequest) !*XMLHttpRequestUpload {
+    if (self._upload) |upload| {
+        return upload;
+    }
+    const upload = try self._exec._factory.xhrEventTarget(
+        self._arena.allocator(),
+        XMLHttpRequestUpload{ ._proto = undefined, ._xhr = self },
+    );
+    self._upload = upload;
+    return upload;
+}
+
+fn getReadyState(self: *const XMLHttpRequest) u32 {
+    return @backingInt(self._ready_state);
+}
+
+// Headers are sorted by name, so all values for `name` are contiguous.
+fn getResponseHeader(self: *const XMLHttpRequest, name: []const u8, exec: *const Execution) !?[]const u8 {
+    const items = self._response_headers.items;
+    const start = for (items, 0..) |hdr, i| {
+        if (std.ascii.eqlIgnoreCase(name, hdr.name)) {
+            break i;
+        }
+    } else return null;
+
+    var end = start + 1;
+    while (end < items.len and std.mem.eql(u8, items[end].name, items[start].name)) {
+        end += 1;
+    }
+    if (end - start == 1) {
+        return items[start].value;
+    }
+
+    var buf: std.Io.Writer.Allocating = .init(exec.local_arena);
+    for (items[start..end], 0..) |hdr, i| {
+        if (i > 0) {
+            try buf.writer.writeAll(", ");
+        }
+        try buf.writer.writeAll(hdr.value);
+    }
+    return buf.written();
+}
+
+// Should return sorted and combined. They are already sorted, so combining
+// is easy.
+fn getAllResponseHeaders(self: *const XMLHttpRequest, exec: *const Execution) ![]const u8 {
+    if (self._ready_state != .done) {
+        // MDN says this should return null, but it seems to return an empty string
+        // in every browser. Specs are too hard for a dumbo like me to understand.
+        return "";
+    }
+
+    var buf: std.Io.Writer.Allocating = .init(exec.local_arena);
+    for (self._response_headers.items, 0..) |hdr, i| {
+        if (i > 0 and std.mem.eql(u8, hdr.name, self._response_headers.items[i - 1].name)) {
+            try buf.writer.print(", {s}", .{hdr.value});
+            continue;
+        }
+        if (i > 0) {
+            try buf.writer.writeAll("\r\n");
+        }
+        try buf.writer.print("{s}: {s}", .{ hdr.name, hdr.value });
+    }
+    if (self._response_headers.items.len > 0) {
+        try buf.writer.writeAll("\r\n");
+    }
+    return buf.written();
+}
+
+fn getResponseType(self: *const XMLHttpRequest) ResponseType {
+    return self._response_type;
+}
+
+fn setResponseType(self: *XMLHttpRequest, value: []const u8, exec: *const Execution) !void {
+    const rt: ResponseType = if (value.len == 0)
+        .default
+    else
+        std.meta.stringToEnum(ResponseType, value) orelse return;
+
+    if (self._ready_state == .loading or self._ready_state == .done) {
+        return error.InvalidStateError;
+    }
+
+    if (!self._async and exec.js.global == .frame) {
+        return error.InvalidAccessError;
+    }
+
+    if (value.len == 0) {
+        self._response_type = .default;
+        return;
+    }
+
+    if (rt != .default) {
+        self._response_type = rt;
+    }
+}
+
+fn getResponseText(self: *const XMLHttpRequest) []const u8 {
+    // TODO: per WHATWG XHR "get a text response", the bytes must be decoded
+    // using the final encoding derived from the final MIME type
+    // (_override_mime ?? _response_mime). Currently the raw bytes are
+    // returned and V8 treats them as UTF-8.
+    return self._response_data.items;
+}
+
+pub fn getStatus(self: *const XMLHttpRequest) u16 {
+    return self._response_status;
+}
+
+fn getStatusText(self: *const XMLHttpRequest) []const u8 {
+    if (self._response_status_text) |st| {
+        return st;
+    }
+    return std.http.Status.phrase(@fromBackingInt(@intCast(self._response_status))) orelse "";
+}
+
+fn getResponseURL(self: *XMLHttpRequest) []const u8 {
+    return self._response_url;
+}
+
+fn getResponse(self: *XMLHttpRequest, exec: *const Execution) !?Response {
+    // https://xhr.spec.whatwg.org/#the-response-attribute
+    // default/text can be read while still loading, so we return the
+    // current bytes directly instead of caching a value that would go
+    // stale as more data arrives.
+    if (self._response_type == .default or self._response_type == .text) {
+        return .{ .text = self._response_data.items };
+    }
+
+    if (self._ready_state != .done) {
+        return null;
+    }
+
+    if (self._response) |res| {
+        // was already loaded
+        return res;
+    }
+
+    const data = self._response_data.items;
+    const res: Response = switch (self._response_type) {
+        .default, .text => unreachable,
+        .json => blk: {
+            const local = exec.js.local.?;
+
+            // per spec, we need to strip a JSON's body leading BOM
+            const json_text = if (std.mem.startsWith(u8, data, "\u{FEFF}")) data[3..] else data;
+
+            var try_catch: js.TryCatch = undefined;
+            try_catch.init(local);
+            defer try_catch.deinit();
+            const value = local.parseJSON(json_text) catch {
+                // if we fail to parse, we return null, not an error.
+                const null_value = js.Value{ .local = local, .handle = local.isolate.initNull() };
+                break :blk .{ .json = try null_value.persist() };
+            };
+            break :blk .{ .json = try value.persist() };
+        },
+        .document => blk: {
+            // responseType=document is only meaningful in a Frame; workers
+            // have no DOM. Drastically different impls -> switch on global.
+            switch (exec.js.global) {
+                .frame => |frame| {
+                    const final: Mime = self._override_mime orelse self._response_mime orelse .{ .content_type = .text_xml };
+                    if (final.isXML()) {
+                        const document = (try Frame.parse.xmlDocument(frame, data)) orelse return null;
+                        break :blk .{ .document = document.asDocument() };
+                    }
+                    if (!final.isHTML()) {
+                        return null;
+                    }
+                    const document = try exec._factory.genericDocument(.{});
+                    try Frame.parse.htmlAsChildren(frame, document.asNode(), data);
+                    break :blk .{ .document = document };
+                },
+                .worker => return error.NotSupportedInWorker,
+            }
+        },
+        .arraybuffer => .{ .arraybuffer = .{ .values = data } },
+        .blob => blk: {
+            const content_type = self._override_mime_raw orelse self._response_mime_raw orelse "text/xml";
+            const blob = try Blob.initFromBytes(data, content_type, exec);
+            blob.acquireRef();
+            break :blk .{ .blob = blob };
+        },
+    };
+
+    self._response = res;
+    return res;
+}
+
+fn getResponseXML(self: *XMLHttpRequest, exec: *const Execution) !?*Node.Document {
+    if (self._ready_state != .done) {
+        return null;
+    }
+
+    // responseType="document": getResponse already parses + caches it.
+    if (self._response_type == .document) {
+        const res = (try self.getResponse(exec)) orelse return null;
+        return switch (res) {
+            .document => |doc| doc,
+            else => null,
+        };
+    }
+
+    if (self._response_type != .default) {
+        return null;
+    }
+
+    if (self._response_xml) |document| {
+        return document;
+    }
+
+    // With responseType "", only an XML final MIME type is parsed (an HTML
+    // one yields null); absent a Content-Type it defaults to text/xml.
+    const final: Mime = self._override_mime orelse self._response_mime orelse .{ .content_type = .text_xml };
+    if (!final.isXML()) {
+        return null;
+    }
+
+    switch (exec.js.global) {
+        .frame => |frame| {
+            const xml_document = (try Frame.parse.xmlDocument(frame, self._response_data.items)) orelse return null;
+            const document = xml_document.asDocument();
+            self._response_xml = document;
+            return document;
+        },
+        .worker => return error.NotSupportedInWorker,
+    }
+}
+
+fn applyContentType(self: *XMLHttpRequest, content_type: []const u8) !void {
+    self._response_mime = try Mime.parse(content_type);
+    self._response_mime_raw = try self._arena.dupe(u8, std.mem.trim(u8, content_type, &std.ascii.whitespace));
+}
+
+fn applyResponseHeaders(self: *XMLHttpRequest, headers: []const http.Header) !void {
+    const allocator = self._arena.allocator();
+    for (headers) |hdr| {
+        if (Headers.isForbiddenResponseHeaderName(hdr.name)) {
+            continue;
+        }
+        try self._response_headers.append(allocator, .{
+            .name = try allocator.dupe(u8, hdr.name),
+            .value = try allocator.dupe(u8, hdr.value),
+        });
+    }
+
+    // Comparison is by uppercased name...so things like _ sort after letters.
+    std.mem.sort(http.Header, self._response_headers.items, {}, struct {
+        fn lessThan(_: void, a: http.Header, b: http.Header) bool {
+            const len = @min(a.name.len, b.name.len);
+            for (a.name[0..len], b.name[0..len]) |ca, cb| {
+                const ua = std.ascii.toUpper(ca);
+                const ub = std.ascii.toUpper(cb);
+                if (ua != ub) {
+                    return ua < ub;
+                }
+            }
+            return a.name.len < b.name.len;
+        }
+    }.lessThan);
+}
+
+fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
+    const self: *XMLHttpRequest = @ptrCast(@alignCast(transfer.req.ctx));
+
+    if (comptime lp.IS_DEBUG) {
+        log.debug(.http, "request header", .{
+            .source = "xhr",
+            .url = self._url,
+            .status = transfer.responseStatus(),
+        });
+    }
+
+    if (transfer.contentType()) |ct| {
+        self.applyContentType(ct) catch |e| {
+            log.info(.http, "invalid content type", .{
+                .content_Type = ct,
+                .err = e,
+                .url = self._url,
+            });
+            return .abort;
+        };
+    }
+
+    try self.applyResponseHeaders(transfer.responseHeaders());
+
+    self._response_status = transfer.responseStatus().?;
+    self._exec.page.status.noteResponse(.xhr, transfer);
+    if (transfer.statusText()) |st| {
+        self._response_status_text = try self._arena.dupe(u8, st);
+    }
+    if (transfer.getContentLength()) |cl| {
+        self._response_len = cl;
+    }
+    try self._response_data.ensureTotalCapacityPrecise(self._arena.allocator(), transfer.bodyLen());
+    self._response_url = try self._arena.dupeSentinel(u8, transfer.req.url, 0);
+
+    const exec = self._exec;
+
+    var ls: js.Local.Scope = undefined;
+    exec.js.localScope(&ls);
+    defer ls.deinit();
+
+    try self.stateChanged(.headers_received, exec);
+    try self._proto.dispatch(.load_start, .{ .loaded = 0, .total = self._response_len orelse 0 }, exec);
+    try self.stateChanged(.loading, exec);
+
+    return .proceed;
+}
+
+fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {
+    const self: *XMLHttpRequest = @ptrCast(@alignCast(transfer.req.ctx));
+    try self._response_data.appendSlice(self._arena.allocator(), data);
+
+    try self._proto.dispatch(.progress, .{
+        .total = self._response_len orelse 0,
+        .loaded = self._response_data.items.len,
+    }, self._exec);
+}
+
+fn httpDoneCallback(ctx: *anyopaque) !void {
+    const self: *XMLHttpRequest = @ptrCast(@alignCast(ctx));
+
+    log.info(.http, "request complete", .{
+        .source = "xhr",
+        .url = self._url,
+        .status = self._response_status,
+        .len = self._response_data.items.len,
+    });
+
+    // Not that the request is done, the http/client will free the transfer
+    // object. It isn't safe to keep it around.
+    self._http_transfer = null;
+
+    const exec = self._exec;
+
+    try self.stateChanged(.done, exec);
+
+    const loaded = self._response_data.items.len;
+    try self._proto.dispatch(.load, .{
+        .total = loaded,
+        .loaded = loaded,
+    }, exec);
+    try self._proto.dispatch(.load_end, .{
+        .total = loaded,
+        .loaded = loaded,
+    }, exec);
+
+    self.releaseSelfRef();
+}
+
+fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
+    const self: *XMLHttpRequest = @ptrCast(@alignCast(ctx));
+    if (self._response_status == 0) {
+        self._exec.page.status.noteError(.xhr, err);
+    }
+    // handleError can execute JS, which could .send() again: clear this now.
+    self._http_transfer = null;
+    self.handleError(err);
+    self.releaseSelfRef();
+}
+
+fn httpShutdownCallback(ctx: *anyopaque) void {
+    const self: *XMLHttpRequest = @ptrCast(@alignCast(ctx));
+    self._http_transfer = null;
+    self.releaseSelfRef();
+}
+
+pub fn abort(self: *XMLHttpRequest) void {
+    self.handleError(error.TransferCanceled);
+    if (self._http_transfer) |resp| {
+        self._http_transfer = null;
+        resp.cancel();
+    }
+    self.releaseSelfRef();
+}
+
+fn handleError(self: *XMLHttpRequest, err: anyerror) void {
+    self._handleError(err) catch |inner| {
+        log.debug(.http, "handle error error", .{
+            .original = err,
+            .err = inner,
+        });
+    };
+}
+fn _handleError(self: *XMLHttpRequest, err: anyerror) !void {
+    const is_abort = err == error.TransferCanceled;
+    const is_timeout = err == error.OperationTimedout;
+
+    const new_state: ReadyState = if (is_abort) .unsent else .done;
+    if (new_state != self._ready_state) {
+        const exec = self._exec;
+
+        try self.stateChanged(new_state, exec);
+        if (is_abort) {
+            try self._proto.dispatch(.abort, null, exec);
+        } else if (is_timeout) {
+            try self._proto.dispatch(.timeout, null, exec);
+        } else {
+            try self._proto.dispatch(.err, null, exec);
+        }
+        try self._proto.dispatch(.load_end, null, exec);
+    }
+
+    log.debug(.http, "error", .{
+        .url = self._url,
+        .err = err,
+        .source = "xhr.handleError",
+    });
+}
+
+fn stateChanged(self: *XMLHttpRequest, state: ReadyState, exec: *const Execution) !void {
+    if (state == self._ready_state) {
+        return;
+    }
+
+    self._ready_state = state;
+
+    const target = self.asEventTarget();
+    if (exec.hasDirectListeners(target, "readystatechange")) {
+        const event = try Event.initTrusted(.wrap("readystatechange"), .{}, exec.page);
+        try exec.dispatch(target, event, .{ .context = "XHR state change" });
+    }
+}
+
+fn parseMethod(method: []const u8) !http.Method {
+    if (std.ascii.eqlIgnoreCase(method, "get")) return .GET;
+    if (std.ascii.eqlIgnoreCase(method, "put")) return .PUT;
+    if (std.ascii.eqlIgnoreCase(method, "post")) return .POST;
+    if (std.ascii.eqlIgnoreCase(method, "delete")) return .DELETE;
+    if (std.ascii.eqlIgnoreCase(method, "head")) return .HEAD;
+    if (std.ascii.eqlIgnoreCase(method, "options")) return .OPTIONS;
+    if (std.ascii.eqlIgnoreCase(method, "patch")) return .PATCH;
+    if (std.ascii.eqlIgnoreCase(method, "propfind")) return .PROPFIND;
+    return error.InvalidMethod;
+}
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(XMLHttpRequest);
+
+    pub const Meta = struct {
+        pub const name = "XMLHttpRequest";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const constructor = bridge.constructor(XMLHttpRequest.init, .{});
+    pub const UNSENT = bridge.property(@backingInt(XMLHttpRequest.ReadyState.unsent), .{ .template = true });
+    pub const OPENED = bridge.property(@backingInt(XMLHttpRequest.ReadyState.opened), .{ .template = true });
+    pub const HEADERS_RECEIVED = bridge.property(@backingInt(XMLHttpRequest.ReadyState.headers_received), .{ .template = true });
+    pub const LOADING = bridge.property(@backingInt(XMLHttpRequest.ReadyState.loading), .{ .template = true });
+    pub const DONE = bridge.property(@backingInt(XMLHttpRequest.ReadyState.done), .{ .template = true });
+
+    pub const onreadystatechange = EventTarget.handlerAccessor(XMLHttpRequest, "readystatechange");
+    pub const upload = bridge.accessor(XMLHttpRequest.getUpload, null, .{});
+    pub const timeout = bridge.accessor(XMLHttpRequest.getTimeout, XMLHttpRequest.setTimeout, .{});
+    pub const withCredentials = bridge.accessor(XMLHttpRequest.getWithCredentials, XMLHttpRequest.setWithCredentials, .{});
+    pub const open = bridge.function(XMLHttpRequest.open, .{});
+    pub const send = bridge.function(XMLHttpRequest.send, .{});
+    pub const responseType = bridge.accessor(XMLHttpRequest.getResponseType, XMLHttpRequest.setResponseType, .{});
+    pub const status = bridge.accessor(XMLHttpRequest.getStatus, null, .{});
+    pub const statusText = bridge.accessor(XMLHttpRequest.getStatusText, null, .{});
+    pub const readyState = bridge.accessor(XMLHttpRequest.getReadyState, null, .{});
+    pub const response = bridge.accessor(XMLHttpRequest.getResponse, null, .{});
+    pub const responseText = bridge.accessor(XMLHttpRequest.getResponseText, null, .{});
+    pub const responseXML = bridge.accessor(XMLHttpRequest.getResponseXML, null, .{});
+    pub const responseURL = bridge.accessor(XMLHttpRequest.getResponseURL, null, .{});
+    pub const setRequestHeader = bridge.function(XMLHttpRequest.setRequestHeader, .{});
+    pub const overrideMimeType = bridge.function(XMLHttpRequest.overrideMimeType, .{});
+    pub const getResponseHeader = bridge.function(XMLHttpRequest.getResponseHeader, .{});
+    pub const getAllResponseHeaders = bridge.function(XMLHttpRequest.getAllResponseHeaders, .{});
+    pub const abort = bridge.function(XMLHttpRequest.abort, .{});
+};
+
+const testing = @import("../../../testing.zig");
+
+test "parseMethod: accepts known methods case-insensitively" {
+    try testing.expectEqual(.GET, try parseMethod("GET"));
+    try testing.expectEqual(.GET, try parseMethod("get"));
+    try testing.expectEqual(.HEAD, try parseMethod("Head"));
+    try testing.expectEqual(.POST, try parseMethod("post"));
+    try testing.expectEqual(.PUT, try parseMethod("put"));
+    try testing.expectEqual(.DELETE, try parseMethod("delete"));
+    try testing.expectEqual(.OPTIONS, try parseMethod("options"));
+    try testing.expectEqual(.PATCH, try parseMethod("patch"));
+    try testing.expectEqual(.PROPFIND, try parseMethod("propfind"));
+}
+
+test "WebApi: XHR" {
+    try testing.htmlRunner("net/xhr.html", .{});
+}
+
+test "WebApi: XHR in worker" {
+    try testing.htmlRunner("net/xhr_worker.html", .{});
+}
+
+test "WebApi: XHR listeners are dropped when the XHR is freed" {
+    // A freed XHR's address gets reused by a new one, which must not inherit
+    // the old one's listeners.
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec(
+            \\globalThis.fired = 0;
+            \\for (let i = 0; i < 200; i++) {
+            \\  new XMLHttpRequest().addEventListener('foo', () => fired++);
+            \\  new XMLHttpRequest().upload.addEventListener('foo', () => fired++);
+            \\  new XMLHttpRequest().onload = () => fired++;
+            \\  new XMLHttpRequest().upload.onload = () => fired++;
+            \\}
+        , null);
+    }
+
+    // Not env.memoryPressureNotification: it skips small heaps.
+    const isolate = testing.test_session.browser.env.isolate;
+    for (0..3) |_| {
+        isolate.memoryPressureNotification(.critical);
+    }
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const fired = try ls.local.exec(
+        \\for (let i = 0; i < 200; i++) {
+        \\  new XMLHttpRequest().dispatchEvent(new Event('foo'));
+        \\  new XMLHttpRequest().upload.dispatchEvent(new Event('foo'));
+        \\  new XMLHttpRequest().dispatchEvent(new Event('load'));
+        \\  new XMLHttpRequest().upload.dispatchEvent(new Event('load'));
+        \\}
+        \\fired;
+    , null);
+    try testing.expectEqual(0, try fired.toF64());
+}
+
+test "WebApi: worker XHR listeners are dropped when the XHR is freed" {
+    // Same as above, but in a worker, whose listeners live in its own store.
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    // Navigate the frame first to avoid CORS blocking request for the worker.
+    try frame.navigate("http://localhost:9582/", .{});
+    try testing.waitForFrame();
+
+    const worker = try @import("../Worker.zig").init("http://localhost:9582/src/browser/tests/testing.js", null, frame);
+    const ctx = worker._worker_scope._proto.js;
+
+    {
+        var ls: js.Local.Scope = undefined;
+        ctx.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec(
+            \\globalThis.fired = 0;
+            \\for (let i = 0; i < 200; i++) {
+            \\  new XMLHttpRequest().addEventListener('foo', () => fired++);
+            \\  new XMLHttpRequest().upload.addEventListener('foo', () => fired++);
+            \\  new XMLHttpRequest().onload = () => fired++;
+            \\  new XMLHttpRequest().upload.onload = () => fired++;
+            \\}
+        , null);
+    }
+
+    // Not env.memoryPressureNotification: it skips small heaps.
+    const isolate = testing.test_session.browser.env.isolate;
+    for (0..3) |_| {
+        isolate.memoryPressureNotification(.critical);
+    }
+
+    var ls: js.Local.Scope = undefined;
+    ctx.localScope(&ls);
+    defer ls.deinit();
+    const fired = try ls.local.exec(
+        \\for (let i = 0; i < 200; i++) {
+        \\  new XMLHttpRequest().dispatchEvent(new Event('foo'));
+        \\  new XMLHttpRequest().upload.dispatchEvent(new Event('foo'));
+        \\  new XMLHttpRequest().dispatchEvent(new Event('load'));
+        \\  new XMLHttpRequest().upload.dispatchEvent(new Event('load'));
+        \\}
+        \\fired;
+    , null);
+    try testing.expectEqual(0, try fired.toF64());
+}

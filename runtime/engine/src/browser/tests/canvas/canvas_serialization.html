@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<head>
+  <script src="../testing.js"></script>
+</head>
+
+<body>
+  <canvas id=c width=64 height=32></canvas>
+</body>
+
+
+<script id=toDataURL_basic>
+{
+  const canvas = document.getElementById('c');
+  const url = canvas.toDataURL();
+  testing.expectEqual('string', typeof url);
+  testing.expectEqual(true, url.startsWith('data:image/png;base64,'));
+  // iVBORw0KGgo is the base64 of the 8-byte PNG signature.
+  testing.expectEqual(true, url.startsWith('data:image/png;base64,iVBORw0KGgo'));
+}
+</script>
+
+<script id=toDataURL_is_stable>
+{
+  const canvas = document.getElementById('c');
+  testing.expectEqual(canvas.toDataURL(), canvas.toDataURL());
+}
+</script>
+
+<script id=toDataURL_encodes_actual_dimensions_and_pixels>
+{
+  const a = document.createElement('canvas'); a.width = 10; a.height = 8;
+  const b = document.createElement('canvas'); b.width = 20; b.height = 16;
+  testing.expectTrue(a.toDataURL() !== b.toDataURL());
+  const before = a.toDataURL();
+  a.getContext('2d').fillStyle = 'red'; a.getContext('2d').fillRect(0, 0, 10, 8);
+  testing.expectTrue(before !== a.toDataURL());
+  const binary = atob(a.toDataURL().split(',')[1]);
+  const bytes = Uint8Array.from(binary, value => value.charCodeAt(0));
+  const view = new DataView(bytes.buffer);
+  testing.expectEqual(10, view.getUint32(16));
+  testing.expectEqual(8, view.getUint32(20));
+}
+</script>
+
+<script id=toDataURL_default_size>
+{
+  // Default canvas is 300x150; it must serialize like any other.
+  const canvas = document.createElement('canvas');
+  testing.expectEqual(300, canvas.width);
+  testing.expectEqual(150, canvas.height);
+  testing.expectEqual(true, canvas.toDataURL().startsWith('data:image/png;base64,'));
+}
+</script>
+
+<script id=toDataURL_unsupported_type_falls_back_to_png>
+{
+  const canvas = document.getElementById('c');
+  // Per spec an unsupported type falls back to image/png.
+  testing.expectEqual(true, canvas.toDataURL('image/jpeg').startsWith('data:image/png;base64,'));
+  testing.expectEqual(true, canvas.toDataURL('image/webp', 0.5).startsWith('data:image/png;base64,'));
+}
+</script>
+
+<script id=toDataURL_zero_size>
+{
+  const canvas = document.createElement('canvas');
+  canvas.width = 0;
+  testing.expectEqual('data:,', canvas.toDataURL());
+
+  const other = document.createElement('canvas');
+  other.height = 0;
+  testing.expectEqual('data:,', other.toDataURL());
+}
+</script>
+
+<script id=toBlob_basic type=module>
+{
+  const state = await testing.async();
+  const canvas = document.getElementById('c');
+  testing.expectEqual('function', typeof canvas.toBlob);
+
+  canvas.toBlob((blob) => state.resolve(blob));
+  await state.done((blob) => {
+    testing.expectEqual(true, blob instanceof Blob);
+    testing.expectEqual('image/png', blob.type);
+    testing.expectTrue(blob.size > 32);
+  });
+}
+</script>
+
+<script id=toBlob_is_async type=module>
+{
+  const state = await testing.async();
+  const canvas = document.getElementById('c');
+  let called = false;
+  canvas.toBlob(function() {
+    called = true;
+    state.resolve();
+  });
+  // The callback runs from a task, never synchronously. Serialization runs in
+  // parallel, so the spec doesn't order it against other tasks (Chrome runs a
+  // setTimeout(0) queued after it first).
+  const sync = called;
+  await state.done(() => {
+    testing.expectEqual(false, sync);
+    testing.expectEqual(true, called);
+  });
+}
+</script>
+
+<script id=toBlob_drains_microtasks type=module>
+{
+  const state = await testing.async();
+  const canvas = document.getElementById('c');
+  const order = [];
+  canvas.toBlob(function() {
+    order.push('callback');
+    Promise.resolve().then(function() { order.push('microtask'); });
+    // Queued from the callback's task, so it runs after that task's
+    // microtask checkpoint.
+    setTimeout(function() {
+      order.push('timer');
+      state.resolve(order.join(','));
+    }, 0);
+  });
+  await state.done((v) => {
+    testing.expectEqual('callback,microtask,timer', v);
+  });
+}
+</script>
+
+<script id=toBlob_zero_size_yields_null type=module>
+{
+  const state = await testing.async();
+  const canvas = document.createElement('canvas');
+  canvas.width = 0;
+  canvas.toBlob((blob) => state.resolve(blob));
+  await state.done((blob) => {
+    testing.expectEqual(null, blob);
+  });
+}
+</script>
+
+<script id=toBlob_captures_real_pixels_before_callback type=module>
+{
+  const state = await testing.async();
+  const canvas = document.createElement('canvas'); canvas.width = 17; canvas.height = 9;
+  canvas.getContext('2d').fillRect(0, 0, 17, 9);
+  canvas.toBlob(async blob => {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const view = new DataView(bytes.buffer);
+    state.resolve({signature:Array.from(bytes.subarray(0,8)).join(),width:view.getUint32(16),height:view.getUint32(20)});
+  });
+  canvas.width = 4;
+  await state.done(result => {
+    testing.expectEqual('137,80,78,71,13,10,26,10',result.signature);
+    testing.expectEqual(17,result.width);testing.expectEqual(9,result.height);
+  });
+}
+</script>

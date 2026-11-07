@@ -1,0 +1,2237 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const Node = @import("../Node.zig");
+const Attribute = @import("../element/Attribute.zig");
+
+const Selector = @import("Selector.zig");
+
+const Part = Selector.Part;
+const Segment = Selector.Segment;
+const Combinator = Selector.Combinator;
+const Allocator = std.mem.Allocator;
+
+const Parser = @This();
+
+input: []const u8,
+
+// need an explicit error set because the function is recursive
+const ParseError = error{
+    OutOfMemory,
+    InvalidIDSelector,
+    InvalidClassSelector,
+    InvalidAttributeSelector,
+    InvalidPseudoClass,
+    InvalidNthPattern,
+    UnknownPseudoClass,
+    InvalidTagSelector,
+    InvalidSelector,
+    StringTooLarge,
+};
+
+// CSS Syntax preprocessing: normalize line endings (CRLF → LF, CR → LF)
+// https://drafts.csswg.org/css-syntax/#input-preprocessing
+fn preprocessInput(arena: Allocator, input: []const u8) ![]const u8 {
+    var i = std.mem.findScalar(u8, input, '\r') orelse return input;
+
+    var result = try std.ArrayList(u8).initCapacity(arena, input.len);
+    result.appendSliceAssumeCapacity(input[0..i]);
+
+    while (i < input.len) {
+        const c = input[i];
+        if (c == '\r') {
+            result.appendAssumeCapacity('\n');
+            i += 1;
+            if (i < input.len and input[i] == '\n') {
+                i += 1;
+            }
+        } else {
+            result.appendAssumeCapacity(c);
+            i += 1;
+        }
+    }
+
+    return result.items;
+}
+
+pub fn parseList(arena: Allocator, input: []const u8) ParseError![]const Selector.Selector {
+    // Preprocess input to normalize line endings
+    const preprocessed = try preprocessInput(arena, input);
+
+    var selectors: std.ArrayList(Selector.Selector) = .empty;
+
+    var remaining = preprocessed;
+    while (true) {
+        const trimmed = std.mem.trimStart(u8, remaining, &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            // Either an empty selector or a dangling comma ("div,"): both are
+            // parse errors per the selector-list grammar.
+            return error.InvalidSelector;
+        }
+
+        var comma_pos: usize = trimmed.len;
+        var depth: usize = 0;
+        var in_quote: u8 = 0; // 0 = not in quotes, '"' or '\'' = in that quote type
+        var i: usize = 0;
+        while (i < trimmed.len) {
+            const c = trimmed[i];
+            if (in_quote != 0) {
+                // Inside a quoted string
+                if (c == '\\') {
+                    // Skip escape sequence inside quotes
+                    i += 1;
+                    if (i < trimmed.len) i += 1;
+                } else if (c == in_quote) {
+                    // Closing quote
+                    in_quote = 0;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            switch (c) {
+                '\\' => {
+                    // Skip escape sequence (backslash + next character)
+                    i += 1;
+                    if (i < trimmed.len) i += 1;
+                },
+                '"', '\'' => {
+                    in_quote = c;
+                    i += 1;
+                },
+                '(' => {
+                    depth += 1;
+                    i += 1;
+                },
+                ')' => {
+                    if (depth > 0) depth -= 1;
+                    i += 1;
+                },
+                ',' => {
+                    if (depth == 0) {
+                        comma_pos = i;
+                        break;
+                    }
+                    i += 1;
+                },
+                else => {
+                    i += 1;
+                },
+            }
+        }
+
+        const selector_input = std.mem.trimEnd(u8, trimmed[0..comma_pos], &std.ascii.whitespace);
+
+        if (selector_input.len == 0) {
+            // An empty segment between commas (",div") is a parse error.
+            return error.InvalidSelector;
+        }
+        const selector = try parse(arena, selector_input);
+        try selectors.append(arena, selector);
+
+        if (comma_pos >= trimmed.len) break;
+        remaining = trimmed[comma_pos + 1 ..];
+    }
+
+    if (selectors.items.len == 0) {
+        return error.InvalidSelector;
+    }
+
+    return selectors.items;
+}
+
+fn parse(arena: Allocator, input: []const u8) ParseError!Selector.Selector {
+    var parser = Parser{ .input = input };
+    const first = try parser.parseCompound(arena);
+
+    var segments: std.ArrayList(Segment) = .empty;
+    while (parser.skipSpaces()) {
+        const combinator = parser.parseCombinator();
+        try segments.append(arena, .{
+            .combinator = combinator,
+            .compound = try parser.parseCompound(arena),
+        });
+    }
+
+    return .{ .first = first, .segments = segments.items };
+}
+
+// Parts written with no whitespace between them ("div.a#b") form a compound.
+fn parseCompound(self: *Parser, arena: Allocator) ParseError!Selector.Compound {
+    _ = self.skipSpaces();
+    var parts: std.ArrayList(Part) = .empty;
+    while (true) {
+        try parts.append(arena, try self.parsePart(arena));
+        if (!isStartOfPart(self.peek())) break;
+    }
+    return .{ .parts = parts.items };
+}
+
+// Whitespace alone, already skipped by the caller, is a descendant combinator.
+fn parseCombinator(self: *Parser) Combinator {
+    const c: Combinator = switch (self.peek()) {
+        '>' => .child,
+        '+' => .next_sibling,
+        '~' => .subsequent_sibling,
+        else => return .descendant,
+    };
+    self.input = self.input[1..];
+    return c;
+}
+
+// :has() arguments are relative selectors. Absolutize them at parse time by
+// prepending a :scope anchor, e.g. ":has(~ .a .b)" is stored as
+// ":scope ~ .a .b". Matching then reuses the regular segment walk, binding
+// :scope to the element :has() is evaluated against.
+// https://drafts.csswg.org/selectors-4/#absolutizing
+const scope_anchor = [_]Part{.{ .pseudo_class = .scope }};
+
+fn absolutize(arena: Allocator, selector: Selector.Selector, combinator: Combinator) !Selector.Selector {
+    const segments = try arena.alloc(Segment, selector.segments.len + 1);
+    segments[0] = .{ .combinator = combinator, .compound = selector.first };
+    @memcpy(segments[1..], selector.segments);
+
+    return .{
+        .first = .{ .parts = &scope_anchor },
+        .segments = segments,
+    };
+}
+
+fn parsePart(self: *Parser, arena: Allocator) !Part {
+    return switch (self.peek()) {
+        '#' => .{ .id = try self.id(arena) },
+        '.' => .{ .class = try self.class(arena) },
+        '*' => blk: {
+            self.input = self.input[1..];
+            break :blk .universal;
+        },
+        '[' => .{ .attribute = try self.attribute(arena) },
+        ':' => if (self.isPseudoElementStart()) blk: {
+            try self.pseudoElement();
+            break :blk .pseudo_element;
+        } else .{ .pseudo_class = try self.pseudoClass(arena) },
+        'a'...'z', 'A'...'Z', '_', '\\', 0x80...0xFF => blk: {
+            // Use parseIdentifier for full escape support
+            const tag_name = try self.parseIdentifier(arena, error.InvalidTagSelector);
+            if (tag_name.len > 256) {
+                return error.InvalidTagSelector;
+            }
+            var buf: [256]u8 = undefined;
+            // Try to match as a known tag enum for optimization
+            const lower = std.ascii.lowerString(&buf, tag_name);
+            if (Node.Element.Tag.parseForMatch(lower)) |known_tag| {
+                break :blk .{ .tag = known_tag };
+            }
+            // Store lowercased for fast comparison
+            const lower_tag = try arena.dupe(u8, lower);
+            break :blk .{ .tag_name = lower_tag };
+        },
+        else => error.InvalidSelector,
+    };
+}
+
+fn isStartOfPart(c: u8) bool {
+    return switch (c) {
+        '#', '.', '*', '[', ':', 'a'...'z', 'A'...'Z', '_' => true,
+        else => false,
+    };
+}
+
+// Returns true if there's more input after trimming whitespace
+fn skipSpaces(self: *Parser) bool {
+    const trimmed = std.mem.trimStart(u8, self.input, &std.ascii.whitespace);
+    self.input = trimmed;
+    return trimmed.len > 0;
+}
+
+// Returns true if whitespace was actually removed
+fn skipSpacesConsumed(self: *Parser) bool {
+    const original_len = self.input.len;
+    const trimmed = std.mem.trimStart(u8, self.input, &std.ascii.whitespace);
+    self.input = trimmed;
+    return trimmed.len < original_len;
+}
+
+fn peek(self: *const Parser) u8 {
+    const input = self.input;
+    if (input.len == 0) {
+        return 0;
+    }
+    return input[0];
+}
+
+fn consumeUntilCommaOrParen(self: *Parser) []const u8 {
+    const input = self.input;
+    var depth: usize = 0;
+    var i: usize = 0;
+
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        switch (c) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            ',' => {
+                if (depth == 0) break;
+            },
+            else => {},
+        }
+    }
+
+    const result = input[0..i];
+    self.input = input[i..];
+    return result;
+}
+
+const pseudo_elements = [_][]const u8{
+    "after",         "backdrop",            "before",          "checkmark",
+    "column",        "cue",                 "details-content", "file-selector-button",
+    "first-letter",  "first-line",          "grammar-error",   "interest-button",
+    "marker",        "permission-icon",     "picker-icon",     "placeholder",
+    "scroll-marker", "scroll-marker-group", "search-text",     "select-listbox",
+    "selection",     "spelling-error",      "target-text",     "view-transition",
+};
+const functional_pseudo_elements = [_][]const u8{
+    "cue",                            "highlight",                  "part",
+    "picker",                         "slotted",                    "view-transition-group",
+    "view-transition-group-children", "view-transition-image-pair", "view-transition-new",
+    "view-transition-old",
+};
+// Any other -webkit- name is an unknown, valid pseudo-element.
+const webkit_pseudo_classes = [_][]const u8{
+    "-webkit-any-link",        "-webkit-autofill",    "-webkit-drag",
+    "-webkit-full-page-media", "-webkit-full-screen", "-webkit-full-screen-ancestor",
+};
+const legacy_pseudo_elements = [_][]const u8{ "before", "after", "first-line", "first-letter" };
+
+fn isPseudoElementStart(self: *const Parser) bool {
+    const input = self.input;
+    if (std.mem.startsWith(u8, input, "::")) return true;
+    if (self.peek() != ':') return false;
+    const name = pseudoName(input[1..]);
+    const rest = input[1 + name.len ..];
+    return inList(name, &legacy_pseudo_elements) and !std.mem.startsWith(u8, rest, "(");
+}
+
+fn pseudoName(input: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < input.len and (std.ascii.isAlphanumeric(input[i]) or input[i] == '-' or input[i] == '_')) : (i += 1) {}
+    return input[0..i];
+}
+
+fn inList(name: []const u8, list: []const []const u8) bool {
+    for (list) |entry| {
+        if (std.ascii.eqlIgnoreCase(name, entry)) return true;
+    }
+    return false;
+}
+
+fn pseudoElement(self: *Parser) !void {
+    var current = try self.onePseudoElement();
+    while (self.peek() == ':') {
+        if (self.isPseudoElementStart()) {
+            const next = try self.onePseudoElement();
+            if (!current.allowsPseudoElement(next)) return error.InvalidSelector;
+            current = next;
+            continue;
+        }
+        self.input = self.input[1..];
+        const name = pseudoName(self.input);
+        self.input = self.input[name.len..];
+        if (self.peek() == '(') {
+            const args = try self.arguments();
+            const forgiving = (std.ascii.eqlIgnoreCase(name, "is") or std.ascii.eqlIgnoreCase(name, "where")) and
+                !current.is("column") and !current.is("slotted");
+            if (!forgiving and (args.len == 0 or !current.allowsFunctionalPseudoClass(name))) {
+                return error.InvalidSelector;
+            }
+        } else if (!current.allowsPseudoClass(name)) {
+            return error.InvalidSelector;
+        }
+    }
+    if (self.skipSpaces()) return error.InvalidSelector;
+}
+
+fn isUnknownWebkit(name: []const u8) bool {
+    return name.len > "-webkit-".len and std.ascii.startsWithIgnoreCase(name, "-webkit-") and
+        !inList(name, &webkit_pseudo_classes);
+}
+
+const tree_abiding_pseudo_elements = [_][]const u8{
+    "after",                          "backdrop",                   "before",
+    "checkmark",                      "details-content",            "file-selector-button",
+    "interest-button",                "marker",                     "permission-icon",
+    "picker",                         "picker-icon",                "placeholder",
+    "select-listbox",                 "view-transition",            "view-transition-group",
+    "view-transition-group-children", "view-transition-image-pair", "view-transition-new",
+    "view-transition-old",
+};
+const element_backed_pseudo_elements = [_][]const u8{ "part", "details-content", "select-listbox", "permission-icon", "picker" };
+const scrollbar_pseudo_elements = [_][]const u8{
+    "-webkit-resizer",         "-webkit-scrollbar",       "-webkit-scrollbar-button",      "-webkit-scrollbar-corner",
+    "-webkit-scrollbar-thumb", "-webkit-scrollbar-track", "-webkit-scrollbar-track-piece",
+};
+const user_action_pseudo_classes = [_][]const u8{ "active", "focus", "focus-visible", "focus-within", "hover" };
+const scrollbar_pseudo_classes = [_][]const u8{
+    "active",    "corner-present", "decrement",  "disabled", "double-button",
+    "enabled",   "end",            "horizontal", "hover",    "increment",
+    "no-button", "single-button",  "start",      "vertical", "window-inactive",
+};
+const after_part_pseudo_classes = webkit_pseudo_classes ++ [_][]const u8{
+    "active",            "active-view-transition",
+    "any-link",          "autofill",
+    "checked",           "default",
+    "defined",           "disabled",
+    "enabled",           "focus",
+    "focus-visible",     "focus-within",
+    "fullscreen",        "future",
+    "granted",           "hover",
+    "in-range",          "indeterminate",
+    "interest-source",   "interest-target",
+    "invalid",           "link",
+    "modal",             "open",
+    "optional",          "out-of-range",
+    "past",              "picture-in-picture",
+    "placeholder-shown", "popover-open",
+    "read-only",         "read-write",
+    "required",          "target",
+    "target-after",      "target-before",
+    "target-current",    "unbounded",
+    "user-invalid",      "user-valid",
+    "valid",             "visited",
+    "window-inactive",   "xr-overlay",
+};
+const after_part_functional_pseudo_classes = [_][]const u8{ "active-view-transition-type", "dir", "lang", "state" };
+
+const PseudoElement = struct {
+    name: []const u8,
+    functional: bool,
+
+    fn is(self: PseudoElement, name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(self.name, name);
+    }
+
+    fn isElementBacked(self: PseudoElement) bool {
+        return inList(self.name, &element_backed_pseudo_elements);
+    }
+
+    fn allowsPseudoElement(self: PseudoElement, next: PseudoElement) bool {
+        if (self.isElementBacked()) return !next.is("part") and !next.is("slotted") and !(next.is("cue") and next.functional);
+        if (self.is("slotted")) return inList(next.name, &tree_abiding_pseudo_elements);
+        if (self.is("before") or self.is("after")) return next.is("marker");
+        if (self.is("column")) return next.is("scroll-marker");
+        return false;
+    }
+
+    fn allowsFunctionalPseudoClass(self: PseudoElement, name: []const u8) bool {
+        return self.isElementBacked() and inList(name, &after_part_functional_pseudo_classes);
+    }
+
+    fn allowsPseudoClass(self: PseudoElement, name: []const u8) bool {
+        if (self.isElementBacked()) return inList(name, &after_part_pseudo_classes);
+        if (inList(self.name, &scrollbar_pseudo_elements)) return inList(name, &scrollbar_pseudo_classes);
+        if (self.is("file-selector-button") or (self.is("cue") and !self.functional) or isUnknownWebkit(self.name)) {
+            return inList(name, &user_action_pseudo_classes);
+        }
+        if (self.is("selection")) return std.ascii.eqlIgnoreCase(name, "window-inactive");
+        if (std.ascii.startsWithIgnoreCase(self.name, "view-transition-")) {
+            return std.ascii.eqlIgnoreCase(name, "only-child");
+        }
+        if (self.is("search-text")) return std.ascii.eqlIgnoreCase(name, "current");
+        if (self.is("scroll-marker")) {
+            return inList(name, &user_action_pseudo_classes) or inList(name, &.{ "target-current", "target-before", "target-after" });
+        }
+        if (self.is("scroll-marker-group")) return inList(name, &.{ "hover", "focus-within" });
+        return false;
+    }
+};
+
+fn arguments(self: *Parser) ![]const u8 {
+    const input = self.input[1..];
+    var depth: usize = 0;
+    for (input, 0..) |c, i| switch (c) {
+        '(' => depth += 1,
+        ')' => {
+            if (depth == 0) {
+                self.input = input[i + 1 ..];
+                return std.mem.trim(u8, input[0..i], &std.ascii.whitespace);
+            }
+            depth -= 1;
+        },
+        else => {},
+    };
+    return error.InvalidSelector;
+}
+
+fn onePseudoElement(self: *Parser) !PseudoElement {
+    const double = std.mem.startsWith(u8, self.input, "::");
+    self.input = self.input[if (double) 2 else 1..];
+    const name = pseudoName(self.input);
+    self.input = self.input[name.len..];
+
+    if (!double) {
+        return .{ .name = name, .functional = false };
+    }
+    if (self.peek() == '(') {
+        if (!inList(name, &functional_pseudo_elements)) return error.InvalidSelector;
+        const args = try self.arguments();
+        if (args.len == 0) return error.InvalidSelector;
+        if (std.ascii.eqlIgnoreCase(name, "picker") and !std.ascii.eqlIgnoreCase(args, "select")) {
+            return error.InvalidSelector;
+        }
+        return .{ .name = name, .functional = true };
+    }
+    if (!inList(name, &pseudo_elements) and !isUnknownWebkit(name)) {
+        return error.InvalidSelector;
+    }
+    return .{ .name = name, .functional = false };
+}
+
+fn pseudoClass(self: *Parser, arena: Allocator) !Selector.PseudoClass {
+    if (comptime lp.IS_DEBUG) {
+        // Should have been verified by caller
+        std.debug.assert(self.peek() == ':');
+    }
+
+    self.input = self.input[1..];
+
+    const name = pseudoName(self.input);
+    if (name.len == 0) {
+        return error.InvalidPseudoClass;
+    }
+    self.input = self.input[name.len..];
+
+    const next = self.peek();
+
+    // Check for functional pseudo-classes like :nth-child(2n+1) or :not(...)
+    if (next == '(') {
+        self.input = self.input[1..]; // Skip '('
+
+        if (std.mem.eql(u8, name, "nth-child")) {
+            const pattern = try self.parseNthPattern();
+            const of = try self.parseNthOf(arena);
+            _ = self.skipSpaces();
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..];
+            if (of) |selectors| return .{ .nth_child_of = .{ .pattern = pattern, .selectors = selectors } };
+            return .{ .nth_child = pattern };
+        }
+
+        if (std.mem.eql(u8, name, "nth-last-child")) {
+            const pattern = try self.parseNthPattern();
+            const of = try self.parseNthOf(arena);
+            _ = self.skipSpaces();
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..];
+            if (of) |selectors| return .{ .nth_last_child_of = .{ .pattern = pattern, .selectors = selectors } };
+            return .{ .nth_last_child = pattern };
+        }
+
+        if (std.mem.eql(u8, name, "nth-of-type")) {
+            const pattern = try self.parseNthPattern();
+            _ = self.skipSpaces();
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..];
+            return .{ .nth_of_type = pattern };
+        }
+
+        if (std.mem.eql(u8, name, "nth-last-of-type")) {
+            const pattern = try self.parseNthPattern();
+            _ = self.skipSpaces();
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..];
+            return .{ .nth_last_of_type = pattern };
+        }
+
+        if (std.mem.eql(u8, name, "not")) {
+            // CSS Level 4: :not() can contain a full selector list (comma-separated selectors)
+            // e.g., :not(div, .class, #id > span)
+            var selectors: std.ArrayList(Selector.Selector) = .empty;
+
+            _ = self.skipSpaces();
+
+            // Parse comma-separated selectors
+            while (true) {
+                if (self.peek() == ')') break;
+                if (self.peek() == 0) return error.InvalidPseudoClass;
+
+                // Parse a full selector (with potential combinators and compounds)
+                const selector = try parse(arena, self.consumeUntilCommaOrParen());
+                if (selector.hasPseudoElement()) return error.InvalidPseudoClass;
+                try selectors.append(arena, selector);
+
+                _ = self.skipSpaces();
+                if (self.peek() == ',') {
+                    self.input = self.input[1..]; // Skip comma
+                    _ = self.skipSpaces();
+                    continue;
+                }
+                break;
+            }
+
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..]; // Skip ')'
+
+            if (selectors.items.len == 0) return error.InvalidPseudoClass;
+            return .{ .not = selectors.items };
+        }
+
+        if (std.mem.eql(u8, name, "is")) {
+            var selectors: std.ArrayList(Selector.Selector) = .empty;
+
+            _ = self.skipSpaces();
+            while (true) {
+                if (self.peek() == ')') break;
+                if (self.peek() == 0) return error.InvalidPseudoClass;
+
+                const selector = try parse(arena, self.consumeUntilCommaOrParen());
+                // Invalid here, so the forgiving list drops it.
+                if (!selector.hasPseudoElement()) try selectors.append(arena, selector);
+
+                _ = self.skipSpaces();
+                if (self.peek() == ',') {
+                    self.input = self.input[1..];
+                    _ = self.skipSpaces();
+                    continue;
+                }
+                break;
+            }
+
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..];
+
+            // Empty :is() is valid per spec - matches nothing
+            return .{ .is = selectors.items };
+        }
+
+        if (std.mem.eql(u8, name, "where")) {
+            var selectors: std.ArrayList(Selector.Selector) = .empty;
+
+            _ = self.skipSpaces();
+            while (true) {
+                if (self.peek() == ')') break;
+                if (self.peek() == 0) return error.InvalidPseudoClass;
+
+                const selector = try parse(arena, self.consumeUntilCommaOrParen());
+                if (!selector.hasPseudoElement()) try selectors.append(arena, selector);
+
+                _ = self.skipSpaces();
+                if (self.peek() == ',') {
+                    self.input = self.input[1..];
+                    _ = self.skipSpaces();
+                    continue;
+                }
+                break;
+            }
+
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..];
+
+            // Empty :where() is valid per spec - matches nothing
+            return .{ .where = selectors.items };
+        }
+
+        if (std.mem.eql(u8, name, "has")) {
+            var selectors: std.ArrayList(Selector.Selector) = .empty;
+
+            _ = self.skipSpaces();
+            while (true) {
+                if (self.peek() == ')') break;
+                if (self.peek() == 0) return error.InvalidPseudoClass;
+
+                // :has() takes a <relative-selector-list>: each argument may
+                // start with an explicit combinator (":has(> div)", ":has(~ p)")
+                // and is anchored at the element being matched, with an implied
+                // descendant combinator when none is written.
+                // https://drafts.csswg.org/selectors-4/#relational
+                const combinator = self.parseCombinator();
+
+                const selector = try parse(arena, self.consumeUntilCommaOrParen());
+                if (selector.hasPseudoElement()) return error.InvalidPseudoClass;
+                try selectors.append(arena, try absolutize(arena, selector, combinator));
+
+                _ = self.skipSpaces();
+                if (self.peek() == ',') {
+                    self.input = self.input[1..];
+                    _ = self.skipSpaces();
+                    continue;
+                }
+                break;
+            }
+
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..];
+
+            if (selectors.items.len == 0) return error.InvalidPseudoClass;
+            return .{ .has = selectors.items };
+        }
+
+        if (std.mem.eql(u8, name, "lang")) {
+            _ = self.skipSpaces();
+            const lang_start = self.input;
+            var lang_i: usize = 0;
+            while (lang_i < lang_start.len and lang_start[lang_i] != ')') : (lang_i += 1) {}
+            if (lang_i == 0 or self.peek() == 0) return error.InvalidPseudoClass;
+
+            const lang = try arena.dupe(u8, std.mem.trim(u8, lang_start[0..lang_i], &std.ascii.whitespace));
+            self.input = lang_start[lang_i..];
+
+            if (self.peek() != ')') return error.InvalidPseudoClass;
+            self.input = self.input[1..];
+
+            return .{ .lang = lang };
+        }
+
+        return error.UnknownPseudoClass;
+    }
+
+    switch (name.len) {
+        4 => switch (@as(u32, @bitCast(name[0..4].*))) {
+            asUint("root") => return .root,
+            asUint("link") => return .link,
+            else => {},
+        },
+        5 => switch (@as(u40, @bitCast(name[0..5].*))) {
+            asUint("modal") => return .modal,
+            asUint("hover") => return .hover,
+            asUint("focus") => return .focus,
+            asUint("scope") => return .scope,
+            asUint("empty") => return .empty,
+            asUint("valid") => return .valid,
+            else => {},
+        },
+        6 => switch (@as(u48, @bitCast(name[0..6].*))) {
+            asUint("active") => return .active,
+            asUint("target") => return .target,
+            else => {},
+        },
+        7 => switch (@as(u56, @bitCast(name[0..7].*))) {
+            asUint("checked") => return .checked,
+            asUint("visited") => return .visited,
+            asUint("enabled") => return .enabled,
+            asUint("invalid") => return .invalid,
+            asUint("default") => return .default,
+            asUint("defined") => return .defined,
+            else => {},
+        },
+        8 => switch (@as(u64, @bitCast(name[0..8].*))) {
+            asUint("disabled") => return .disabled,
+            asUint("required") => return .required,
+            asUint("optional") => return .optional,
+            asUint("any-link") => return .any_link,
+            asUint("in-range") => return .in_range,
+            else => {},
+        },
+        9 => switch (@as(u72, @bitCast(name[0..9].*))) {
+            asUint("read-only") => return .read_only,
+            else => {},
+        },
+        10 => switch (@as(u80, @bitCast(name[0..10].*))) {
+            asUint("only-child") => return .only_child,
+            asUint("last-child") => return .last_child,
+            asUint("read-write") => return .read_write,
+            else => {},
+        },
+        11 => switch (@as(u88, @bitCast(name[0..11].*))) {
+            asUint("first-child") => return .first_child,
+            else => {},
+        },
+        12 => switch (@as(u96, @bitCast(name[0..12].*))) {
+            asUint("only-of-type") => return .only_of_type,
+            asUint("last-of-type") => return .last_of_type,
+            asUint("focus-within") => return .focus_within,
+            asUint("out-of-range") => return .out_of_range,
+            asUint("popover-open") => return .popover_open,
+            else => {},
+        },
+        13 => switch (@as(u104, @bitCast(name[0..13].*))) {
+            asUint("first-of-type") => return .first_of_type,
+            asUint("focus-visible") => return .focus_visible,
+            asUint("indeterminate") => return .indeterminate,
+            else => {},
+        },
+        17 => switch (@as(u136, @bitCast(name[0..17].*))) {
+            asUint("placeholder-shown") => return .placeholder_shown,
+            else => {},
+        },
+        else => {},
+    }
+
+    return error.UnknownPseudoClass;
+}
+
+// Parses the optional "of S" part of :nth-child() and :nth-last-child()
+fn parseNthOf(self: *Parser, arena: Allocator) !?[]const Selector.Selector {
+    // "of" needs whitespace before it; parseNthPattern may already have skipped it
+    const spaced = std.ascii.isWhitespace((self.input.ptr - 1)[0]);
+    if (!self.skipSpacesConsumed() and !spaced) {
+        return null;
+    }
+    const input = self.input;
+    if (input.len < 3 or !std.ascii.eqlIgnoreCase(input[0..2], "of")) {
+        return null;
+    }
+    // "of" followed by a name character is a longer identifier, not the keyword
+    const c = input[2];
+    if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '\\' or c >= 0x80) {
+        return null;
+    }
+    self.input = input[2..];
+    _ = self.skipSpaces();
+
+    var selectors: std.ArrayList(Selector.Selector) = .empty;
+    while (true) {
+        if (self.peek() == ')' or self.peek() == 0) return error.InvalidPseudoClass;
+
+        const selector = try parse(arena, self.consumeUntilCommaOrParen());
+        if (selector.hasPseudoElement()) return error.InvalidPseudoClass;
+        try selectors.append(arena, selector);
+
+        _ = self.skipSpaces();
+        if (self.peek() != ',') break;
+        self.input = self.input[1..];
+        _ = self.skipSpaces();
+    }
+    return selectors.items;
+}
+
+fn parseNthPattern(self: *Parser) !Selector.NthPattern {
+    _ = self.skipSpaces();
+
+    const start = self.input;
+
+    // Check for special keywords
+    if (std.mem.startsWith(u8, start, "odd")) {
+        self.input = start[3..];
+        return .{ .a = 2, .b = 1 };
+    }
+
+    if (std.mem.startsWith(u8, start, "even")) {
+        self.input = start[4..];
+        return .{ .a = 2, .b = 0 };
+    }
+
+    // Parse An+B notation
+    var a: i32 = 0;
+    var b: i32 = 0;
+    var has_n = false;
+
+    // Try to parse coefficient 'a'
+    var p = self.peek();
+    const sign_a: i32 = if (p == '-') blk: {
+        self.input = self.input[1..];
+        break :blk -1;
+    } else if (p == '+') blk: {
+        self.input = self.input[1..];
+        break :blk 1;
+    } else 1;
+
+    p = self.peek();
+    if (p == 'n' or p == 'N') {
+        // Just 'n' means a=1
+        a = sign_a;
+        has_n = true;
+        self.input = self.input[1..];
+    } else {
+        // Parse numeric coefficient
+        var num: i32 = 0;
+        var digit_count: usize = 0;
+        p = self.peek();
+        while (std.ascii.isDigit(p)) {
+            num = num * 10 + @as(i32, p - '0');
+            self.input = self.input[1..];
+            digit_count += 1;
+            p = self.peek();
+        }
+
+        if (digit_count > 0) {
+            p = self.peek();
+            if (p == 'n' or p == 'N') {
+                a = sign_a * num;
+                has_n = true;
+                self.input = self.input[1..];
+            } else {
+                // Just a number, no 'n', so this is 'b'
+                b = sign_a * num;
+                return .{ .a = 0, .b = b };
+            }
+        } else if (sign_a != 1) {
+            // We had a sign but no number and no 'n'
+            return error.InvalidNthPattern;
+        }
+    }
+
+    if (!has_n) {
+        return error.InvalidNthPattern;
+    }
+
+    // Parse offset 'b'
+    _ = self.skipSpaces();
+    p = self.peek();
+    if (p == '+' or p == '-') {
+        const sign_b: i32 = if (p == '-') -1 else 1;
+        self.input = self.input[1..];
+        _ = self.skipSpaces();
+
+        var num: i32 = 0;
+        var digit_count: usize = 0;
+        p = self.peek();
+        while (std.ascii.isDigit(p)) {
+            num = num * 10 + @as(i32, p - '0');
+            self.input = self.input[1..];
+            digit_count += 1;
+            p = self.peek();
+        }
+
+        if (digit_count == 0) {
+            return error.InvalidNthPattern;
+        }
+
+        b = sign_b * num;
+    }
+
+    return .{ .a = a, .b = b };
+}
+
+pub fn id(self: *Parser, arena: Allocator) ![]const u8 {
+    if (comptime lp.IS_DEBUG) {
+        // should have been verified by caller
+        std.debug.assert(self.peek() == '#');
+    }
+
+    self.input = self.input[1..]; // Skip '#'
+    return self.parseIdentifier(arena, error.InvalidIDSelector);
+}
+
+fn class(self: *Parser, arena: Allocator) ![]const u8 {
+    if (comptime lp.IS_DEBUG) {
+        // should have been verified by caller
+        std.debug.assert(self.peek() == '.');
+    }
+
+    self.input = self.input[1..]; // Skip '.'
+    return self.parseIdentifier(arena, error.InvalidClassSelector);
+}
+
+// Parse a CSS identifier (used by id and class selectors)
+fn parseIdentifier(self: *Parser, arena: Allocator, err: ParseError) ParseError![]const u8 {
+    const input = self.input;
+
+    if (input.len == 0) {
+        @branchHint(.cold);
+        return err;
+    }
+
+    var i: usize = 0;
+    const first = input[0];
+
+    if (first == '\\' or first == 0) {
+        // First char needs special processing - go straight to slow path
+    } else if (first >= 0x80 or std.ascii.isAlphabetic(first) or first == '_') {
+        // Valid first char
+        i = 1;
+    } else if (first == '-') {
+        // Dash must be followed by dash, letter, underscore, escape, or non-ASCII
+        if (input.len < 2) {
+            @branchHint(.cold);
+            return err;
+        }
+        const second = input[1];
+        if (second == '-' or second == '\\' or std.ascii.isAlphabetic(second) or second == '_' or second >= 0x80) {
+            i = 1; // First char validated, start scanning from position 1
+        } else {
+            @branchHint(.cold);
+            return err;
+        }
+    } else {
+        @branchHint(.cold);
+        return err;
+    }
+
+    // Fast scan remaining characters (no escapes/nulls)
+    while (i < input.len) {
+        const b = input[i];
+
+        if (b == '\\' or b == 0) {
+            // Stop at escape or null - need slow path
+            break;
+        }
+
+        // Check if valid identifier character
+        switch (b) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+            0x80...0xFF => {},
+            ' ', '\t', '\n', '\r', '.', '#', '>', '+', '~', '[', ':', ')', ']' => break,
+            else => {
+                @branchHint(.cold);
+                return err;
+            },
+        }
+        i += 1;
+    }
+
+    // Fast path: no escapes/nulls found
+    if (i == input.len or (i > 0 and input[i] != '\\' and input[i] != 0)) {
+        if (i == 0) {
+            @branchHint(.cold);
+            return err;
+        }
+        self.input = input[i..];
+        return input[0..i];
+    }
+
+    // Slow path: has escapes or nulls
+    return self.consumeEscapedIdentTail(arena, i, err);
+}
+
+// Decode the tail of an <ident-token> that contains escape sequences or null.
+// The caller is expecteed to have already done a "fast path" scan, and
+// `prefix_len` is the part of `self.input` that needs to this "slow path" for
+// decoding
+fn consumeEscapedIdentTail(self: *Parser, arena: Allocator, prefix_len: usize, err: ParseError) ![]const u8 {
+    const input = self.input;
+
+    var result = try std.ArrayList(u8).initCapacity(arena, input.len);
+    result.appendSliceAssumeCapacity(input[0..prefix_len]);
+
+    var j = prefix_len;
+    while (j < input.len) {
+        const b = input[j];
+
+        if (b == '\\') {
+            if (j + 1 < input.len) switch (input[j + 1]) {
+                // Not a valid escape: the ident ends before the backslash.
+                // https://drafts.csswg.org/css-syntax/#starts-with-a-valid-escape
+                '\n', '\r', '\x0C' => break,
+                else => {},
+            };
+            j += 1;
+            const escape_result = try parseEscape(input[j..], arena);
+            try result.appendSlice(arena, escape_result.bytes);
+            j += escape_result.consumed;
+            continue;
+        }
+
+        if (b == 0) {
+            try result.appendSlice(arena, "\u{FFFD}");
+            j += 1;
+            continue;
+        }
+
+        switch (b) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+            0x80...0xFF => {},
+            else => break,
+        }
+        try result.append(arena, b);
+        j += 1;
+    }
+
+    if (result.items.len == 0) {
+        @branchHint(.cold);
+        return err;
+    }
+
+    self.input = input[j..];
+    return result.items;
+}
+
+fn tag(self: *Parser) ![]const u8 {
+    var input = self.input;
+
+    // First character: must be letter, underscore, or non-ASCII (>= 0x80)
+    // Can also be hyphen if not followed by digit or another hyphen
+    const first = input[0];
+    if (first == '-') {
+        if (input.len < 2) {
+            @branchHint(.cold);
+            return error.InvalidTagSelector;
+        }
+        const second = input[1];
+        if (second == '-' or std.ascii.isDigit(second)) {
+            @branchHint(.cold);
+            return error.InvalidTagSelector;
+        }
+    } else if (!std.ascii.isAlphabetic(first) and first != '_' and first < 0x80) {
+        @branchHint(.cold);
+        return error.InvalidTagSelector;
+    }
+
+    var i: usize = 1;
+    for (input[1..]) |b| {
+        switch (b) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+            0x80...0xFF => {}, // non-ASCII characters
+            ' ', '\t', '\n', '\r' => break,
+            // Stop at selector delimiters
+            '.', '#', '>', '+', '~', '[', ':', ')', ']' => break,
+            else => {
+                @branchHint(.cold);
+                return error.InvalidTagSelector;
+            },
+        }
+        i += 1;
+    }
+
+    self.input = input[i..];
+    return input[0..i];
+}
+
+fn attribute(self: *Parser, arena: Allocator) !Selector.Attribute {
+    if (comptime lp.IS_DEBUG) {
+        // should have been verified by caller
+        std.debug.assert(self.peek() == '[');
+    }
+
+    self.input = self.input[1..];
+    _ = self.skipSpaces();
+
+    // Optional namespace component: `*|name` (any namespace) or `|name`
+    // (no namespace). Attributes are stored by qualified name and almost
+    // never namespaced, so both forms match by name.
+    if (self.peek() == '*' and self.input.len > 1 and self.input[1] == '|') {
+        self.input = self.input[2..];
+    } else if (self.peek() == '|' and self.input.len > 1 and self.input[1] != '=') {
+        self.input = self.input[1..];
+    }
+
+    // Kept as-written in original_name for the case-sensitive match on
+    // foreign elements; like the rest of the AST, it borrows the input.
+    const attr_name = try self.attributeName(arena);
+
+    // Normalize the name to lowercase for fast matching (consistent with Attribute.normalizeNameForLookup)
+    const name = if (Attribute.needsLowerCasing(attr_name))
+        try Attribute.normalizeNameForLookupAlloc(arena, .wrap(attr_name))
+    else
+        lp.String.wrap(attr_name);
+
+    _ = self.skipSpaces();
+
+    // Unexpected EOF closes all open constructs per CSS Syntax, so a
+    // dangling `[foo` is a valid presence selector.
+    if (self.peek() == ']' or self.peek() == 0) {
+        if (self.peek() == ']') {
+            self.input = self.input[1..];
+        }
+        return .{
+            .name = name,
+            .matcher = .presence,
+            .original_name = .wrap(attr_name),
+            .value_case = .sensitive,
+        };
+    }
+
+    const matcher_type = try self.attributeMatcher();
+    _ = self.skipSpaces();
+
+    const value = try self.attributeValue(arena);
+    _ = self.skipSpaces();
+
+    // Parse optional case-sensitivity flag
+    var value_case: Selector.AttributeValueCase = if (case_insensitive_html_attributes.has(name.str())) .html_legacy else .sensitive;
+    if (std.ascii.toLower(self.peek()) == 'i') {
+        self.input = self.input[1..];
+        value_case = .insensitive;
+        _ = self.skipSpaces();
+    } else if (std.ascii.toLower(self.peek()) == 's') {
+        // 's' flag means case-sensitive (explicit)
+        self.input = self.input[1..];
+        value_case = .sensitive;
+        _ = self.skipSpaces();
+    }
+
+    // As above, EOF stands in for the closing bracket ([align="center").
+    if (self.peek() == ']') {
+        self.input = self.input[1..];
+    } else if (self.peek() != 0) {
+        return error.InvalidAttributeSelector;
+    }
+
+    const matcher: Selector.AttributeMatcher = switch (matcher_type) {
+        .exact => .{ .exact = value },
+        .word => .{ .word = value },
+        .prefix_dash => .{ .prefix_dash = value },
+        .starts_with => .{ .starts_with = value },
+        .ends_with => .{ .ends_with = value },
+        .substring => .{ .substring = value },
+        .presence => unreachable,
+    };
+
+    return .{
+        .name = name,
+        .matcher = matcher,
+        .original_name = .wrap(attr_name),
+        .value_case = value_case,
+    };
+}
+
+// Attributes whose values match ASCII case-insensitively on HTML elements
+// unless the selector has an `s` flag.
+// https://html.spec.whatwg.org/multipage/semantics-other.html#case-sensitivity-of-selectors
+const case_insensitive_html_attributes = std.StaticStringMap(void).initComptime(.{
+    .{ "accept", {} },
+    .{ "accept-charset", {} },
+    .{ "align", {} },
+    .{ "alink", {} },
+    .{ "axis", {} },
+    .{ "bgcolor", {} },
+    .{ "charset", {} },
+    .{ "checked", {} },
+    .{ "clear", {} },
+    .{ "codetype", {} },
+    .{ "color", {} },
+    .{ "compact", {} },
+    .{ "declare", {} },
+    .{ "defer", {} },
+    .{ "dir", {} },
+    .{ "direction", {} },
+    .{ "disabled", {} },
+    .{ "enctype", {} },
+    .{ "face", {} },
+    .{ "frame", {} },
+    .{ "hreflang", {} },
+    .{ "http-equiv", {} },
+    .{ "lang", {} },
+    .{ "language", {} },
+    .{ "link", {} },
+    .{ "media", {} },
+    .{ "method", {} },
+    .{ "multiple", {} },
+    .{ "nohref", {} },
+    .{ "noresize", {} },
+    .{ "noshade", {} },
+    .{ "nowrap", {} },
+    .{ "readonly", {} },
+    .{ "rel", {} },
+    .{ "rev", {} },
+    .{ "rules", {} },
+    .{ "scope", {} },
+    .{ "scrolling", {} },
+    .{ "selected", {} },
+    .{ "shape", {} },
+    .{ "target", {} },
+    .{ "text", {} },
+    .{ "type", {} },
+    .{ "valign", {} },
+    .{ "valuetype", {} },
+    .{ "vlink", {} },
+});
+
+fn attributeName(self: *Parser, arena: Allocator) ![]const u8 {
+    const input = self.input;
+    if (input.len == 0) {
+        return error.InvalidAttributeSelector;
+    }
+
+    const first = input[0];
+    if (first != '\\' and first != 0 and !std.ascii.isAlphabetic(first) and first != '_' and first < 0x80) {
+        return error.InvalidAttributeSelector;
+    }
+
+    // Fast scan until we hit a character that needs special handling
+    var i: usize = if (first == '\\' or first == 0) 0 else 1;
+    while (i < input.len) : (i += 1) {
+        switch (input[i]) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+            0x80...0xFF => {},
+            else => break,
+        }
+    }
+
+    if (i == input.len or (input[i] != '\\' and input[i] != 0)) {
+        // Fast path fully completed (no escapes/nulls in the name)
+        if (i == 0) {
+            @branchHint(.cold);
+            return error.InvalidAttributeSelector;
+        }
+        self.input = input[i..];
+        return input[0..i];
+    }
+
+    // Slow path: decode escape sequences (and null -> U+FFFD).
+    return self.consumeEscapedIdentTail(arena, i, error.InvalidAttributeSelector);
+}
+
+fn attributeMatcher(self: *Parser) !std.meta.FieldEnum(Selector.AttributeMatcher) {
+    const input = self.input;
+    if (input.len < 2) {
+        return error.InvalidAttributeSelector;
+    }
+
+    if (input[0] == '=') {
+        self.input = input[1..];
+        return .exact;
+    }
+
+    self.input = input[2..];
+    return switch (@as(u16, @bitCast(input[0..2].*))) {
+        asUint("~=") => .word,
+        asUint("|=") => .prefix_dash,
+        asUint("^=") => .starts_with,
+        asUint("$=") => .ends_with,
+        asUint("*=") => .substring,
+        else => return error.InvalidAttributeSelector,
+    };
+}
+
+fn attributeValue(self: *Parser, arena: Allocator) ![]const u8 {
+    const input = self.input;
+    if (input.len == 0) {
+        return error.InvalidAttributeSelector;
+    }
+
+    const quote = input[0];
+    if (quote == '"' or quote == '\'') {
+        // Walk the string respecting backslash escapes per CSS Syntax Level 3 §4.3.5.
+        // Decode \\ \" \' and \<hex digits>, treat \<newline> as a line continuation,
+        // and stop at the matching unescaped closing quote.
+        // https://drafts.csswg.org/css-syntax/#consume-string-token
+        var result = try std.ArrayList(u8).initCapacity(arena, input.len);
+        var i: usize = 1;
+        while (i < input.len and input[i] != quote) {
+            const b = input[i];
+            if (b == '\\') {
+                if (i + 1 >= input.len) {
+                    // Backslash at EOF inside a string is a parse error per spec;
+                    // surface it as a missing closing quote.
+                    return error.InvalidAttributeSelector;
+                }
+                const after = input[i + 1];
+                if (after == '\n') {
+                    // Escaped newline inside a string is a line continuation: drop both.
+                    i += 2;
+                    continue;
+                }
+                const escape = try parseEscape(input[i + 1 ..], arena);
+                try result.appendSlice(arena, escape.bytes);
+                i += 1 + escape.consumed;
+                continue;
+            }
+            if (b == '\n') {
+                // Bare newline terminates a string token (parse error).
+                return error.InvalidAttributeSelector;
+            }
+            try result.append(arena, b);
+            i += 1;
+        }
+        if (i >= input.len) return error.InvalidAttributeSelector;
+        self.input = input[i + 1 ..];
+        return result.items;
+    }
+
+    // An unquoted value is an <ident-token>: [x=1] and [x=-1] are invalid.
+    return self.parseIdentifier(arena, error.InvalidAttributeSelector);
+}
+
+fn asUint(comptime string: anytype) @Int(
+    .unsigned,
+    @bitSizeOf(@TypeOf(string.*)) - 8, // (- 8) to exclude sentinel 0
+) {
+    const byteLength = @sizeOf(@TypeOf(string.*)) - 1;
+    const expectedType = *const [byteLength:0]u8;
+    if (@TypeOf(string) != expectedType) {
+        @compileError("expected : " ++ @typeName(expectedType) ++ ", got: " ++ @typeName(@TypeOf(string)));
+    }
+
+    return @bitCast(@as(*const [byteLength]u8, string).*);
+}
+
+const EscapeResult = struct {
+    bytes: []const u8,
+    consumed: usize, // how many bytes from input were consumed
+};
+
+// Parse CSS escape sequence starting after the backslash
+// Input should point to the character after '\'
+// Returns the UTF-8 bytes for the escaped character and how many input bytes were consumed
+fn parseEscape(input: []const u8, arena: Allocator) !EscapeResult {
+    if (input.len == 0) {
+        // EOF after backslash -> replacement character
+        return .{ .bytes = "\u{FFFD}", .consumed = 0 };
+    }
+
+    const first = input[0];
+
+    // Check if it's a hex escape (1-6 hex digits)
+    if (std.ascii.isHex(first)) {
+        var hex_value: u32 = 0;
+        var i: usize = 0;
+
+        // Parse up to 6 hex digits
+        while (i < 6 and i < input.len) : (i += 1) {
+            const c = input[i];
+            if (!std.ascii.isHex(c)) break;
+
+            const digit = if (c >= '0' and c <= '9')
+                c - '0'
+            else if (c >= 'a' and c <= 'f')
+                c - 'a' + 10
+            else if (c >= 'A' and c <= 'F')
+                c - 'A' + 10
+            else
+                unreachable;
+
+            hex_value = hex_value * 16 + digit;
+        }
+
+        var consumed = i;
+
+        // Consume one optional whitespace character (space, tab, CR, LF, FF)
+        if (i < input.len) {
+            const next = input[i];
+            if (next == ' ' or next == '\t' or next == '\r' or next == '\n' or next == '\x0C') {
+                consumed += 1;
+            }
+        }
+
+        // Validate the code point and convert to UTF-8
+        // Invalid: 0, > 0x10FFFF, or surrogate range 0xD800-0xDFFF
+        if (hex_value == 0 or hex_value > 0x10FFFF or (hex_value >= 0xD800 and hex_value <= 0xDFFF)) {
+            return .{ .bytes = "\u{FFFD}", .consumed = consumed };
+        }
+
+        // Encode as UTF-8
+        var buf = try arena.alloc(u8, 4);
+        const len = std.unicode.utf8Encode(@intCast(hex_value), buf) catch {
+            return .{ .bytes = "\u{FFFD}", .consumed = consumed };
+        };
+        return .{ .bytes = buf[0..len], .consumed = consumed };
+    }
+
+    // Simple escape - just the character itself
+    var buf = try arena.alloc(u8, 1);
+    buf[0] = first;
+    return .{ .bytes = buf, .consumed = 1 };
+}
+
+const testing = @import("../../../testing.zig");
+test "Selector: Parser.ID" {
+    const arena = testing.allocator;
+
+    {
+        var parser = Parser{ .input = "#" };
+        try testing.expectError(error.InvalidIDSelector, parser.id(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "# " };
+        try testing.expectError(error.InvalidIDSelector, parser.id(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "#1" };
+        try testing.expectError(error.InvalidIDSelector, parser.id(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "#9abc" };
+        try testing.expectError(error.InvalidIDSelector, parser.id(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "#-1" };
+        try testing.expectError(error.InvalidIDSelector, parser.id(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "#-5abc" };
+        try testing.expectError(error.InvalidIDSelector, parser.id(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "#--" };
+        try testing.expectEqual("--", try parser.id(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#--test" };
+        try testing.expectEqual("--test", try parser.id(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#-" };
+        try testing.expectError(error.InvalidIDSelector, parser.id(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "#over" };
+        try testing.expectEqual("over", try parser.id(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#myID123" };
+        try testing.expectEqual("myID123", try parser.id(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#_test" };
+        try testing.expectEqual("_test", try parser.id(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#test_123" };
+        try testing.expectEqual("test_123", try parser.id(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#-test" };
+        try testing.expectEqual("-test", try parser.id(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#my-id" };
+        try testing.expectEqual("my-id", try parser.id(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#test other" };
+        try testing.expectEqual("test", try parser.id(arena));
+        try testing.expectEqual(" other", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#id.class" };
+        try testing.expectEqual("id", try parser.id(arena));
+        try testing.expectEqual(".class", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#id:hover" };
+        try testing.expectEqual("id", try parser.id(arena));
+        try testing.expectEqual(":hover", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#id>child" };
+        try testing.expectEqual("id", try parser.id(arena));
+        try testing.expectEqual(">child", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#id[attr]" };
+        try testing.expectEqual("id", try parser.id(arena));
+        try testing.expectEqual("[attr]", parser.input);
+    }
+}
+
+test "Selector: Parser.class" {
+    const arena = testing.allocator;
+
+    {
+        var parser = Parser{ .input = "." };
+        try testing.expectError(error.InvalidClassSelector, parser.class(arena));
+    }
+
+    {
+        var parser = Parser{ .input = ". " };
+        try testing.expectError(error.InvalidClassSelector, parser.class(arena));
+    }
+
+    {
+        var parser = Parser{ .input = ".1" };
+        try testing.expectError(error.InvalidClassSelector, parser.class(arena));
+    }
+
+    {
+        var parser = Parser{ .input = ".9abc" };
+        try testing.expectError(error.InvalidClassSelector, parser.class(arena));
+    }
+
+    {
+        var parser = Parser{ .input = ".-1" };
+        try testing.expectError(error.InvalidClassSelector, parser.class(arena));
+    }
+
+    {
+        var parser = Parser{ .input = ".-5abc" };
+        try testing.expectError(error.InvalidClassSelector, parser.class(arena));
+    }
+
+    {
+        var parser = Parser{ .input = ".--" };
+        try testing.expectEqual("--", try parser.class(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".--test" };
+        try testing.expectEqual("--test", try parser.class(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".-" };
+        try testing.expectError(error.InvalidClassSelector, parser.class(arena));
+    }
+
+    {
+        var parser = Parser{ .input = ".active" };
+        try testing.expectEqual("active", try parser.class(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".myClass123" };
+        try testing.expectEqual("myClass123", try parser.class(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "._test" };
+        try testing.expectEqual("_test", try parser.class(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".test_123" };
+        try testing.expectEqual("test_123", try parser.class(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".-test" };
+        try testing.expectEqual("-test", try parser.class(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".my-class" };
+        try testing.expectEqual("my-class", try parser.class(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".test other" };
+        try testing.expectEqual("test", try parser.class(arena));
+        try testing.expectEqual(" other", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".class1.class2" };
+        try testing.expectEqual("class1", try parser.class(arena));
+        try testing.expectEqual(".class2", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".class:hover" };
+        try testing.expectEqual("class", try parser.class(arena));
+        try testing.expectEqual(":hover", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".class>child" };
+        try testing.expectEqual("class", try parser.class(arena));
+        try testing.expectEqual(">child", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = ".class[attr]" };
+        try testing.expectEqual("class", try parser.class(arena));
+        try testing.expectEqual("[attr]", parser.input);
+    }
+}
+
+test "Selector: Parser.tag" {
+    {
+        var parser = Parser{ .input = "1" };
+        try testing.expectError(error.InvalidTagSelector, parser.tag());
+    }
+
+    {
+        var parser = Parser{ .input = "9abc" };
+        try testing.expectError(error.InvalidTagSelector, parser.tag());
+    }
+
+    {
+        var parser = Parser{ .input = "-1" };
+        try testing.expectError(error.InvalidTagSelector, parser.tag());
+    }
+
+    {
+        var parser = Parser{ .input = "-5abc" };
+        try testing.expectError(error.InvalidTagSelector, parser.tag());
+    }
+
+    {
+        var parser = Parser{ .input = "--" };
+        try testing.expectError(error.InvalidTagSelector, parser.tag());
+    }
+
+    {
+        var parser = Parser{ .input = "--test" };
+        try testing.expectError(error.InvalidTagSelector, parser.tag());
+    }
+
+    {
+        var parser = Parser{ .input = "-" };
+        try testing.expectError(error.InvalidTagSelector, parser.tag());
+    }
+
+    {
+        var parser = Parser{ .input = "div" };
+        try testing.expectEqual("div", try parser.tag());
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "p" };
+        try testing.expectEqual("p", try parser.tag());
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "MyCustomElement" };
+        try testing.expectEqual("MyCustomElement", try parser.tag());
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "_test" };
+        try testing.expectEqual("_test", try parser.tag());
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "test_123" };
+        try testing.expectEqual("test_123", try parser.tag());
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "-test" };
+        try testing.expectEqual("-test", try parser.tag());
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "my-element" };
+        try testing.expectEqual("my-element", try parser.tag());
+        try testing.expectEqual("", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "div other" };
+        try testing.expectEqual("div", try parser.tag());
+        try testing.expectEqual(" other", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "div.class" };
+        try testing.expectEqual("div", try parser.tag());
+        try testing.expectEqual(".class", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "div#id" };
+        try testing.expectEqual("div", try parser.tag());
+        try testing.expectEqual("#id", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "div:hover" };
+        try testing.expectEqual("div", try parser.tag());
+        try testing.expectEqual(":hover", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "div>child" };
+        try testing.expectEqual("div", try parser.tag());
+        try testing.expectEqual(">child", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "div[attr]" };
+        try testing.expectEqual("div", try parser.tag());
+        try testing.expectEqual("[attr]", parser.input);
+    }
+}
+
+test "Selector: Parser.parseNthPattern" {
+    {
+        var parser = Parser{ .input = "odd)" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(2, pattern.a);
+        try testing.expectEqual(1, pattern.b);
+        try testing.expectEqual(")", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "even)" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(2, pattern.a);
+        try testing.expectEqual(0, pattern.b);
+        try testing.expectEqual(")", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "3)" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(0, pattern.a);
+        try testing.expectEqual(3, pattern.b);
+        try testing.expectEqual(")", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "2n)" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(2, pattern.a);
+        try testing.expectEqual(0, pattern.b);
+        try testing.expectEqual(")", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "2n+1)" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(2, pattern.a);
+        try testing.expectEqual(1, pattern.b);
+        try testing.expectEqual(")", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "3n-2)" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(3, pattern.a);
+        try testing.expectEqual(-2, pattern.b);
+        try testing.expectEqual(")", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "n)" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(1, pattern.a);
+        try testing.expectEqual(0, pattern.b);
+        try testing.expectEqual(")", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "-n)" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(-1, pattern.a);
+        try testing.expectEqual(0, pattern.b);
+        try testing.expectEqual(")", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "  2n + 1  )" };
+        const pattern = try parser.parseNthPattern();
+        try testing.expectEqual(2, pattern.a);
+        try testing.expectEqual(1, pattern.b);
+        try testing.expectEqual("  )", parser.input);
+    }
+}
+
+test "Selector: Parser.attributeValue" {
+    const arena = testing.arena_allocator;
+
+    // Unquoted identifier value (unchanged path).
+    {
+        var parser = Parser{ .input = "abc]" };
+        try testing.expectEqual("abc", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Plain double-quoted value with no escapes.
+    {
+        var parser = Parser{ .input = "\"abc\"]" };
+        try testing.expectEqual("abc", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Plain single-quoted value with no escapes.
+    {
+        var parser = Parser{ .input = "'abc']" };
+        try testing.expectEqual("abc", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped backslash inside a double-quoted value: "abc\\def" -> abc\def.
+    {
+        var parser = Parser{ .input = "\"abc\\\\def\"]" };
+        try testing.expectEqual("abc\\def", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped quote inside a double-quoted value: "foo\"bar" -> foo"bar.
+    {
+        var parser = Parser{ .input = "\"foo\\\"bar\"]" };
+        try testing.expectEqual("foo\"bar", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped single quote inside a single-quoted value: 'foo\'bar' -> foo'bar.
+    {
+        var parser = Parser{ .input = "'foo\\'bar']" };
+        try testing.expectEqual("foo'bar", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Hex escape with explicit space terminator: "\41 B" -> "AB" (space is consumed).
+    {
+        var parser = Parser{ .input = "\"\\41 B\"]" };
+        try testing.expectEqual("AB", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Hex escape consumes up to 6 hex digits with no delimiter: "\41B" -> "ƛ" (U+041B).
+    {
+        var parser = Parser{ .input = "\"\\41B\"]" };
+        try testing.expectEqual("\u{041B}", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Hex escape decoding to a multi-byte UTF-8 sequence: "\1F3A8" -> "🎨".
+    {
+        var parser = Parser{ .input = "\"\\1F3A8\"]" };
+        try testing.expectEqual("🎨", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped newline inside a string is a line continuation (drops the newline).
+    {
+        var parser = Parser{ .input = "\"foo\\\nbar\"]" };
+        try testing.expectEqual("foobar", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Missing closing quote.
+    {
+        var parser = Parser{ .input = "\"abc" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeValue(arena));
+    }
+
+    // Unescaped newline inside a string terminates with a parse error.
+    {
+        var parser = Parser{ .input = "\"abc\ndef\"]" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeValue(arena));
+    }
+
+    // Trailing backslash before EOF is a parse error.
+    {
+        var parser = Parser{ .input = "\"abc\\" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeValue(arena));
+    }
+
+    // An unquoted value must start like an ident.
+    for ([_][]const u8{ "1]", "-1]", "-]", "+a]" }) |input| {
+        var parser = Parser{ .input = input };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeValue(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "--1]" };
+        try testing.expectEqual("--1", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // An escaped digit is a valid ident start.
+    {
+        var parser = Parser{ .input = "\\31 ]" };
+        try testing.expectEqual("1", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Unquoted values are idents and may hold escapes: tel\: -> tel:
+    {
+        var parser = Parser{ .input = "tel\\:]" };
+        try testing.expectEqual("tel:", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escape in the middle of an unquoted value.
+    {
+        var parser = Parser{ .input = "a\\:b]" };
+        try testing.expectEqual("a:b", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escape as the first character of an unquoted value.
+    {
+        var parser = Parser{ .input = "\\:a]" };
+        try testing.expectEqual(":a", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Hex escape in an unquoted value consumes its terminating space.
+    {
+        var parser = Parser{ .input = "tel\\3a 1]" };
+        try testing.expectEqual("tel:1", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped ordinary letter decodes to itself.
+    {
+        var parser = Parser{ .input = "te\\l]" };
+        try testing.expectEqual("tel", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Unquoted value stops before a following flag.
+    {
+        var parser = Parser{ .input = "a\\:b i]" };
+        try testing.expectEqual("a:b", try parser.attributeValue(arena));
+        try testing.expectEqual(" i]", parser.input);
+    }
+
+    // A null in an unquoted value is U+FFFD.
+    {
+        var parser = Parser{ .input = "a\x00b]" };
+        try testing.expectEqual("a\u{FFFD}b", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Backslash at EOF in an unquoted value is U+FFFD.
+    {
+        var parser = Parser{ .input = "abc\\" };
+        try testing.expectEqual("abc\u{FFFD}", try parser.attributeValue(arena));
+        try testing.expectEqual("", parser.input);
+    }
+
+    // An unescaped colon still ends the unquoted value.
+    {
+        var parser = Parser{ .input = "a:b]" };
+        try testing.expectEqual("a", try parser.attributeValue(arena));
+        try testing.expectEqual(":b]", parser.input);
+    }
+}
+
+test "Selector: Parser escaped newline ends an identifier" {
+    const arena = testing.arena_allocator;
+
+    // A backslash followed by a newline is not a valid escape: the ident
+    // ends before the backslash.
+    // https://drafts.csswg.org/css-syntax/#starts-with-a-valid-escape
+    {
+        var parser = Parser{ .input = ".a\\\nb" };
+        try testing.expectEqual("a", try parser.class(arena));
+        try testing.expectEqual("\\\nb", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "#a\\\x0Cb" };
+        try testing.expectEqual("a", try parser.id(arena));
+        try testing.expectEqual("\\\x0Cb", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "a\\\nb]" };
+        try testing.expectEqual("a", try parser.attributeName(arena));
+        try testing.expectEqual("\\\nb]", parser.input);
+    }
+
+    {
+        var parser = Parser{ .input = "a\\\rb]" };
+        try testing.expectEqual("a", try parser.attributeValue(arena));
+        try testing.expectEqual("\\\rb]", parser.input);
+    }
+
+    // Nothing before the backslash: no ident at all.
+    {
+        var parser = Parser{ .input = ".\\\nb" };
+        try testing.expectError(error.InvalidClassSelector, parser.class(arena));
+    }
+
+    {
+        var parser = Parser{ .input = "\\\n]" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeValue(arena));
+    }
+
+    // The stray backslash makes the whole selector invalid.
+    const invalid = [_][]const u8{
+        ".a\\\nb",
+        "#a\\\nb",
+        "[a\\\nb]",
+        "[x=a\\\nb]",
+        "[x=a\\\r\nb]",
+        "[x=a\\\x0Cb]",
+    };
+    for (invalid) |input| {
+        if (parseList(arena, input)) |_| {
+            return error.TestExpectedError;
+        } else |_| {}
+    }
+
+    // In a quoted value, a backslash and a newline are a line continuation.
+    {
+        const selectors = try parseList(arena, "[x=\"a\\\nb\"]");
+        try testing.expectEqual(1, selectors.len);
+    }
+}
+
+test "Selector: Parser.attribute unquoted escaped values" {
+    const arena = testing.arena_allocator;
+
+    const cases = [_]struct { []const u8, std.meta.Tag(Selector.AttributeMatcher) }{
+        .{ "[href=tel\\:]", .exact },
+        .{ "[href~=tel\\:]", .word },
+        .{ "[href|=tel\\:]", .prefix_dash },
+        .{ "[href^=tel\\:]", .starts_with },
+        .{ "[href$=tel\\:]", .ends_with },
+        .{ "[href*=tel\\:]", .substring },
+    };
+    for (cases) |case| {
+        var parser = Parser{ .input = case[0] };
+        const attr = try parser.attribute(arena);
+        try testing.expectEqual(case[1], std.meta.activeTag(attr.matcher));
+        const value = switch (attr.matcher) {
+            .presence => unreachable,
+            inline else => |v| v,
+        };
+        try testing.expectEqual("tel:", value);
+        try testing.expectEqual("", parser.input);
+    }
+
+    // An unescaped colon in an unquoted value is still invalid.
+    {
+        var parser = Parser{ .input = "[x=a:b]" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attribute(arena));
+    }
+}
+
+test "Selector: Parser.attributeName" {
+    const arena = testing.arena_allocator;
+
+    // Plain name (fast path).
+    {
+        var parser = Parser{ .input = "ng-app]" };
+        try testing.expectEqual("ng-app", try parser.attributeName(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped colon in the name: [ng\:jq] -> attribute literally named "ng:jq".
+    // AngularJS probes for these during bootstrap; rejecting them aborts the
+    // whole framework. (see workingnomads.com regression)
+    {
+        var parser = Parser{ .input = "ng\\:jq]" };
+        try testing.expectEqual("ng:jq", try parser.attributeName(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escape as the very first character.
+    {
+        var parser = Parser{ .input = "\\:foo]" };
+        try testing.expectEqual(":foo", try parser.attributeName(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Hex escape: [\41 bc] -> "Abc" (space terminates the hex escape).
+    {
+        var parser = Parser{ .input = "\\41 bc]" };
+        try testing.expectEqual("Abc", try parser.attributeName(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Name followed by a matcher stops at the matcher (fast path, no escape).
+    {
+        var parser = Parser{ .input = "data-ng-csp=foo]" };
+        try testing.expectEqual("data-ng-csp", try parser.attributeName(arena));
+        try testing.expectEqual("=foo]", parser.input);
+    }
+
+    // Escaped name followed by a matcher.
+    {
+        var parser = Parser{ .input = "ng\\:csp~=foo]" };
+        try testing.expectEqual("ng:csp", try parser.attributeName(arena));
+        try testing.expectEqual("~=foo]", parser.input);
+    }
+
+    // Invalid first character.
+    {
+        var parser = Parser{ .input = "=foo]" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeName(arena));
+    }
+}
+
+test "Selector: Parser.has" {
+    const arena = testing.arena_allocator;
+
+    // No leading combinator: absolutized with an implied descendant combinator.
+    {
+        const selector = try parse(arena, "div:has(p)");
+        const args = selector.first.parts[1].pseudo_class.has;
+        try testing.expectEqual(1, args.len);
+        try testing.expectEqual(true, args[0].first.parts[0].pseudo_class == .scope);
+        try testing.expectEqual(1, args[0].segments.len);
+        try testing.expectEqual(.descendant, args[0].segments[0].combinator);
+        try testing.expectEqual(.p, args[0].segments[0].compound.parts[0].tag);
+    }
+
+    // Explicit leading combinators.
+    {
+        const selector = try parse(arena, "div:has(> p)");
+        const arg = selector.first.parts[1].pseudo_class.has[0];
+        try testing.expectEqual(true, arg.first.parts[0].pseudo_class == .scope);
+        try testing.expectEqual(.child, arg.segments[0].combinator);
+    }
+
+    {
+        const selector = try parse(arena, "li:has(~ li.active)");
+        const arg = selector.first.parts[1].pseudo_class.has[0];
+        try testing.expectEqual(.subsequent_sibling, arg.segments[0].combinator);
+        try testing.expectEqual(.li, arg.segments[0].compound.parts[0].tag);
+        try testing.expectEqual("active", arg.segments[0].compound.parts[1].class);
+    }
+
+    {
+        const selector = try parse(arena, "span:has(+em)");
+        const arg = selector.first.parts[1].pseudo_class.has[0];
+        try testing.expectEqual(.next_sibling, arg.segments[0].combinator);
+    }
+
+    // The argument's own combinators are preserved after the anchor segment.
+    {
+        const selector = try parse(arena, "div:has(~ p a)");
+        const arg = selector.first.parts[1].pseudo_class.has[0];
+        try testing.expectEqual(2, arg.segments.len);
+        try testing.expectEqual(.subsequent_sibling, arg.segments[0].combinator);
+        try testing.expectEqual(.descendant, arg.segments[1].combinator);
+    }
+
+    // Comma-separated relative selector list.
+    {
+        const selector = try parse(arena, "div:has(> p, ~ a)");
+        const args = selector.first.parts[1].pseudo_class.has;
+        try testing.expectEqual(2, args.len);
+        try testing.expectEqual(.child, args[0].segments[0].combinator);
+        try testing.expectEqual(.subsequent_sibling, args[1].segments[0].combinator);
+    }
+
+    // A combinator with nothing after it is invalid.
+    {
+        try testing.expectError(error.InvalidSelector, parse(arena, "div:has(>)"));
+        try testing.expectError(error.InvalidSelector, parse(arena, "div:has(~ )"));
+    }
+
+    // Empty :has() stays invalid.
+    {
+        try testing.expectError(error.InvalidPseudoClass, parse(arena, "div:has()"));
+    }
+}

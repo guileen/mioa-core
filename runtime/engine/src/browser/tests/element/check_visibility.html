@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<body></body>
+
+<!-
+<script id="inline_display_none">
+  {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    testing.expectEqual(true, el.checkVisibility());
+
+    el.style.display = "none";
+    testing.expectEqual(false, el.checkVisibility());
+
+    el.style.display = "block";
+    testing.expectEqual(true, el.checkVisibility());
+
+    el.remove();
+  }
+</script>
+
+<script id="inline_visibility_hidden">
+  {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+
+    el.style.visibility = "hidden";
+    // Without visibilityProperty option, visibility:hidden is not checked
+    testing.expectEqual(true, el.checkVisibility());
+    // With visibilityProperty: true, visibility:hidden is detected
+    testing.expectEqual(false, el.checkVisibility({ visibilityProperty: true }));
+
+    el.style.visibility = "collapse";
+    testing.expectEqual(false, el.checkVisibility({ visibilityProperty: true }));
+
+    el.style.visibility = "visible";
+    testing.expectEqual(true, el.checkVisibility({ visibilityProperty: true }));
+
+    el.remove();
+  }
+</script>
+
+<script id="inline_opacity_zero">
+  {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+
+    el.style.opacity = "0";
+    // Without checkOpacity option, opacity:0 is not checked
+    testing.expectEqual(true, el.checkVisibility());
+    // With checkOpacity: true, opacity:0 is detected
+    testing.expectEqual(false, el.checkVisibility({ checkOpacity: true }));
+
+    el.style.opacity = "0.5";
+    testing.expectEqual(true, el.checkVisibility({ checkOpacity: true }));
+
+    el.style.opacity = "1";
+    testing.expectEqual(true, el.checkVisibility({ checkOpacity: true }));
+
+    el.remove();
+  }
+</script>
+
+<script id="parent_hidden_hides_child">
+  {
+    const parent = document.createElement("div");
+    const child = document.createElement("span");
+    parent.appendChild(child);
+    document.body.appendChild(parent);
+
+    testing.expectEqual(true, child.checkVisibility());
+
+    // display:none on parent hides children (no option needed)
+    parent.style.display = "none";
+    testing.expectEqual(false, child.checkVisibility());
+
+    // visibility:hidden on parent - needs visibilityProperty option
+    parent.style.display = "block";
+    parent.style.visibility = "hidden";
+    testing.expectEqual(true, child.checkVisibility()); // without option
+    testing.expectEqual(false, child.checkVisibility({ visibilityProperty: true }));
+
+    // opacity:0 on parent - needs checkOpacity option
+    parent.style.visibility = "visible";
+    parent.style.opacity = "0";
+    testing.expectEqual(true, child.checkVisibility()); // without option
+    testing.expectEqual(false, child.checkVisibility({ checkOpacity: true }));
+
+    parent.remove();
+  }
+</script>
+
+<style id="style-basic">
+  .hidden-by-class { display: none; }
+  .visible-by-class { display: block; }
+</style>
+<script id="style_tag_basic">
+  {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+
+    testing.expectEqual(true, el.checkVisibility());
+
+    el.className = "hidden-by-class";
+    testing.expectEqual(false, el.checkVisibility());
+
+    el.className = "visible-by-class";
+    testing.expectEqual(true, el.checkVisibility());
+
+    el.className = "";
+    el.remove();
+  }
+</script>
+
+<style id="style-specificity">
+  .spec-hidden { display: none; }
+  #spec-visible { display: block; }
+</style>
+<script id="specificity_id_beats_class">
+  {
+    const el = document.createElement("div");
+    el.id = "spec-visible";
+    el.className = "spec-hidden";
+    document.body.appendChild(el);
+
+    // ID selector (#spec-visible: display:block) should beat class selector (.spec-hidden: display:none)
+    testing.expectEqual(true, el.checkVisibility());
+
+    el.remove();
+  }
+</script>
+
+<style id="style-order-1">
+  .order-test { display: none; }
+</style>
+<style id="style-order-2">
+  .order-test { display: block; }
+</style>
+<script id="rule_order_later_wins">
+  {
+    const el = document.createElement("div");
+    el.className = "order-test";
+    document.body.appendChild(el);
+
+    // Second style block should win (display: block)
+    testing.expectEqual(true, el.checkVisibility());
+
+    el.remove();
+  }
+</script>
+
+<style id="style-override">
+  .should-be-hidden { display: none; }
+</style>
+<script id="inline_overrides_stylesheet">
+  {
+    const el = document.createElement("div");
+    el.className = "should-be-hidden";
+    document.body.appendChild(el);
+
+    testing.expectEqual(false, el.checkVisibility());
+
+    // Inline style should override
+    el.style.display = "block";
+    testing.expectEqual(true, el.checkVisibility());
+
+    el.remove();
+  }
+</script>
+
+<script id="dynamic_style_element">
+  {
+    const el = document.createElement("div");
+    el.className = "dynamic-style-test";
+    document.body.appendChild(el);
+
+    testing.expectEqual(true, el.checkVisibility());
+
+    // Add a style element
+    const style = document.createElement("style");
+    style.textContent = ".dynamic-style-test { display: none; }";
+    document.head.appendChild(style);
+
+    testing.expectEqual(false, el.checkVisibility());
+
+    // Remove the style element
+    style.remove();
+    testing.expectEqual(true, el.checkVisibility());
+
+    el.remove();
+  }
+</script>
+
+<script id="ua_unrendered_tags_are_display_none">
+  {
+    // Per HTML Rendering §15.3.1 "Hidden elements", these tags get
+    // display:none from the UA stylesheet:
+    //   area, base, datalist, head, link, meta, noscript, param, script,
+    //   source, style, template, title, track
+    // (basefont/noembed/noframes/rp are obsolete and not represented in
+    // Lightpanda's Element.Tag enum.)
+    const tags = [
+      'area', 'base', 'datalist', 'link', 'meta', 'noscript', 'param',
+      'script', 'source', 'style', 'template', 'title', 'track',
+    ];
+    for (const t of tags) {
+      const el = document.createElement(t);
+      document.body.appendChild(el);
+      testing.expectEqual('none', window.getComputedStyle(el).display);
+      testing.expectEqual(false, el.checkVisibility());
+      el.remove();
+    }
+    // <head> itself
+    testing.expectEqual('none', window.getComputedStyle(document.head).display);
+    testing.expectEqual(false, document.head.checkVisibility());
+  }
+</script>
+
+<script id="ua_input_type_hidden_is_display_none">
+  {
+    // input[type="hidden" i] { display: none !important }
+    const inp = document.createElement('input');
+    inp.type = 'hidden';
+    document.body.appendChild(inp);
+    testing.expectEqual('none', window.getComputedStyle(inp).display);
+    testing.expectEqual(false, inp.checkVisibility());
+
+    // Other input types are visible
+    inp.type = 'text';
+    testing.expectEqual(true, inp.checkVisibility());
+
+    // Spec uses [type=hidden i] (case-insensitive)
+    inp.type = 'HIDDEN';
+    testing.expectEqual(false, inp.checkVisibility());
+
+    inp.remove();
+  }
+</script>
+
+<script id="ua_closed_details_hides_non_summary_children">
+  {
+    // details:not([open]) > *:not(summary) { display: none }
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = 'header';
+    const child = document.createElement('p');
+    child.textContent = 'body';
+    details.appendChild(summary);
+    details.appendChild(child);
+    document.body.appendChild(details);
+
+    // Closed: <summary> visible, body child hidden
+    testing.expectEqual(true, summary.checkVisibility());
+    testing.expectEqual(false, child.checkVisibility());
+    testing.expectEqual('none', window.getComputedStyle(child).display);
+
+    // Open: child visible
+    details.setAttribute('open', '');
+    testing.expectEqual(true, child.checkVisibility());
+
+    // Closed again
+    details.removeAttribute('open');
+    testing.expectEqual(false, child.checkVisibility());
+
+    // Descendants of a closed-details child are hidden via the ancestor walk.
+    const grandchild = document.createElement('span');
+    child.appendChild(grandchild);
+    testing.expectEqual(false, grandchild.checkVisibility());
+
+    details.remove();
+  }
+</script>
+
+<script id="ua_closed_dialog_is_hidden">
+  {
+    // dialog:not([open]) { display: none }
+    const dialog = document.createElement('dialog');
+    const child = document.createElement('p');
+    dialog.appendChild(child);
+    document.body.appendChild(dialog);
+
+    testing.expectEqual(false, dialog.checkVisibility());
+    testing.expectEqual(false, child.checkVisibility());
+    testing.expectEqual('none', window.getComputedStyle(dialog).display);
+
+    dialog.show();
+    testing.expectEqual(true, dialog.checkVisibility());
+    testing.expectEqual(true, child.checkVisibility());
+
+    dialog.close();
+    testing.expectEqual(false, dialog.checkVisibility());
+
+    dialog.remove();
+  }
+</script>
+
+<script id="ua_closed_popover_is_hidden">
+  {
+    // [popover]:not(:popover-open):not(dialog[open]) { display: none }
+    const pop = document.createElement('div');
+    pop.setAttribute('popover', '');
+    const child = document.createElement('p');
+    pop.appendChild(child);
+    document.body.appendChild(pop);
+
+    testing.expectEqual(false, pop.checkVisibility());
+    testing.expectEqual(false, child.checkVisibility());
+    testing.expectEqual('none', window.getComputedStyle(pop).display);
+
+    pop.showPopover();
+    testing.expectEqual(true, pop.checkVisibility());
+    testing.expectEqual(true, child.checkVisibility());
+
+    pop.hidePopover();
+    testing.expectEqual(false, pop.checkVisibility());
+
+    // Any popover value counts, and an author `display` still wins over the
+    // UA rule, as for every other UA display:none fallback.
+    pop.setAttribute('popover', 'manual');
+    testing.expectEqual(false, pop.checkVisibility());
+    pop.style.display = 'block';
+    testing.expectEqual(true, pop.checkVisibility());
+
+    // A modal/non-modal <dialog> that is also a popover is shown by [open].
+    const dialog = document.createElement('dialog');
+    dialog.setAttribute('popover', '');
+    document.body.appendChild(dialog);
+    testing.expectEqual(false, dialog.checkVisibility());
+    dialog.show();
+    testing.expectEqual(true, dialog.checkVisibility());
+
+    dialog.close();
+    testing.expectEqual(false, dialog.checkVisibility());
+    // dialog:popover-open { display: block } overrides dialog:not([open]).
+    dialog.showPopover();
+    testing.expectEqual(true, dialog.checkVisibility());
+    dialog.hidePopover();
+    testing.expectEqual(false, dialog.checkVisibility());
+
+    dialog.remove();
+    pop.remove();
+  }
+</script>
+
+<script id="hidden_attribute_propagates_through_check_visibility">
+  {
+    // [hidden] { display: none } applies to the element itself...
+    const parent = document.createElement('div');
+    parent.setAttribute('hidden', '');
+    const child = document.createElement('span');
+    parent.appendChild(child);
+    document.body.appendChild(parent);
+
+    testing.expectEqual(false, parent.checkVisibility());
+    // ...and through ancestor walking, hides descendants too.
+    testing.expectEqual(false, child.checkVisibility());
+
+    parent.remove();
+  }
+</script>
+
+<script id="inline_display_overrides_ua_default">
+  {
+    // Author inline `display: block` on a UA-hidden tag wins per CSS cascade
+    // (inline > UA stylesheet).
+    const s = document.createElement('script');
+    s.style.display = 'block';
+    document.body.appendChild(s);
+    testing.expectEqual(true, s.checkVisibility());
+    s.remove();
+  }
+</script>
+
+<style id="style-author-beats-ua-hidden">
+  .cv-author-flex { display: flex; }
+  .cv-author-none { display: none; }
+</style>
+
+<script id="author_class_display_overrides_hidden_attr">
+  {
+    // Regression: author `.x { display: flex }` must beat UA `[hidden] {
+    // display: none }` per CSS Cascade §6.1 — any normal-origin author rule
+    // wins over UA origin regardless of specificity. Before the fix, the UA
+    // short-circuit in `isElementHidden` fired before the author rule walk,
+    // so `[hidden]` always won regardless of the class rule.
+    const el = document.createElement("div");
+    el.className = "cv-author-flex";
+    el.setAttribute("hidden", "");
+    document.body.appendChild(el);
+
+    testing.expectEqual(true, el.checkVisibility());
+    // Invariant from `StyleManager.zig:329-331`: checkVisibility() and
+    // `getComputedStyle().display === "none"` must agree.
+    testing.expectEqual(true, window.getComputedStyle(el).display !== "none");
+
+    el.remove();
+  }
+</script>
+
+<script id="author_class_display_none_alone_hides">
+  {
+    // Sanity baseline: class display:none alone still hides correctly.
+    const el = document.createElement("div");
+    el.className = "cv-author-none";
+    document.body.appendChild(el);
+
+    testing.expectEqual(false, el.checkVisibility());
+    testing.expectEqual("none", window.getComputedStyle(el).display);
+
+    el.remove();
+  }
+</script>
+
+<script id="author_class_display_none_with_hidden_attr_stays_hidden">
+  {
+    // Both author and UA say hide → still hidden (author wins, but agrees
+    // with UA).
+    const el = document.createElement("div");
+    el.className = "cv-author-none";
+    el.setAttribute("hidden", "");
+    document.body.appendChild(el);
+
+    testing.expectEqual(false, el.checkVisibility());
+    testing.expectEqual("none", window.getComputedStyle(el).display);
+
+    el.remove();
+  }
+</script>
+
+<script id="author_wildcard_overrides_hidden_attr">
+  {
+    // `*` lives in the `other_rules` bucket. Per CSS Cascade §6.1, any author
+    // rule for `display` — even a wildcard — beats UA origin regardless of
+    // specificity. The style is added dynamically and removed at teardown so
+    // the wildcard doesn't leak onto adjacent tests in the file.
+    const style = document.createElement("style");
+    style.textContent = "* { display: block; }";
+    document.head.appendChild(style);
+
+    const el = document.createElement("div");
+    el.setAttribute("hidden", "");
+    document.body.appendChild(el);
+
+    testing.expectEqual(true, el.checkVisibility());
+    testing.expectEqual(true, window.getComputedStyle(el).display !== "none");
+
+    el.remove();
+    style.remove();
+  }
+</script>
+
+<script id="no_author_rule_hidden_attr_still_hides">
+  {
+    // UA `[hidden]` fallback still applies when no author rule for `display`
+    // matched the element. After the fix the UA short-circuit runs AFTER
+    // the author rule walk, gated on `display_priority == 0`.
+    const el = document.createElement("div");
+    el.setAttribute("hidden", "");
+    document.body.appendChild(el);
+
+    testing.expectEqual(false, el.checkVisibility());
+    testing.expectEqual("none", window.getComputedStyle(el).display);
+
+    el.remove();
+  }
+</script>
+
+<script id="inline_display_with_hidden_attr_regression_guard">
+  {
+    // Inline `display` already wins via INLINE_PRIORITY and passed before
+    // the fix; regression guard so future refactors don't break the path.
+    const el = document.createElement("div");
+    el.setAttribute("hidden", "");
+    el.style.display = "flex";
+    document.body.appendChild(el);
+
+    testing.expectEqual(true, el.checkVisibility());
+    testing.expectEqual(true, window.getComputedStyle(el).display !== "none");
+
+    el.remove();
+  }
+</script>
+
+<script id="deep_nesting">
+  {
+    const levels = 5;
+    let current = document.body;
+    const elements = [];
+
+    for (let i = 0; i < levels; i++) {
+      const el = document.createElement("div");
+      current.appendChild(el);
+      elements.push(el);
+      current = el;
+    }
+
+    // All should be visible
+    for (let i = 0; i < levels; i++) {
+      testing.expectEqual(true, elements[i].checkVisibility());
+    }
+
+    // Hide middle element
+    elements[2].style.display = "none";
+
+    // Elements 0, 1 should still be visible
+    testing.expectEqual(true, elements[0].checkVisibility());
+    testing.expectEqual(true, elements[1].checkVisibility());
+
+    // Elements 2, 3, 4 should be hidden
+    testing.expectEqual(false, elements[2].checkVisibility());
+    testing.expectEqual(false, elements[3].checkVisibility());
+    testing.expectEqual(false, elements[4].checkVisibility());
+
+    elements[0].remove();
+  }
+</script>
+
+<style id="style-keyword-case">
+  .hidden-upper { DISPLAY: NONE; }
+  .invisible-upper { Visibility: Hidden; }
+</style>
+<script id="keyword_values_are_case_insensitive">
+  {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+
+    el.setAttribute("style", "display: NONE");
+    testing.expectEqual(false, el.checkVisibility());
+    testing.expectEqual('none', window.getComputedStyle(el).display);
+
+    el.setAttribute("style", "visibility: HIDDEN");
+    testing.expectEqual(true, el.checkVisibility());
+    testing.expectEqual(false, el.checkVisibility({ visibilityProperty: true }));
+
+    el.removeAttribute("style");
+    el.className = "hidden-upper";
+    testing.expectEqual(false, el.checkVisibility());
+
+    el.className = "invisible-upper";
+    testing.expectEqual(true, el.checkVisibility());
+    testing.expectEqual(false, el.checkVisibility({ visibilityProperty: true }));
+
+    el.remove();
+  }
+</script>
+
+<style id="style-memo">
+  .memo-hide { display: none; }
+  .memo-tabs input:checked + span { display: none; }
+  .memo-tabs input:indeterminate + span { display: none; }
+  .memo-form input:invalid + span { display: none; }
+  .memo-form select:invalid + span { display: none; }
+  x-memo:not(:defined) { display: none; }
+  .memo-badge:empty { display: none; }
+</style>
+<script id="memo_attribute_mutations">
+  {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const check = (visible) => {
+      testing.expectEqual(visible, el.checkVisibility());
+      testing.expectEqual(visible ? "block" : "none", getComputedStyle(el).display);
+      testing.expectEqual(visible, el.offsetWidth > 0);
+    };
+
+    check(true);
+    el.hidden = true;
+    check(false);
+    el.hidden = false;
+    check(true);
+
+    el.classList.add("memo-hide");
+    check(false);
+    el.classList.remove("memo-hide");
+    check(true);
+
+    el.style.display = "none";
+    check(false);
+    el.style.display = "";
+    check(true);
+
+    el.setAttribute("style", "display: none");
+    check(false);
+    el.style.cssText = "color: red";
+    check(true);
+
+    el.remove();
+  }
+</script>
+
+<script id="memo_insert_rule">
+  {
+    const el = document.createElement("div");
+    el.className = "memo-dyn";
+    document.body.appendChild(el);
+    testing.expectEqual(true, el.checkVisibility());
+
+    const style = document.createElement("style");
+    document.head.appendChild(style);
+    const index = style.sheet.insertRule(".memo-dyn { display: none }", style.sheet.cssRules.length);
+    testing.expectEqual(false, el.checkVisibility());
+
+    style.sheet.deleteRule(index);
+    testing.expectEqual(true, el.checkVisibility());
+
+    style.remove();
+    el.remove();
+  }
+</script>
+
+<script id="memo_form_state">
+  {
+    const tabs = document.createElement("div");
+    tabs.className = "memo-tabs";
+    tabs.innerHTML = '<input type="checkbox"><span>panel</span>';
+    document.body.appendChild(tabs);
+    const input = tabs.firstChild;
+    const panel = tabs.lastChild;
+
+    testing.expectEqual(true, panel.checkVisibility());
+    input.checked = true;
+    testing.expectEqual(false, panel.checkVisibility());
+    input.click();
+    testing.expectEqual(true, panel.checkVisibility());
+    input.indeterminate = true;
+    testing.expectEqual(false, panel.checkVisibility());
+    input.indeterminate = false;
+    testing.expectEqual(true, panel.checkVisibility());
+
+    const form = document.createElement("div");
+    form.className = "memo-form";
+    form.innerHTML = '<input required><span>a</span><select required><option value="">-</option><option value="x">x</option></select><span>b</span>';
+    document.body.appendChild(form);
+    const [text, a, select, b] = form.childNodes;
+
+    testing.expectEqual(false, a.checkVisibility());
+    text.value = "filled";
+    testing.expectEqual(true, a.checkVisibility());
+    text.value = "";
+    testing.expectEqual(false, a.checkVisibility());
+
+    testing.expectEqual(false, b.checkVisibility());
+    select.value = "x";
+    testing.expectEqual(true, b.checkVisibility());
+    select.selectedIndex = 0;
+    testing.expectEqual(false, b.checkVisibility());
+
+    tabs.remove();
+    form.remove();
+  }
+</script>
+
+<script id="memo_custom_element_defined">
+  {
+    const el = document.createElement("x-memo");
+    document.body.appendChild(el);
+    testing.expectEqual(false, el.checkVisibility());
+    customElements.define("x-memo", class extends HTMLElement {});
+    testing.expectEqual(true, el.checkVisibility());
+    el.remove();
+  }
+</script>
+
+<script id="memo_character_data">
+  {
+    const badge = document.createElement("span");
+    badge.className = "memo-badge";
+    badge.textContent = "3";
+    document.body.appendChild(badge);
+    const text = badge.firstChild;
+
+    testing.expectEqual(true, badge.checkVisibility());
+    text.data = "";
+    testing.expectEqual(false, badge.checkVisibility());
+    text.appendData("4");
+    testing.expectEqual(true, badge.checkVisibility());
+    text.deleteData(0, 1);
+    testing.expectEqual(false, badge.checkVisibility());
+    text.insertData(0, "5");
+    testing.expectEqual(true, badge.checkVisibility());
+
+    badge.remove();
+  }
+</script>
+
+<script id="memo_reparent">
+  {
+    const hidden = document.createElement("div");
+    hidden.style.display = "none";
+    const shown = document.createElement("div");
+    const child = document.createElement("span");
+    document.body.appendChild(hidden);
+    document.body.appendChild(shown);
+
+    shown.appendChild(child);
+    testing.expectEqual(true, child.checkVisibility());
+    hidden.appendChild(child);
+    testing.expectEqual(false, child.checkVisibility());
+    shown.appendChild(child);
+    testing.expectEqual(true, child.checkVisibility());
+
+    // repeat reads hit the memo
+    for (let i = 0; i < 2; i++) {
+      testing.expectEqual(true, child.checkVisibility());
+      testing.expectEqual("block", getComputedStyle(shown).display);
+      testing.expectEqual("none", getComputedStyle(hidden).display);
+    }
+
+    hidden.remove();
+    shown.remove();
+  }
+</script>
+
+<style id="style-insert-rule-layers">
+  @layer base {
+    .layered-hide { display: none; }
+  }
+</style>
+<script id="insert_rule_fast_path_matches_rebuild">
+  {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const first = document.createElement("style");
+    document.head.appendChild(first);
+    const last = document.createElement("style");
+    document.head.appendChild(last);
+
+    // Appends to the last sheet
+    el.className = "ins-a";
+    last.sheet.insertRule(".ins-a { display: none }", last.sheet.cssRules.length);
+    testing.expectEqual(false, el.checkVisibility());
+    last.sheet.insertRule(".ins-a { display: block }", last.sheet.cssRules.length);
+    testing.expectEqual(true, el.checkVisibility());
+    last.sheet.insertRule("div.ins-a { display: none }", last.sheet.cssRules.length);
+    testing.expectEqual(false, el.checkVisibility());
+
+    // An append to an earlier sheet and an insert at index 0 rebuild, and
+    // still lose to the later rule at equal specificity
+    first.sheet.insertRule("div.ins-a { display: block }", first.sheet.cssRules.length);
+    testing.expectEqual(false, el.checkVisibility());
+    last.sheet.insertRule("div.ins-a { display: inline }", 0);
+    testing.expectEqual(false, el.checkVisibility());
+
+    // An unlayered append outranks a layered rule from an earlier sheet
+    el.className = "layered-hide";
+    testing.expectEqual(false, el.checkVisibility());
+    last.sheet.insertRule(".layered-hide { display: block }", last.sheet.cssRules.length);
+    testing.expectEqual(true, el.checkVisibility());
+
+    // Deleting rebuilds
+    last.sheet.deleteRule(last.sheet.cssRules.length - 1);
+    testing.expectEqual(false, el.checkVisibility());
+
+    first.remove();
+    last.remove();
+    el.remove();
+  }
+</script>
+
+<style id="style-important-text">
+  .imp-text { display: none !important; display: block; }
+</style>
+<script id="important_survives_cssrules_materialization">
+  {
+    const el = document.createElement("div");
+    el.className = "imp-text";
+    document.body.appendChild(el);
+    testing.expectEqual(false, el.checkVisibility());
+    // Reading cssRules re-parses the text into rule objects; same cascade.
+    const sheet = document.getElementById("style-important-text").sheet;
+    testing.expectEqual(1, sheet.cssRules.length);
+    testing.expectEqual(false, el.checkVisibility());
+    el.remove();
+  }
+</script>
+
+<script id="memo_focus">
+  {
+    const style = document.createElement("style");
+    style.textContent = "#memo_focus_input:focus + span { display: none; }";
+    document.head.appendChild(style);
+
+    const wrap = document.createElement("div");
+    wrap.innerHTML = '<input id="memo_focus_input"><span>s</span>';
+    document.body.appendChild(wrap);
+    const input = wrap.querySelector("input");
+    const span = wrap.querySelector("span");
+
+    testing.expectEqual(true, span.checkVisibility());
+    input.focus();
+    testing.expectEqual(false, span.checkVisibility());
+    input.blur();
+    testing.expectEqual(true, span.checkVisibility());
+
+    wrap.remove();
+    style.remove();
+  }
+</script>
+
+<script id="memo_checked_rollback">
+  {
+    const style = document.createElement("style");
+    style.textContent = "#memo_checked_input:checked + span { display: none; }";
+    document.head.appendChild(style);
+
+    const wrap = document.createElement("div");
+    wrap.innerHTML = '<input type="checkbox" id="memo_checked_input"><span>s</span>';
+    document.body.appendChild(wrap);
+    const input = wrap.querySelector("input");
+    const span = wrap.querySelector("span");
+
+    let during = null;
+    input.addEventListener("click", (e) => {
+      during = span.checkVisibility();
+      e.preventDefault();
+    });
+
+    testing.expectEqual(true, span.checkVisibility());
+    input.click();
+    // the toggle is visible to listeners, then rolled back by preventDefault
+    testing.expectEqual(false, during);
+    testing.expectEqual(false, input.checked);
+    testing.expectEqual(true, span.checkVisibility());
+
+    wrap.remove();
+    style.remove();
+  }
+</script>
+
+<script id="memo_target">
+  {
+    const style = document.createElement("style");
+    style.textContent = "#memo_target_anchor:target + span { display: none; }";
+    document.head.appendChild(style);
+
+    const wrap = document.createElement("div");
+    wrap.innerHTML = '<div id="memo_target_anchor"></div><span>s</span>';
+    document.body.appendChild(wrap);
+    const span = wrap.querySelector("span");
+
+    testing.expectEqual(true, span.checkVisibility());
+    location.hash = "#memo_target_anchor";
+    testing.expectEqual(false, span.checkVisibility());
+    location.hash = "#memo_target_other";
+    testing.expectEqual(true, span.checkVisibility());
+
+    wrap.remove();
+    style.remove();
+  }
+</script>
+
+<script id="inherits_across_shadow_boundary">
+  {
+    const none = document.createElement("div");
+    none.style.display = "none";
+    document.body.appendChild(none);
+    const button = document.createElement("button");
+    none.attachShadow({ mode: "open" }).appendChild(button);
+    testing.expectEqual(false, button.checkVisibility());
+
+    none.style.display = "block";
+    testing.expectEqual(true, button.checkVisibility());
+
+    const hidden = document.createElement("div");
+    hidden.style.cssText = "visibility: hidden; --c: red; font-size: 30px";
+    document.body.appendChild(hidden);
+    const span = document.createElement("span");
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("x", "2em");
+    const hidden_shadow = hidden.attachShadow({ mode: "open" });
+    hidden_shadow.appendChild(span);
+    hidden_shadow.appendChild(svg);
+    testing.expectEqual(false, span.checkVisibility({ visibilityProperty: true }));
+    testing.expectEqual("hidden", getComputedStyle(span).visibility);
+    testing.expectEqual("red", getComputedStyle(span).getPropertyValue("--c"));
+    testing.expectEqual(60, svg.x.baseVal.value);
+
+    none.remove();
+    hidden.remove();
+  }
+</script>
+
+<script id="slotted_inherits_from_slot">
+  {
+    const host = document.createElement("div");
+    const child = document.createElement("span");
+    host.appendChild(child);
+    document.body.appendChild(host);
+
+    const shadow = host.attachShadow({ mode: "open", slotAssignment: "manual" });
+    shadow.innerHTML = '<slot id="shown"></slot><div style="visibility: hidden"><slot id="hidden"></slot></div>';
+    const shown = shadow.getElementById("shown");
+    const hidden = shadow.getElementById("hidden");
+
+    shown.assign(child);
+    testing.expectEqual(true, child.checkVisibility({ visibilityProperty: true }));
+
+    // Reassigning changes no style or DOM, only the slot it inherits from
+    hidden.assign(child);
+    testing.expectEqual(false, child.checkVisibility({ visibilityProperty: true }));
+    testing.expectEqual("hidden", getComputedStyle(child).visibility);
+
+    host.remove();
+  }
+</script>

@@ -1,0 +1,1068 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("js.zig");
+const WasmStreaming = @import("WasmStreaming.zig");
+const bridge = @import("bridge.zig");
+const reflect = @import("../reflect.zig");
+
+// Not ideal, but its children have special constructor rules (can be extended
+// can't be instantiated). And rather than coming up with a generic definition
+// for this one case, we just hardcode it.
+const HtmlElement = @import("../webapi/element/Html.zig");
+
+const v8 = js.v8;
+const log = lp.log;
+const JsApis = bridge.JsApis;
+const PageJsApis = bridge.PageJsApis;
+const SharedWorkerJsApis = bridge.SharedWorkerJsApis;
+const ServiceWorkerJsApis = bridge.ServiceWorkerJsApis;
+const DedicatedWorkerJsApis = bridge.DedicatedWorkerJsApis;
+
+const Snapshot = @This();
+
+const Caller = @import("Caller.zig");
+
+const Realm = enum {
+    window,
+    worker,
+
+    fn asExposed(comptime self: Realm) Caller.Function.Opts.Exposed {
+        return switch (self) {
+            .window => .window,
+            .worker => .worker,
+        };
+    }
+};
+
+const embedded_snapshot_blob = if (lp.build_config.snapshot_path) |path| @embedFile(path) else "";
+
+// When creating our Snapshot, we use local function templates for every Zig type.
+// You cannot, from what I can tell, create persisted FunctionTemplates at
+// snapshot creation time. But you can embed those templates (or any other v8
+// Data) so that it's available to contexts created from the snapshot. This is
+// the starting index of those function templates, which we can extract. At
+// creation time, in debug, we assert that this is actually a consecutive integer
+// sequence
+data_start: usize,
+
+// The snapshot data (v8.StartupData is a ptr to the data and len).
+startup_data: v8.StartupData,
+
+// V8 doesn't know how to serialize external references, and pretty much any hook
+// into Zig is an external reference (e.g. every accessor and function callback).
+// When we create the snapshot, we give it an array with the address of every
+// external reference. When we load the snapshot, we need to give it the same
+// array with the exact same number of entries in the same order (but, of course
+// cross-process, the value (address) might be different).
+external_references: *const ExternalReferences,
+
+// Track whether this snapshot owns its data (was created in-process)
+// If false, the data points into embedded_snapshot_blob and will not be freed
+owns_data: bool = false,
+
+pub fn load() !Snapshot {
+    if (comptime embedded_snapshot_blob.len > 0) {
+        return loadEmbedded();
+    }
+    return create();
+}
+
+fn loadEmbedded() !Snapshot {
+    // Binary format: [data_start: usize][blob data]
+    const min_size = @sizeOf(usize) + 1000;
+    if (embedded_snapshot_blob.len < min_size) {
+        // our blob should be in the MB, this is just a quick sanity check
+        return error.InvalidSnapshot;
+    }
+
+    const data_start = std.mem.readInt(usize, embedded_snapshot_blob[0..@sizeOf(usize)], .little);
+    const blob = embedded_snapshot_blob[@sizeOf(usize)..];
+
+    const startup_data = v8.StartupData{ .data = blob.ptr, .raw_size = @intCast(blob.len) };
+    if (!v8.v8__StartupData__IsValid(startup_data)) {
+        return error.InvalidSnapshot;
+    }
+
+    return .{
+        .owns_data = false,
+        .data_start = data_start,
+        .startup_data = startup_data,
+        .external_references = collectExternalReferences(),
+    };
+}
+
+pub fn deinit(self: Snapshot) void {
+    // Only free if we own the data (was created in-process)
+    if (self.owns_data) {
+        // V8 allocated this with `new char[]`, so we need to use the C++ delete[] operator
+        v8.v8__StartupData__DELETE(self.startup_data.data);
+    }
+}
+
+pub fn write(self: Snapshot, writer: *std.Io.Writer) !void {
+    if (!self.isValid()) {
+        return error.InvalidSnapshot;
+    }
+
+    try writer.writeInt(usize, self.data_start, .little);
+    try writer.writeAll(self.startup_data.data[0..@intCast(self.startup_data.raw_size)]);
+}
+
+pub fn fromEmbedded(self: Snapshot) bool {
+    // if the snapshot comes from the embedFile, then it'll be flagged as not
+    // owning (aka, not needing to free) the data.
+    return self.owns_data == false;
+}
+
+fn isValid(self: Snapshot) bool {
+    return v8.v8__StartupData__IsValid(self.startup_data);
+}
+
+pub fn create() !Snapshot {
+    const external_references = collectExternalReferences();
+
+    var params: v8.CreateParams = undefined;
+    v8.v8__Isolate__CreateParams__CONSTRUCT(&params);
+    params.array_buffer_allocator = v8.v8__ArrayBuffer__Allocator__NewDefaultAllocator(4 * 1024 * 1024 * 1024);
+    defer v8.v8__ArrayBuffer__Allocator__DELETE(params.array_buffer_allocator.?);
+    params.external_references = external_references;
+
+    const snapshot_creator = v8.v8__SnapshotCreator__CREATE(&params);
+    defer v8.v8__SnapshotCreator__DESTRUCT(snapshot_creator);
+
+    var data_start: usize = 0;
+    const isolate = v8.v8__SnapshotCreator__getIsolate(snapshot_creator).?;
+    defer v8.v8__Isolate__LowMemoryNotification(isolate);
+
+    // WebAssembly.compileStreaming/instantiateStreaming are installed at
+    // context genesis, and only if the isolate has a streaming callback. The
+    // pointer is not serialized; the runtime isolate registers its own.
+    v8.v8__Isolate__SetWasmStreamingCallback(isolate, WasmStreaming.callback);
+
+    {
+        // CreateBlob, which we'll call once everything is setup, MUST NOT
+        // be called from an active HandleScope. Hence we have this scope to
+        // clean it up before we call CreateBlob
+        var handle_scope: v8.HandleScope = undefined;
+        v8.v8__HandleScope__CONSTRUCT(&handle_scope, isolate);
+        defer v8.v8__HandleScope__DESTRUCT(&handle_scope);
+
+        // Create templates for ALL types (JsApis)
+        var templates: [JsApis.len]*const v8.FunctionTemplate = undefined;
+        inline for (JsApis, 0..) |JsApi, i| {
+            @setEvalBranchQuota(10_000);
+            templates[i] = generateConstructor(JsApi, isolate);
+            attachClass(JsApi, false, isolate, templates[i], null);
+        }
+
+        // Set up prototype chains BEFORE attaching properties
+        inline for (JsApis, 0..) |JsApi, i| {
+            if (comptime protoIndexLookup(JsApi)) |proto_index| {
+                v8.v8__FunctionTemplate__Inherit(templates[i], templates[proto_index]);
+            }
+        }
+
+        // Add ALL templates to snapshot (done once, in any context)
+        // We need a context to call AddData, so create a temporary one
+        {
+            const temp_context = v8.v8__Context__New(isolate, null, null);
+            v8.v8__Context__Enter(temp_context);
+            defer v8.v8__Context__Exit(temp_context);
+
+            var last_data_index: usize = 0;
+            inline for (JsApis, 0..) |_, i| {
+                @setEvalBranchQuota(10_000);
+                const data_index = v8.v8__SnapshotCreator__AddData(snapshot_creator, @ptrCast(templates[i]));
+                if (i == 0) {
+                    data_start = data_index;
+                    last_data_index = data_index;
+                } else {
+                    if (data_index != last_data_index + 1) {
+                        return error.InvalidDataIndex;
+                    }
+                    last_data_index = data_index;
+                }
+            }
+
+            // V8 requires a default context. We could probably make this our
+            // Page context, but having both the Page and Worker context be
+            // added via addContext makes things a little more consistent.
+            v8.v8__SnapshotCreator__setDefaultContext(snapshot_creator, temp_context);
+        }
+
+        {
+            const Window = @import("../webapi/Window.zig");
+            const index = try createSnapshotContext(.window, &PageJsApis, Window.JsApi, isolate, snapshot_creator.?, &templates);
+            std.debug.assert(index == 0);
+        }
+
+        {
+            const DedicatedWorkerGlobalScope = @import("../webapi/DedicatedWorkerGlobalScope.zig");
+            const index = try createSnapshotContext(.worker, &DedicatedWorkerJsApis, DedicatedWorkerGlobalScope.JsApi, isolate, snapshot_creator.?, &templates);
+            std.debug.assert(index == 1);
+        }
+
+        {
+            const SharedWorkerGlobalScope = @import("../webapi/SharedWorkerGlobalScope.zig");
+            const index = try createSnapshotContext(.worker, &SharedWorkerJsApis, SharedWorkerGlobalScope.JsApi, isolate, snapshot_creator.?, &templates);
+            std.debug.assert(index == 2);
+        }
+
+        {
+            const ServiceWorkerGlobalScope = @import("../webapi/ServiceWorkerGlobalScope.zig");
+            const index = try createSnapshotContext(.worker, &ServiceWorkerJsApis, ServiceWorkerGlobalScope.JsApi, isolate, snapshot_creator.?, &templates);
+            std.debug.assert(index == 3);
+        }
+    }
+
+    const blob = v8.v8__SnapshotCreator__createBlob(snapshot_creator, v8.kKeep);
+
+    return .{
+        .owns_data = true,
+        .data_start = data_start,
+        .startup_data = blob,
+        .external_references = external_references,
+    };
+}
+
+fn createSnapshotContext(
+    comptime realm: Realm,
+    comptime ContextApis: []const type,
+    comptime GlobalScopeApi: type,
+    isolate: *v8.Isolate,
+    snapshot_creator: *v8.SnapshotCreator,
+    templates: []*const v8.FunctionTemplate,
+) !usize {
+    // Create a global template that inherits from the GlobalScopeApi (Window or WorkerGlobalScope)
+    const global_scope_index = comptime bridge.JsApiLookup.getId(GlobalScopeApi);
+    const js_global = v8.v8__FunctionTemplate__New__DEFAULT(isolate);
+    const class_name = v8.v8__String__NewFromUtf8(isolate, GlobalScopeApi.Meta.name.ptr, v8.kNormal, @intCast(GlobalScopeApi.Meta.name.len));
+    v8.v8__FunctionTemplate__SetClassName(js_global, class_name);
+    v8.v8__FunctionTemplate__Inherit(js_global, templates[global_scope_index]);
+
+    const global_template = v8.v8__FunctionTemplate__InstanceTemplate(js_global).?;
+    v8.v8__ObjectTemplate__SetInternalFieldCount(global_template, comptime countInternalFields(GlobalScopeApi));
+
+    // Set up named/indexed handlers for Window's global object (for named element access like window.myDiv)
+    if (comptime std.mem.eql(u8, GlobalScopeApi.Meta.name, "Window")) {
+        v8.v8__ObjectTemplate__SetNamedHandler(global_template, &.{
+            .getter = bridge.unknownWindowPropertyCallback,
+            .setter = null,
+            .query = null,
+            .deleter = null,
+            .enumerator = null,
+            .definer = null,
+            .descriptor = null,
+            .data = null,
+            .flags = v8.kOnlyInterceptStrings | v8.kNonMasking,
+        });
+        const window_index = @import("../webapi/Window.zig").JsApi.index;
+        v8.v8__ObjectTemplate__SetIndexedHandler(global_template, &.{
+            .getter = window_index.getter,
+            .setter = null,
+            .query = window_index.query,
+            .deleter = null,
+            .enumerator = null,
+            .definer = null,
+            .descriptor = null,
+            .data = null,
+            .flags = 0,
+        });
+    }
+
+    // Re-run attachClass, but specifically targetting the global (Window or WGS)
+    // templates, so that all of these getters/functions which are already defined
+    // on their prototype will now be defined directly on the object.
+    inline for (comptime globalScopeChain(GlobalScopeApi)) |ScopeApi| {
+        // ScopeApi is going to be Window, EventTarget
+        // Or WorkerGlobalState, EventTarget
+        comptime {
+            //
+            if (hasGatedMember(ScopeApi)) {
+                @compileError("[Global] scope interface " ++ @typeName(ScopeApi) ++ " has [Exposed]-gated members. This is not supported");
+            }
+        }
+        const scope_index = comptime bridge.JsApiLookup.getId(ScopeApi);
+        // So we're attaching the Window/EventTarget members (which were already attached
+        // to it's prototype), directly on the global_template.
+        attachClass(ScopeApi, true, isolate, templates[scope_index], global_template);
+    }
+
+    const context = v8.v8__Context__New(isolate, global_template, null);
+    v8.v8__Context__Enter(context);
+    defer v8.v8__Context__Exit(context);
+
+    // Initialize embedder data to null so callbacks can detect snapshot creation
+    v8.v8__Context__SetAlignedPointerInEmbedderData(context, 1, null);
+
+    const global_obj = v8.v8__Context__Global(context);
+
+    // Attach constructors for this context's APIs to the global, and for any
+    // type with members tagged [Exposed=Window]/[Exposed=Worker], prune the
+    // ones that don't match this realm from the per-context Func.prototype.
+    const prototype_key = v8.v8__String__NewFromUtf8(isolate, "prototype", v8.kNormal, 9);
+
+    inline for (ContextApis) |JsApi| {
+        @setEvalBranchQuota(10_000);
+        const template_index = comptime bridge.JsApiLookup.getId(JsApi);
+        const func = v8.v8__FunctionTemplate__GetFunction(templates[template_index], context);
+        if (@hasDecl(JsApi.Meta, "name") and comptime isNamespace(JsApi) == false) {
+            const name = JsApi.Meta.name;
+            const v8_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+            var maybe_result: v8.MaybeBool = undefined;
+            // Web IDL: interface objects on the global are non-enumerable.
+            v8.v8__Object__DefineOwnProperty(global_obj, context, v8_class_name, func, v8.DontEnum, &maybe_result);
+
+            if (@hasDecl(JsApi.Meta, "constructor_alias")) {
+                const alias = JsApi.Meta.constructor_alias;
+                const alias_func = generateLegacyFactoryFunction(JsApi, isolate, templates[template_index], func.?, context.?);
+                const v8_alias_name = v8.v8__String__NewFromUtf8(isolate, alias.ptr, v8.kNormal, @intCast(alias.len));
+                var maybe_alias_result: v8.MaybeBool = undefined;
+                v8.v8__Object__DefineOwnProperty(global_obj, context, v8_alias_name, @ptrCast(alias_func), v8.DontEnum, &maybe_alias_result);
+            }
+        }
+
+        // WebIDL [Exposed=...] gating. Members are installed on the shared
+        // FunctionTemplate by attachClass; here we delete the ones that don't
+        // match this realm from the per-context Func.prototype.
+        if (comptime hasGatedMember(JsApi)) {
+            const func_obj: *const v8.Object = @ptrCast(func);
+            if (v8.v8__Object__Get(func_obj, context, prototype_key)) |proto_handle| {
+                const proto_obj: *const v8.Object = @ptrCast(proto_handle);
+                inline for (@typeInfo(JsApi).@"struct".decl_names) |decl_name| {
+                    const exposed = comptime memberExposed(@field(JsApi, decl_name));
+                    if (comptime exposed != .both and exposed != realm.asExposed()) {
+                        const name: [:0]const u8 = decl_name;
+                        const name_v8 = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+                        var maybe_deleted: v8.MaybeBool = undefined;
+                        v8.v8__Object__Delete(proto_obj, context, name_v8, &maybe_deleted);
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        // Delete built-in console so we can inject our own
+        const console_key = v8.v8__String__NewFromUtf8(isolate, "console", v8.kNormal, 7);
+        var maybe_deleted: v8.MaybeBool = undefined;
+        v8.v8__Object__Delete(global_obj, context, console_key, &maybe_deleted);
+        if (maybe_deleted.value == false) {
+            return error.ConsoleDeleteError;
+        }
+    }
+
+    // Set prototype chains on function objects
+    // https://groups.google.com/g/v8-users/c/qAQQBmbi--8
+    inline for (JsApis, 0..) |JsApi, i| {
+        if (comptime protoIndexLookup(JsApi)) |proto_index| {
+            const proto_func = v8.v8__FunctionTemplate__GetFunction(templates[proto_index], context);
+            const proto_obj: *const v8.Object = @ptrCast(proto_func);
+
+            const self_func = v8.v8__FunctionTemplate__GetFunction(templates[i], context);
+            const self_obj: *const v8.Object = @ptrCast(self_func);
+
+            var maybe_result: v8.MaybeBool = undefined;
+            v8.v8__Object__SetPrototype(self_obj, context, proto_obj, &maybe_result);
+        }
+    }
+
+    {
+        // DOMException prototype setup
+        const code_str = "DOMException.prototype.__proto__ = Error.prototype";
+        const code = v8.v8__String__NewFromUtf8(isolate, code_str.ptr, v8.kNormal, @intCast(code_str.len));
+        const script = v8.v8__Script__Compile(context, code, null) orelse return error.ScriptCompileFailed;
+        _ = v8.v8__Script__Run(script, context) orelse return error.ScriptRunFailed;
+    }
+
+    return v8.v8__SnapshotCreator__AddContext(snapshot_creator, context);
+}
+
+fn hasGatedMember(comptime JsApi: type) bool {
+    comptime {
+        for (@typeInfo(JsApi).@"struct".decl_names) |decl_name| {
+            if (memberExposed(@field(JsApi, decl_name)) != .both) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+fn memberExposed(value: anytype) Caller.Function.Opts.Exposed {
+    const T = @TypeOf(value);
+    if (T == bridge.Accessor or T == bridge.Function) {
+        return value.exposed;
+    }
+    return .both;
+}
+
+fn countExternalReferences() comptime_int {
+    @setEvalBranchQuota(100_000);
+
+    var count: comptime_int = 0;
+
+    // +1 for the illegal constructor callback shared by various types
+    count += 1;
+
+    // +1 for the upgrade constructor shared by built-in element interfaces
+    count += 1;
+
+    // +1 for the noop function shared by various types
+    count += 1;
+
+    // +1 for unknownWindowPropertyCallback used on Window's global template
+    count += 1;
+
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
+
+    inline for (JsApis) |JsApi| {
+        if (@hasDecl(JsApi, "constructor")) {
+            count += 1;
+        }
+
+        if (@hasDecl(JsApi, "callable")) {
+            count += 1;
+        }
+
+        const decl_names = @typeInfo(JsApi).@"struct".decl_names;
+        inline for (decl_names) |decl_name| {
+            const value = @field(JsApi, decl_name);
+            const T = @TypeOf(value);
+            if (T == bridge.Accessor) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+                count += 1;
+                if (value.setter != null) {
+                    count += 1;
+                }
+            } else if (T == bridge.Function) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+                count += 1;
+            } else if (T == bridge.Iterator) {
+                count += 1;
+            } else if (T == bridge.Indexed) {
+                count += 1;
+                if (value.enumerator != null) {
+                    count += 1;
+                }
+                if (value.setter != null) count += 1;
+                if (value.deleter != null) count += 1;
+                if (value.query != null) count += 1;
+                if (value.definer != null) count += 1;
+            } else if (T == bridge.NamedIndexed) {
+                count += 1;
+                if (value.setter != null) count += 1;
+                if (value.deleter != null) count += 1;
+                if (value.query != null) count += 1;
+                if (value.definer != null) count += 1;
+                if (value.descriptor != null) count += 1;
+                if (value.enumerator != null) count += 1;
+            }
+        }
+    }
+
+    if (comptime lp.IS_DEBUG) {
+        inline for (JsApis) |JsApi| {
+            if (!hasNamedIndexedGetter(JsApi)) {
+                count += 1;
+            }
+        }
+    }
+
+    return count + 1; // +1 for null terminator
+}
+
+const ExternalReferences = [countExternalReferences()]isize;
+
+// Static rather than carried by value: in debug builds every frame the
+// Snapshot passed through (create, load, App.init) kept its own copy, which
+// was enough to exhaust V8's stack limit before the snapshot's first script.
+var external_references_storage: ExternalReferences = undefined;
+
+fn collectExternalReferences() *const ExternalReferences {
+    @setEvalBranchQuota(100_000);
+    var idx: usize = 0;
+    const references = &external_references_storage;
+    @memset(references, 0);
+
+    references[idx] = @bitCast(@intFromPtr(&illegalConstructorCallback));
+    idx += 1;
+
+    references[idx] = @bitCast(@intFromPtr(HtmlElement.JsApi.upgrade_constructor.func));
+    idx += 1;
+
+    references[idx] = @bitCast(@intFromPtr(&bridge.Function.noopFunction));
+    idx += 1;
+
+    references[idx] = @bitCast(@intFromPtr(&bridge.unknownWindowPropertyCallback));
+    idx += 1;
+
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
+
+    inline for (JsApis) |JsApi| {
+        if (@hasDecl(JsApi, "constructor")) {
+            references[idx] = @bitCast(@intFromPtr(JsApi.constructor.func));
+            idx += 1;
+        }
+
+        if (@hasDecl(JsApi, "callable")) {
+            references[idx] = @bitCast(@intFromPtr(JsApi.callable.func));
+            idx += 1;
+        }
+
+        const decl_names = @typeInfo(JsApi).@"struct".decl_names;
+        inline for (decl_names) |decl_name| {
+            const value = @field(JsApi, decl_name);
+            const T = @TypeOf(value);
+            if (T == bridge.Accessor) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
+                references[idx] = @bitCast(@intFromPtr(value.getter));
+                idx += 1;
+                if (value.setter) |setter| {
+                    references[idx] = @bitCast(@intFromPtr(setter));
+                    idx += 1;
+                }
+            } else if (T == bridge.Function) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+                references[idx] = @bitCast(@intFromPtr(value.func));
+                idx += 1;
+            } else if (T == bridge.Iterator) {
+                references[idx] = @bitCast(@intFromPtr(value.func));
+                idx += 1;
+            } else if (T == bridge.Indexed) {
+                references[idx] = @bitCast(@intFromPtr(value.getter));
+                idx += 1;
+                if (value.enumerator) |enumerator| {
+                    references[idx] = @bitCast(@intFromPtr(enumerator));
+                    idx += 1;
+                }
+                if (value.setter) |setter| {
+                    references[idx] = @bitCast(@intFromPtr(setter));
+                    idx += 1;
+                }
+                if (value.deleter) |deleter| {
+                    references[idx] = @bitCast(@intFromPtr(deleter));
+                    idx += 1;
+                }
+                if (value.query) |query| {
+                    references[idx] = @bitCast(@intFromPtr(query));
+                    idx += 1;
+                }
+                if (value.definer) |definer| {
+                    references[idx] = @bitCast(@intFromPtr(definer));
+                    idx += 1;
+                }
+            } else if (T == bridge.NamedIndexed) {
+                references[idx] = @bitCast(@intFromPtr(value.getter));
+                idx += 1;
+                if (value.setter) |setter| {
+                    references[idx] = @bitCast(@intFromPtr(setter));
+                    idx += 1;
+                }
+                if (value.deleter) |deleter| {
+                    references[idx] = @bitCast(@intFromPtr(deleter));
+                    idx += 1;
+                }
+                if (value.query) |query| {
+                    references[idx] = @bitCast(@intFromPtr(query));
+                    idx += 1;
+                }
+                if (value.definer) |definer| {
+                    references[idx] = @bitCast(@intFromPtr(definer));
+                    idx += 1;
+                }
+                if (value.descriptor) |descriptor| {
+                    references[idx] = @bitCast(@intFromPtr(descriptor));
+                    idx += 1;
+                }
+                if (value.enumerator) |enumerator| {
+                    references[idx] = @bitCast(@intFromPtr(enumerator));
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    // @LOG-UNKNOWN-PROPERTY
+    // if (comptime lp.IS_DEBUG) {
+    //     inline for (JsApis) |JsApi| {
+    //         if (!hasNamedIndexedGetter(JsApi)) {
+    //             references[idx] = @bitCast(@intFromPtr(bridge.unknownObjectPropertyCallback(JsApi)));
+    //             idx += 1;
+    //         }
+    //     }
+    // }
+
+    return references;
+}
+
+fn countInternalFields(comptime JsApi: type) u8 {
+    var last_used_id = 0;
+    var cache_count: u8 = 0;
+
+    inline for (@typeInfo(JsApi).@"struct".decl_names) |decl_name| {
+        const name: [:0]const u8 = decl_name;
+        const value = @field(JsApi, name);
+        const definition = @TypeOf(value);
+
+        switch (definition) {
+            inline bridge.Accessor, bridge.Function => {
+                const cache = value.cache orelse continue;
+                if (cache != .internal) {
+                    continue;
+                }
+                // We assert that they are declared in-order. This isn't necessary
+                // but I don't want to do anything fancy to look for gaps or
+                // duplicates.
+                const internal_id = cache.internal;
+                if (internal_id != last_used_id + 1) {
+                    @compileError(@typeName(JsApi) ++ "." ++ name ++ " has a non-monotonic cache index");
+                }
+                last_used_id = internal_id;
+                cache_count += 1; // this is just last_used, but it's more explicit this way
+            },
+            else => {},
+        }
+    }
+
+    if (@hasDecl(JsApi.Meta, "empty_with_no_proto")) {
+        return cache_count;
+    }
+
+    // we need cache_count internal fields, + 1 for the TAO pointer (the v8 -> Zig)
+    // mapping) itself.
+    return cache_count + 1;
+}
+
+// Shared illegal constructor callback for types without explicit constructors
+fn illegalConstructorCallback(raw_info: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = v8.v8__FunctionCallbackInfo__GetIsolate(raw_info);
+
+    // Recover the constructor's name via NewTarget, whose .name property was
+    // set via SetClassName when the FunctionTemplate was built. Lets us tell
+    // `new DOMException()` apart from `new MutationRecord()` in the warning.
+    var name_buf: [128]u8 = undefined;
+    var name: []const u8 = "<unknown>";
+    if (v8.v8__FunctionCallbackInfo__NewTarget(raw_info)) |new_target| {
+        if (v8.v8__Value__IsFunction(new_target)) {
+            const func: *const v8.Function = @ptrCast(new_target);
+            if (v8.v8__Function__GetName(func)) |name_value| {
+                if (v8.v8__Value__IsString(name_value)) {
+                    const str: *const v8.String = @ptrCast(name_value);
+                    const n = v8.v8__String__WriteUtf8(str, isolate, &name_buf, name_buf.len, v8.WRITE_REPLACE_INVALID_UTF8, null);
+                    name = name_buf[0..@intCast(n)];
+                }
+            }
+        }
+    }
+    log.info(.js, "Illegal constructor call", .{ .name = name });
+
+    const message = v8.v8__String__NewFromUtf8(isolate, "Illegal Constructor", v8.kNormal, 19);
+    const js_exception = v8.v8__Exception__TypeError(message);
+
+    _ = v8.v8__Isolate__ThrowException(isolate, js_exception);
+    var return_value: v8.ReturnValue = undefined;
+    v8.v8__FunctionCallbackInfo__GetReturnValue(raw_info, &return_value);
+    v8.v8__ReturnValue__Set(return_value, js_exception);
+}
+
+// Helper to check if a JsApi has a NamedIndexed handler (public for reuse)
+fn hasNamedIndexedGetter(comptime JsApi: type) bool {
+    const decl_names = @typeInfo(JsApi).@"struct".decl_names;
+    inline for (decl_names) |decl_name| {
+        const value = @field(JsApi, decl_name);
+        const T = @TypeOf(value);
+        if (T == bridge.NamedIndexed) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Generic prototype index lookup for a given API list
+fn protoIndexLookup(comptime JsApi: type) ?u16 {
+    @setEvalBranchQuota(100_000);
+    comptime {
+        const T = JsApi.bridge.type;
+        const F = reflect.Proto(T) orelse return null;
+        // Look up in the provided API list
+        for (JsApis, 0..) |Api, i| {
+            if (Api == F.JsApi) {
+                return i;
+            }
+        }
+        @compileError("Prototype " ++ @typeName(F.JsApi) ++ " not found in API list");
+    }
+}
+
+// Generate a constructor template for a JsApi type (public for reuse)
+fn generateConstructor(comptime JsApi: type, isolate: *v8.Isolate) *const v8.FunctionTemplate {
+    const callback, const arity = comptime blk: {
+        // The constructor belongs to the legacy factory function (`Image`),
+        // see generateLegacyFactoryFunction.
+        if (@hasDecl(JsApi, "constructor") and !@hasDecl(JsApi.Meta, "constructor_alias")) {
+            break :blk .{ JsApi.constructor.func, JsApi.constructor.arity };
+        }
+        if (inheritsFromHtmlElement(JsApi)) {
+            break :blk .{ HtmlElement.JsApi.upgrade_constructor.func, @as(c_int, HtmlElement.JsApi.upgrade_constructor.arity) };
+        }
+        break :blk .{ &illegalConstructorCallback, @as(c_int, 0) };
+    };
+    const template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+        .length = arity,
+        .callback = callback,
+        .behavior = v8.kConstructorBehavior_Allow,
+    }).?;
+    {
+        const internal_field_count = comptime countInternalFields(JsApi);
+        if (internal_field_count > 0) {
+            const instance_template = v8.v8__FunctionTemplate__InstanceTemplate(template);
+            v8.v8__ObjectTemplate__SetInternalFieldCount(instance_template, internal_field_count);
+        }
+    }
+    const name_str = if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi);
+    const class_name = v8.v8__String__NewFromUtf8(isolate, name_str.ptr, v8.kNormal, @intCast(name_str.len));
+    v8.v8__FunctionTemplate__SetClassName(template, class_name);
+    // Web IDL: interface object's `prototype` property is non-writable/non-configurable.
+    v8.v8__FunctionTemplate__ReadOnlyPrototype(template);
+    return template;
+}
+
+// https://webidl.spec.whatwg.org/#legacy-factory-functions
+// `Image`, `Audio`, `Option`: a function distinct from the interface object
+// (so `new HTMLImageElement()` stays illegal and `Image.name` is "Image"),
+// whose `prototype` is the interface's prototype object.
+fn generateLegacyFactoryFunction(comptime JsApi: type, isolate: *v8.Isolate, interface_template: *const v8.FunctionTemplate, interface_func: *const v8.Function, context: *const v8.Context) *const v8.Function {
+    const alias = JsApi.Meta.constructor_alias;
+    const template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+        .length = JsApi.constructor.arity,
+        .callback = JsApi.constructor.func,
+        .behavior = v8.kConstructorBehavior_Allow,
+    }).?;
+    // Inherit so that the objects we construct pass the interface's
+    // accessor and method signature checks.
+    v8.v8__FunctionTemplate__Inherit(template, interface_template);
+    {
+        const internal_field_count = comptime countInternalFields(JsApi);
+        if (internal_field_count > 0) {
+            const instance_template = v8.v8__FunctionTemplate__InstanceTemplate(template);
+            v8.v8__ObjectTemplate__SetInternalFieldCount(instance_template, internal_field_count);
+        }
+    }
+    const class_name = v8.v8__String__NewFromUtf8(isolate, alias.ptr, v8.kNormal, @intCast(alias.len));
+    v8.v8__FunctionTemplate__SetClassName(template, class_name);
+
+    const func = v8.v8__FunctionTemplate__GetFunction(template, context).?;
+    const prototype_key = v8.v8__String__NewFromUtf8(isolate, "prototype", v8.kNormal, 9);
+    const interface_prototype = v8.v8__Object__Get(@ptrCast(interface_func), context, prototype_key).?;
+    var maybe_result: v8.MaybeBool = undefined;
+    v8.v8__Object__DefineOwnProperty(@ptrCast(func), context, prototype_key, interface_prototype, v8.ReadOnly + v8.DontEnum + v8.DontDelete, &maybe_result);
+    return func;
+}
+
+// hard-coded special case for HtmlElement which can be extended but not
+// instantiated.
+fn inheritsFromHtmlElement(comptime JsApi: type) bool {
+    if (JsApi.bridge.type == HtmlElement) {
+        return false;
+    }
+    return bridge.inheritsOrIs(JsApi, HtmlElement.JsApi);
+}
+
+// Web IDL namespace (CSS, console)
+fn isNamespace(comptime JsApi: type) bool {
+    return @hasDecl(JsApi.Meta, "namespace") and JsApi.Meta.namespace;
+}
+
+const Unforgeable = struct {
+    Owner: type,
+    name: [:0]const u8,
+    accessor: bridge.Accessor,
+};
+
+fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolate, template: *const v8.FunctionTemplate, define_on: ?*const v8.ObjectTemplate) void {
+    const instance = v8.v8__FunctionTemplate__InstanceTemplate(template);
+    const prototype = v8.v8__FunctionTemplate__PrototypeTemplate(template);
+    const signature = v8.v8__Signature__New(isolate, template);
+
+    // Namespace objects (e.g. console) expose their members as own properties
+    // of each instance rather than via the prototype, so Object.entries(...)
+    // returns them. See https://console.spec.whatwg.org/#console-namespace.
+    const own_properties = isNamespace(JsApi);
+    const member_template = if (own_properties) instance else prototype;
+
+    const decl_names = @typeInfo(JsApi).@"struct".decl_names;
+    var has_named_index_getter = false;
+
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
+
+    inline for (decl_names) |name| {
+        const value = @field(JsApi, name);
+        const definition = @TypeOf(value);
+
+        if (comptime flatten) {
+            // [Global] flattening only mirrors non-static accessors/methods onto itself
+            switch (definition) {
+                bridge.Accessor, bridge.Function => if (value.static) continue,
+                else => continue,
+            }
+        }
+
+        switch (definition) {
+            bridge.Accessor => {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
+                if (comptime value.unforgeable) {
+                    // this accessor will be handled in the unforgeables loop
+                    // later in this function.
+                    continue;
+                }
+                attachAccessorProperty(name, value, isolate, template, signature, define_on orelse prototype);
+            },
+            bridge.Function => {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
+                // For non-static functions, use the signature to validate the
+                // receiver, unless the operation has to reject rather than throw.
+                const func_signature = if (value.static or value.rejects_bad_receiver) null else signature;
+                const function_template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+                    .callback = value.func,
+                    .length = value.arity,
+                    .signature = func_signature,
+                }).?;
+                // A member may override its JS-visible name (see Response.json_static)
+                const fn_name = value.js_name orelse name;
+                const js_name = v8.v8__String__NewFromUtf8(isolate, fn_name.ptr, v8.kNormal, @intCast(fn_name.len));
+                v8.v8__FunctionTemplate__SetClassName(function_template, js_name);
+                if (value.static and !own_properties) {
+                    v8.v8__Template__Set(@ptrCast(template), js_name, @ptrCast(function_template), v8.None);
+                } else {
+                    // Web IDL: operations on the interface prototype object
+                    // (and mirrored onto [Global] instances) are enumerable.
+                    v8.v8__Template__Set(@ptrCast(define_on orelse member_template), js_name, @ptrCast(function_template), v8.None);
+                }
+            },
+            bridge.Indexed => {
+                var configuration: v8.IndexedPropertyHandlerConfiguration = .{
+                    .getter = value.getter,
+                    .enumerator = value.enumerator,
+                    .setter = value.setter,
+                    .query = value.query,
+                    .deleter = value.deleter,
+                    .definer = if (value.definer) |definer| @ptrCast(definer) else null,
+                    .descriptor = null,
+                    .index_of = null,
+                    .iterable_to_list = null,
+                    .data = null,
+                    .flags = 0,
+                };
+                v8.v8__ObjectTemplate__SetIndexedHandler(instance, &configuration);
+            },
+            bridge.NamedIndexed => {
+                var configuration: v8.NamedPropertyHandlerConfiguration = .{
+                    .getter = value.getter,
+                    .setter = value.setter,
+                    .query = value.query,
+                    .deleter = value.deleter,
+                    .enumerator = value.enumerator,
+                    .definer = if (value.definer) |definer| @ptrCast(definer) else null,
+                    .descriptor = if (value.descriptor) |descriptor| @ptrCast(descriptor) else null,
+                    .data = null,
+                    .flags = v8.kOnlyInterceptStrings | v8.kNonMasking,
+                };
+                v8.v8__ObjectTemplate__SetNamedHandler(instance, &configuration);
+                has_named_index_getter = true;
+            },
+            bridge.Iterator => {
+                const function_template = v8.v8__FunctionTemplate__New__Config(isolate, &.{ .callback = value.func }).?;
+                const js_name = if (value.async)
+                    v8.v8__Symbol__GetAsyncIterator(isolate)
+                else
+                    v8.v8__Symbol__GetIterator(isolate);
+                // Web IDL: @@iterator is { writable, enumerable: false, configurable }.
+                v8.v8__Template__Set(@ptrCast(prototype), js_name, @ptrCast(function_template), v8.DontEnum);
+            },
+            bridge.Property => {
+                const js_value = switch (value.value) {
+                    .null => js.simpleZigValueToJs(.{ .handle = isolate }, null, true, false),
+                    inline .bool, .int, .float, .string => |v| js.simpleZigValueToJs(.{ .handle = isolate }, v, true, false),
+                };
+                const js_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+
+                {
+                    const flags = if (value.readonly) v8.ReadOnly + v8.DontDelete else 0;
+                    v8.v8__Template__Set(@ptrCast(prototype), js_name, js_value, flags);
+                }
+
+                if (value.template) {
+                    v8.v8__Template__Set(@ptrCast(template), js_name, js_value, v8.ReadOnly + v8.DontDelete);
+                }
+            },
+            bridge.Constructor => {},
+            else => {},
+        }
+    }
+
+    if (comptime flatten == false) {
+        inline for (unforgeables) |u| {
+            if (comptime bridge.inheritsOrIs(JsApi, u.Owner)) {
+                // unforgeables attributes aren't only applied directly on the
+                // instance, they're also applied directly on every child instance
+                attachAccessorProperty(u.name, u.accessor, isolate, template, signature, instance);
+            }
+        }
+    }
+
+    // Flattening mirrors members onto a global, not per-interface setup.
+    if (comptime flatten) {
+        return;
+    }
+
+    if (@hasDecl(JsApi.Meta, "htmldda")) {
+        v8.v8__ObjectTemplate__MarkAsUndetectable(instance);
+        v8.v8__ObjectTemplate__SetCallAsFunctionHandler(instance, JsApi.Meta.callable.func);
+    }
+
+    if (@hasDecl(JsApi.Meta, "name")) {
+        const js_name = v8.v8__Symbol__GetToStringTag(isolate);
+        // Namespace objects override the class string (e.g. console's is
+        // "console", not "Console").
+        const tag = if (@hasDecl(JsApi.Meta, "class_string")) JsApi.Meta.class_string else JsApi.Meta.name;
+        const js_value = v8.v8__String__NewFromUtf8(isolate, tag.ptr, v8.kNormal, @intCast(tag.len));
+        // Interfaces inherit tags from prototypes; namespaces keep own tags.
+        v8.v8__Template__Set(@ptrCast(member_template), js_name, js_value, v8.ReadOnly + v8.DontEnum);
+    }
+
+    // @LOG-UNKNOWN-PROPERTY
+    // if (comptime lp.IS_DEBUG) {
+    //     if (!has_named_index_getter) {
+    //         var configuration: v8.NamedPropertyHandlerConfiguration = .{
+    //             .getter = bridge.unknownObjectPropertyCallback(JsApi),
+    //             .setter = null,
+    //             .query = null,
+    //             .deleter = null,
+    //             .enumerator = null,
+    //             .definer = null,
+    //             .descriptor = null,
+    //             .data = null,
+    //             .flags = v8.kOnlyInterceptStrings | v8.kNonMasking,
+    //         };
+    //         v8.v8__ObjectTemplate__SetNamedHandler(instance, &configuration);
+    //     }
+    // }
+}
+
+// The chain of interface types reachable from a [Global] interface via WebIDL
+// inheritance, e.g. Window -> [Window.JsApi, EventTarget.JsApi].
+fn globalScopeChain(comptime GlobalScopeApi: type) []const type {
+    comptime {
+        var chain: []const type = &[_]type{};
+        var JsApi = GlobalScopeApi;
+        while (true) {
+            chain = chain ++ &[_]type{JsApi};
+            const proto_index = protoIndexLookup(JsApi) orelse break;
+            JsApi = JsApis[proto_index];
+        }
+        return chain;
+    }
+}
+
+// Every [LegacyUnforgeable] accessor. We collect this once so we don't need to
+// keep scanning for this in attachClass
+const unforgeables: []const Unforgeable = blk: {
+    @setEvalBranchQuota(100_000);
+    var list: []const Unforgeable = &.{};
+    for (JsApis) |Api| {
+        for (@typeInfo(Api).@"struct".decl_names) |decl_name| {
+            const value = @field(Api, decl_name);
+            if (@TypeOf(value) == bridge.Accessor and value.unforgeable and !value.static) {
+                list = list ++ &[_]Unforgeable{.{ .Owner = Api, .name = decl_name, .accessor = value }};
+            }
+        }
+    }
+    break :blk list;
+};
+
+// Attach JsApi members to a template (public for reuse). This is called on all
+// types. But, for globals (window, WGS) it's called twice. The first time, it's
+// called like any other interface. The 2nd time, it's called with flatten == true
+// and define_on != null. This is the "flattening" pass, and it defines all of
+// the functions/accessors on directly on the global instance. Thus, globals have
+// it defined on both their prototype (first pass) and their own instance (2nd pass).
+fn attachAccessorProperty(comptime name: [:0]const u8, value: bridge.Accessor, isolate: *v8.Isolate, template: *const v8.FunctionTemplate, signature: anytype, target: anytype) void {
+    const js_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+    const getter_signature = if (value.static) null else signature;
+    const getter_callback = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+        .callback = value.getter,
+        .signature = getter_signature,
+    }).?;
+    // WebIDL: getter function's .name should be "get X"
+    const getter_name_str = "get " ++ name;
+    const getter_name_v8 = v8.v8__String__NewFromUtf8(isolate, getter_name_str.ptr, v8.kNormal, @intCast(getter_name_str.len));
+    v8.v8__FunctionTemplate__SetClassName(getter_callback, getter_name_v8);
+
+    const setter_callback = if (value.setter) |setter| blk: {
+        const cb = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+            .callback = setter,
+            .signature = getter_signature,
+            .length = 1,
+        }).?;
+        const setter_name_str = "set " ++ name;
+        const setter_name_v8 = v8.v8__String__NewFromUtf8(isolate, setter_name_str.ptr, v8.kNormal, @intCast(setter_name_str.len));
+        v8.v8__FunctionTemplate__SetClassName(cb, setter_name_v8);
+        break :blk cb;
+    } else null;
+
+    var attribute: v8.PropertyAttribute = 0;
+    if (value.setter == null) {
+        attribute |= v8.ReadOnly;
+    }
+    if (value.deletable == false) {
+        attribute |= v8.DontDelete;
+    }
+
+    if (value.static) {
+        v8.v8__Template__SetAccessorProperty(@ptrCast(template), js_name, getter_callback, setter_callback, attribute);
+    } else {
+        // Web IDL: attributes on the interface prototype object
+        // (and mirrored onto [Global] instances) are enumerable.
+        v8.v8__ObjectTemplate__SetAccessorProperty__Config(target, &.{
+            .key = js_name,
+            .getter = getter_callback,
+            .setter = setter_callback,
+            .attribute = attribute,
+        });
+    }
+}

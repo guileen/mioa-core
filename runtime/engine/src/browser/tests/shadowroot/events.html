@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<body></body>
+
+<script id="event_bubbling_through_shadow">
+{
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<button id="btn">Click</button>';
+    document.body.appendChild(host);
+
+    const button = shadow.getElementById('btn');
+
+    let insideCalled = false;
+    let shadowCalled = false;
+    let hostCalled = false;
+    let documentCalled = false;
+
+    let insideTarget = null;
+    let hostTarget = null;
+
+    button.addEventListener('click', (e) => {
+        insideCalled = true;
+        insideTarget = e.target;
+    });
+
+    shadow.addEventListener('click', (e) => {
+        shadowCalled = true;
+    });
+
+    host.addEventListener('click', (e) => {
+        hostCalled = true;
+        hostTarget = e.target;
+    });
+
+    document.addEventListener('click', (e) => {
+        documentCalled = true;
+    });
+
+    const event = new Event('click', { bubbles: true });
+    button.dispatchEvent(event);
+
+    testing.expectEqual(true, insideCalled);
+    testing.expectEqual(true, shadowCalled);
+
+    // Without composed:true, event should NOT escape shadow tree
+    testing.expectEqual(false, hostCalled);
+    testing.expectEqual(false, documentCalled);
+
+    host.remove();
+}
+</script>
+
+<script id="event_composed_escapes_shadow">
+{
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<button id="btn">Click</button>';
+    document.body.appendChild(host);
+
+    const button = shadow.getElementById('btn');
+
+    let hostCalled = false;
+    let hostTarget = null;
+
+    host.addEventListener('click', (e) => {
+        hostCalled = true;
+        hostTarget = e.target;
+    });
+
+    // With composed:true, event SHOULD escape shadow tree
+    const event = new Event('click', { bubbles: true, composed: true });
+    button.dispatchEvent(event);
+
+    testing.expectEqual(true, hostCalled);
+
+    // Event target should be retargeted to host when outside shadow tree
+    testing.expectEqual(host, hostTarget);
+
+    host.remove();
+}
+</script>
+
+<script id="composedPath_basic">
+{
+    const div1 = document.createElement('div');
+    const div2 = document.createElement('div');
+    const button = document.createElement('button');
+
+    div1.appendChild(div2);
+    div2.appendChild(button);
+    document.body.appendChild(div1);
+
+    let capturedPath = null;
+
+    button.addEventListener('click', (e) => {
+        capturedPath = e.composedPath();
+    });
+
+    const event = new Event('click', { bubbles: true });
+    button.dispatchEvent(event);
+
+    testing.expectEqual(7, capturedPath.length);
+    testing.expectEqual(button, capturedPath[0]);
+    testing.expectEqual(div2, capturedPath[1]);
+    testing.expectEqual(div1, capturedPath[2]);
+    testing.expectEqual(document.body, capturedPath[3]);
+    testing.expectEqual(document.documentElement, capturedPath[4]);
+    testing.expectEqual(document, capturedPath[5]);
+    testing.expectEqual(window, capturedPath[6]);
+
+    div1.remove();
+}
+</script>
+
+<script id="composedPath_after_dispatch">
+{
+    const button = document.createElement('button');
+    document.body.appendChild(button);
+
+    const event = new Event('click', { bubbles: true });
+    button.dispatchEvent(event);
+
+    const path = event.composedPath();
+    testing.expectEqual(0, path.length);
+
+    button.remove();
+}
+</script>
+
+<script id="composedPath_with_shadow_not_composed">
+{
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    const button = document.createElement('button');
+
+    shadow.appendChild(button);
+    document.body.appendChild(host);
+
+    let capturedPath = null;
+
+    button.addEventListener('click', (e) => {
+        capturedPath = e.composedPath();
+    });
+
+    const event = new Event('click', { bubbles: true });
+    button.dispatchEvent(event);
+
+    testing.expectEqual(2, capturedPath.length);
+    testing.expectEqual(button, capturedPath[0]);
+    testing.expectEqual(shadow, capturedPath[1]);
+
+    host.remove();
+}
+</script>
+
+<script id="composedPath_with_shadow_composed">
+{
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    const button = document.createElement('button');
+
+    shadow.appendChild(button);
+    document.body.appendChild(host);
+
+    let capturedPath = null;
+
+    button.addEventListener('click', (e) => {
+        capturedPath = e.composedPath();
+    });
+
+    const event = new Event('click', { bubbles: true, composed: true });
+    button.dispatchEvent(event);
+
+    testing.expectEqual(7, capturedPath.length);
+    testing.expectEqual(button, capturedPath[0]);
+    testing.expectEqual(shadow, capturedPath[1]);
+    testing.expectEqual(host, capturedPath[2]);
+    testing.expectEqual(document.body, capturedPath[3]);
+    testing.expectEqual(document.documentElement, capturedPath[4]);
+    testing.expectEqual(document, capturedPath[5]);
+    testing.expectEqual(window, capturedPath[6]);
+
+    host.remove();
+}
+</script>
+
+<script id="composedPath_open_shadow_from_host">
+{
+    // Test that open shadow root exposes internals in composedPath
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    const button = document.createElement('button');
+
+    shadow.appendChild(button);
+    document.body.appendChild(host);
+
+    let capturedPath = null;
+
+    host.addEventListener('click', (e) => {
+        capturedPath = e.composedPath();
+    });
+
+    const event = new Event('click', { bubbles: true, composed: true });
+    button.dispatchEvent(event);
+
+    // Open shadow: external listener should see shadow internals
+    testing.expectEqual(7, capturedPath.length);
+    testing.expectEqual(button, capturedPath[0]);
+    testing.expectEqual(shadow, capturedPath[1]);
+    testing.expectEqual(host, capturedPath[2]);
+    testing.expectEqual(document.body, capturedPath[3]);
+    testing.expectEqual(document.documentElement, capturedPath[4]);
+    testing.expectEqual(document, capturedPath[5]);
+    testing.expectEqual(window, capturedPath[6]);
+
+    host.remove();
+}
+</script>
+
+<script id="composedPath_closed_shadow_from_host">
+{
+    // Test that closed shadow root hides internals in composedPath
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const button = document.createElement('button');
+
+    shadow.appendChild(button);
+    document.body.appendChild(host);
+
+    let capturedPath = null;
+
+    host.addEventListener('click', (e) => {
+        capturedPath = e.composedPath();
+    });
+
+    const event = new Event('click', { bubbles: true, composed: true });
+    button.dispatchEvent(event);
+
+    // Closed shadow: external listener should NOT see shadow internals
+    testing.expectEqual(5, capturedPath.length);
+    testing.expectEqual(host, capturedPath[0]);
+    testing.expectEqual(document.body, capturedPath[1]);
+    testing.expectEqual(document.documentElement, capturedPath[2]);
+    testing.expectEqual(document, capturedPath[3]);
+    testing.expectEqual(window, capturedPath[4]);
+
+    host.remove();
+}
+</script>
+
+<script id="composedPath_closed_shadow_from_inside">
+{
+    // Test that closed shadow root still exposes internals to internal listeners
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const button = document.createElement('button');
+
+    shadow.appendChild(button);
+    document.body.appendChild(host);
+
+    let capturedPath = null;
+
+    button.addEventListener('click', (e) => {
+        capturedPath = e.composedPath();
+    });
+
+    const event = new Event('click', { bubbles: true, composed: true });
+    button.dispatchEvent(event);
+
+    // Inside the shadow: should see full path including shadow internals
+    testing.expectEqual(7, capturedPath.length);
+    testing.expectEqual(button, capturedPath[0]);
+    testing.expectEqual(shadow, capturedPath[1]);
+    testing.expectEqual(host, capturedPath[2]);
+    testing.expectEqual(document.body, capturedPath[3]);
+    testing.expectEqual(document.documentElement, capturedPath[4]);
+    testing.expectEqual(document, capturedPath[5]);
+    testing.expectEqual(window, capturedPath[6]);
+
+    host.remove();
+}
+</script>
+
+<script id="composedPath_detached_tree_excludes_window">
+{
+    // A detached tree's path ends at its root: no document, no window.
+    const root = document.createElement('div');
+    const target = document.createElement('span');
+    root.appendChild(target);
+
+    let capturedPath = null;
+    root.addEventListener('my-event', (e) => {
+        capturedPath = e.composedPath();
+    });
+    target.dispatchEvent(new Event('my-event', { bubbles: true, composed: true }));
+
+    testing.expectEqual(2, capturedPath.length);
+    testing.expectEqual(target, capturedPath[0]);
+    testing.expectEqual(root, capturedPath[1]);
+}
+</script>
+
+<script id="post_dispatch_state">
+{
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const shadow = host.attachShadow({ mode: 'open' });
+    const target = document.createElement('span');
+    shadow.appendChild(target);
+    shadow.addEventListener('my-event', () => {});
+
+    // composed: crossing the boundary retargets to the host post-dispatch.
+    const composed = new Event('my-event', { bubbles: true, composed: true });
+    target.dispatchEvent(composed);
+    testing.expectEqual(host, composed.target);
+    testing.expectEqual(null, composed.currentTarget);
+    testing.expectEqual(0, composed.eventPhase);
+    testing.expectEqual(0, composed.composedPath().length);
+
+    // non-composed: the event never left the shadow tree, targets are cleared.
+    const scoped = new Event('my-event', { bubbles: true, composed: false });
+    target.dispatchEvent(scoped);
+    testing.expectEqual(null, scoped.target);
+
+    host.remove();
+}
+</script>
+
+<script id="related_target_stops_path">
+{
+    // DOM dispatch: the path stops at the node the relatedTarget retargets
+    // onto, so the event never reaches the host or anything above it.
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const shadow = host.attachShadow({ mode: 'open' });
+    const target = document.createElement('span');
+    shadow.appendChild(target);
+
+    const seen = [];
+    const watch = (node, name) => node.addEventListener('my-event', () => seen.push(name));
+    watch(target, 'target');
+    watch(shadow, 'shadow');
+    watch(host, 'host');
+    watch(document.body, 'body');
+    watch(document, 'document');
+
+    target.dispatchEvent(new MouseEvent('my-event', {
+        bubbles: true,
+        composed: true,
+        relatedTarget: host,
+    }));
+
+    testing.expectEqual('target,shadow', seen.join(','));
+
+    host.remove();
+}
+</script>
+
+<script id="related_target_equal_to_target_skips_dispatch">
+{
+    // When the relatedTarget retargets onto the target itself, the event is
+    // not dispatched at all.
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const shadow = host.attachShadow({ mode: 'open' });
+    const inner = document.createElement('span');
+    shadow.appendChild(inner);
+
+    let hostCalled = false;
+    host.addEventListener('my-event', () => hostCalled = true);
+
+    // relatedTarget lives in host's own shadow tree, so it retargets to host.
+    host.dispatchEvent(new MouseEvent('my-event', {
+        bubbles: true,
+        composed: true,
+        relatedTarget: inner,
+    }));
+
+    testing.expectEqual(false, hostCalled);
+
+    host.remove();
+}
+</script>
+
+<script id="related_target_retargeted_per_listener">
+{
+    // Each listener sees the relatedTarget retargeted against its own
+    // currentTarget: the slot is inside the shadow tree and sees the real
+    // node, everything in the document tree sees the host.
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const shadow = host.attachShadow({ mode: 'open' });
+    const slot = document.createElement('slot');
+    const related = document.createElement('i');
+    shadow.appendChild(slot);
+    shadow.appendChild(related);
+
+    const target = document.createElement('span');
+    host.appendChild(target);
+
+    const seen = [];
+    const watch = (node, name) => node.addEventListener('my-event', (e) => {
+        seen.push(name + '=' + (e.relatedTarget === related ? 'related' : (e.relatedTarget === host ? 'host' : '?')));
+    });
+    watch(target, 'target');
+    watch(slot, 'slot');
+    watch(host, 'host');
+
+    target.dispatchEvent(new MouseEvent('my-event', {
+        bubbles: true,
+        composed: true,
+        relatedTarget: related,
+    }));
+
+    testing.expectEqual('target=host,slot=related,host=host', seen.join(','));
+
+    host.remove();
+}
+</script>
+
+<script id="related_target_post_dispatch">
+{
+    // Post-dispatch the relatedTarget is left retargeted against the outermost
+    // node the event reached, or cleared when it would expose a shadow tree.
+    const makeHost = (tag) => {
+        const host = document.createElement('div');
+        document.body.appendChild(host);
+        const shadow = host.attachShadow({ mode: 'open' });
+        const inner = document.createElement(tag);
+        shadow.appendChild(inner);
+        return { host: host, inner: inner };
+    };
+
+    // target and relatedTarget in different shadow trees: each is exposed as
+    // its own host.
+    const a = makeHost('span');
+    const b = makeHost('i');
+    const across = new MouseEvent('my-event', {
+        bubbles: true,
+        composed: true,
+        relatedTarget: b.inner,
+    });
+    a.inner.dispatchEvent(across);
+    testing.expectEqual(a.host, across.target);
+    testing.expectEqual(b.host, across.relatedTarget);
+
+    // target and relatedTarget in the same shadow tree: the event never leaves
+    // it, so both are cleared rather than leaking a shadow node.
+    const c = makeHost('span');
+    const sibling = document.createElement('i');
+    c.inner.parentNode.appendChild(sibling);
+    const within = new MouseEvent('my-event', {
+        bubbles: true,
+        composed: true,
+        relatedTarget: sibling,
+    });
+    c.inner.dispatchEvent(within);
+    testing.expectEqual(null, within.target);
+    testing.expectEqual(null, within.relatedTarget);
+
+    a.host.remove();
+    b.host.remove();
+    c.host.remove();
+}
+</script>

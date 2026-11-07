@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<script id=location>
+  testing.expectEqual(testing.BASE_URL + 'window/location.html', window.location.href);
+  testing.expectEqual(document.location, window.location);
+</script>
+
+<script id=location_hash>
+  location.hash = "#abcdef";
+  testing.expectEqual("#abcdef", location.hash);
+  testing.expectEqual(testing.BASE_URL + 'window/location.html#abcdef', location.href);
+
+  // Clearing the hash leaves an empty fragment, not a null one: the '#'
+  // stays and the document isn't reloaded.
+  location.hash = "";
+  testing.expectEqual("", location.hash);
+  testing.expectEqual(testing.BASE_URL + 'window/location.html#', location.href);
+
+  location.hash = "xyzxyz";
+  testing.expectEqual("#xyzxyz", location.hash);
+  testing.expectEqual(testing.BASE_URL + 'window/location.html#xyzxyz', location.href);
+
+  location.hash = "";
+  testing.expectEqual("", location.hash);
+  testing.expectEqual(testing.BASE_URL + 'window/location.html#', location.href);
+</script>
+
+<script id=location_pathname_setter>
+  testing.expectEqual('function', typeof Object.getOwnPropertyDescriptor(Location.prototype, 'pathname').set);
+</script>
+
+<script id=location_search_setter>
+  testing.expectEqual('function', typeof Object.getOwnPropertyDescriptor(Location.prototype, 'search').set);
+</script>
+
+<div id="sec1"></div>
+<div id="sec2"></div>
+
+<script id=location_target>
+  // :target must reflect the CURRENT location's fragment. Each fragment
+  // navigation replaces the backing Location, so this verifies the selector
+  // reads the live location (not a stale/freed one), and that fragment
+  // navigation releases the previous Location without breaking the chain.
+  const sec1 = document.getElementById('sec1');
+  const sec2 = document.getElementById('sec2');
+
+  location.hash = "#sec1";
+  testing.expectEqual(true, sec1.matches(':target'));
+  testing.expectEqual(false, sec2.matches(':target'));
+
+  // Navigate to a new fragment: :target must follow the new location.
+  location.hash = "#sec2";
+  testing.expectEqual(false, sec1.matches(':target'));
+  testing.expectEqual(true, sec2.matches(':target'));
+
+  // No fragment -> nothing is :target.
+  location.hash = "";
+  testing.expectEqual(false, sec1.matches(':target'));
+  testing.expectEqual(false, sec2.matches(':target'));
+</script>
+
+<script id=location_fragment_churn>
+  // Hammer fragment navigation: every iteration creates a new Location and must
+  // release the previous one. Consistency must hold throughout.
+  for (let i = 0; i < 50; i++) {
+    location.hash = "#h" + i;
+    testing.expectEqual("#h" + i, location.hash);
+  }
+  location.hash = "";
+  testing.expectEqual("", location.hash);
+</script>
+
+<script id=location_hash_no_change>
+  // Per the Location hash setter, assigning a value that doesn't change the
+  // fragment must not navigate at all: re-assigning "" on a fragment-less URL
+  // must not schedule a same-URL reload, and re-assigning the current
+  // fragment must be a no-op too.
+  history.replaceState(null, '', location.pathname);
+  const stable_href = location.href;
+  location.hash = "";
+  testing.expectEqual(stable_href, location.href);
+
+  // Clearing an existing fragment gives an empty one; clearing it again
+  // is a no-op.
+  location.hash = "#gone";
+  location.hash = "";
+  testing.expectEqual(stable_href + '#', location.href);
+  location.hash = "";
+  testing.expectEqual(stable_href + '#', location.href);
+
+  location.hash = "#same";
+  const with_fragment = location.href;
+  location.hash = "#same";
+  location.hash = "same";
+  testing.expectEqual(with_fragment, location.href);
+  testing.expectEqual("#same", location.hash);
+
+  location.hash = "";
+  testing.expectEqual(stable_href + '#', location.href);
+</script>

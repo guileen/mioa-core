@@ -1,0 +1,701 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const reflect = @import("reflect.zig");
+
+const RecyclingAllocator = @import("../RecyclingAllocator.zig");
+
+const Page = @import("Page.zig");
+const Frame = @import("Frame.zig");
+const DocumentRegistry = @import("DocumentRegistry.zig");
+
+const Node = @import("webapi/Node.zig");
+const Blob = @import("webapi/Blob.zig");
+const Event = @import("webapi/Event.zig");
+const DOMRect = @import("webapi/DOMRect.zig");
+const Element = @import("webapi/Element.zig");
+const Document = @import("webapi/Document.zig");
+const UIEvent = @import("webapi/event/UIEvent.zig");
+const EventTarget = @import("webapi/EventTarget.zig");
+const AbortSignal = @import("webapi/AbortSignal.zig");
+const MouseEvent = @import("webapi/event/MouseEvent.zig");
+const AbstractRange = @import("webapi/AbstractRange.zig");
+const DOMRectReadOnly = @import("webapi/DOMRectReadOnly.zig");
+const IDBRequest = @import("webapi/storage/idb/IDBRequest.zig");
+const XMLHttpRequestEventTarget = @import("webapi/net/XMLHttpRequestEventTarget.zig");
+
+const log = lp.log;
+const String = lp.String;
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+
+// Shared across all frames of a Page.
+const Factory = @This();
+
+_page: *Page,
+_arena: Allocator,
+_recycling: RecyclingAllocator,
+_documents: std.ArrayList(u32) = .empty, // ids of the documents _we_ created
+_document_registry: *DocumentRegistry, // &browser.documents
+
+pub fn init(page: *Page, arena: Allocator, document_registry: *DocumentRegistry) Factory {
+    return .{
+        ._page = page,
+        ._arena = arena,
+        ._recycling = .init(arena),
+        ._document_registry = document_registry,
+    };
+}
+
+pub fn deinit(self: *Factory) void {
+    for (self._documents.items) |index| {
+        self._document_registry.release(index);
+    }
+}
+
+pub fn storageAllocator(self: *Factory) Allocator {
+    return self._recycling.allocator();
+}
+
+fn registerDocument(self: *Factory, doc: *Document) !u32 {
+    const index = try self._document_registry.register(doc);
+    try self._documents.append(self._arena, index);
+    return index;
+}
+
+// this is a root object
+pub fn eventTarget(self: *Factory, child: anytype) !*@TypeOf(child) {
+    return self.eventTargetWithAllocator(self._recycling.allocator(), child);
+}
+
+pub fn eventTargetWithAllocator(_: *const Factory, allocator: Allocator, child: anytype) !*@TypeOf(child) {
+    const chain = try PrototypeChain(
+        &.{ EventTarget, @TypeOf(child) },
+    ).allocate(allocator);
+
+    const event_ptr = chain.get(0);
+    event_ptr.* = .{
+        ._type = typeInit(EventTarget, chain.get(1)),
+    };
+    chain.setLeaf(1, child);
+
+    return chain.get(1);
+}
+
+// this is a root object
+pub fn event(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !*@TypeOf(child) {
+    const chain = try PrototypeChain(
+        &.{ Event, @TypeOf(child) },
+    ).allocate(arena.allocator());
+
+    // Special case: Event has a _type_string field, so we need manual setup
+    const event_ptr = chain.get(0);
+    event_ptr.* = try eventInit(arena, typ, chain.get(1));
+    chain.setLeaf(1, child);
+
+    return chain.get(1);
+}
+
+pub fn uiEvent(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !*@TypeOf(child) {
+    const chain = try PrototypeChain(
+        &.{ Event, UIEvent, @TypeOf(child) },
+    ).allocate(arena.allocator());
+
+    // Special case: Event has a _type_string field, so we need manual setup
+    const event_ptr = chain.get(0);
+    event_ptr.* = try eventInit(arena, typ, chain.get(1));
+    chain.setMiddle(1);
+    chain.setLeaf(2, child);
+
+    return chain.get(2);
+}
+
+pub fn mouseEvent(_: *const Factory, arena: *lp.Arena, typ: String, mouse: MouseEvent, child: anytype) !*@TypeOf(child) {
+    const chain = try PrototypeChain(
+        &.{ Event, UIEvent, MouseEvent, @TypeOf(child) },
+    ).allocate(arena.allocator());
+
+    // Special case: Event has a _type_string field, so we need manual setup
+    const event_ptr = chain.get(0);
+    event_ptr.* = try eventInit(arena, typ, chain.get(1));
+    chain.setMiddle(1);
+
+    // Set MouseEvent with all its fields
+    const mouse_ptr = chain.get(2);
+    mouse_ptr.* = mouse;
+    mouse_ptr._proto = chain.get(1);
+    mouse_ptr._type = unionInit(MouseEvent.Type, chain.get(3));
+
+    chain.setLeaf(3, child);
+
+    return chain.get(3);
+}
+
+fn PrototypeChain(comptime types: []const type) type {
+    return struct {
+        const Self = @This();
+        memory: []u8,
+
+        fn totalSize() usize {
+            var size: usize = 0;
+            for (types) |T| {
+                size = std.mem.alignForward(usize, size, @alignOf(T));
+                size += @sizeOf(T);
+            }
+            return size;
+        }
+
+        fn maxAlign() std.mem.Alignment {
+            var alignment: std.mem.Alignment = .@"1";
+
+            for (types) |T| {
+                alignment = std.mem.Alignment.max(alignment, std.mem.Alignment.of(T));
+            }
+
+            return alignment;
+        }
+
+        fn getType(comptime index: usize) type {
+            return types[index];
+        }
+
+        fn allocate(allocator: std.mem.Allocator) !Self {
+            const size = comptime Self.totalSize();
+            const alignment = comptime Self.maxAlign();
+
+            const memory = try allocator.alignedAlloc(u8, alignment, size);
+            return .{ .memory = memory };
+        }
+
+        fn get(self: *const Self, comptime index: usize) *getType(index) {
+            var offset: usize = 0;
+            inline for (types, 0..) |T, i| {
+                offset = std.mem.alignForward(usize, offset, @alignOf(T));
+
+                if (i == index) {
+                    return @as(*T, @ptrCast(@alignCast(self.memory.ptr + offset)));
+                }
+                offset += @sizeOf(T);
+            }
+            unreachable;
+        }
+
+        fn set(self: *const Self, comptime index: usize, value: getType(index)) void {
+            const ptr = self.get(index);
+            ptr.* = value;
+        }
+
+        fn setRoot(self: *const Self) void {
+            const ptr = self.get(0);
+            ptr.* = .{ ._type = typeInit(types[0], self.get(1)) };
+        }
+
+        fn setMiddle(self: *const Self, comptime index: usize) void {
+            assert(index >= 1);
+            assert(index < types.len);
+
+            const ptr = self.get(index);
+            ptr.* = if (comptime @hasField(types[index], "_proto"))
+                .{ ._proto = undefined, ._type = typeInit(types[index], self.get(index + 1)) }
+            else
+                .{ ._type = typeInit(types[index], self.get(index + 1)) };
+            setProto(ptr, self.get(index - 1));
+        }
+
+        fn setLeaf(self: *const Self, comptime index: usize, value: anytype) void {
+            assert(index >= 1);
+
+            const ptr = self.get(index);
+            ptr.* = value;
+            setProto(ptr, self.get(index - 1));
+        }
+    };
+}
+
+fn AutoPrototypeChain(comptime types: []const type) type {
+    return struct {
+        fn create(allocator: std.mem.Allocator, leaf_value: anytype) !*@TypeOf(leaf_value) {
+            const chain = try PrototypeChain(types).allocate(allocator);
+
+            chain.setRoot();
+
+            inline for (1..types.len - 1) |i| {
+                chain.setMiddle(i);
+            }
+
+            chain.setLeaf(types.len - 1, leaf_value);
+            return chain.get(types.len - 1);
+        }
+
+        // Same, for a node chain: stamps the Node with its document.
+        fn createOwned(allocator: std.mem.Allocator, owner: u32, leaf_value: anytype) !*@TypeOf(leaf_value) {
+            comptime assert(types[1] == Node);
+            const chain = try PrototypeChain(types).allocate(allocator);
+
+            chain.setRoot();
+
+            inline for (1..types.len - 1) |i| {
+                chain.setMiddle(i);
+            }
+
+            chain.setLeaf(types.len - 1, leaf_value);
+            chain.get(1)._owner = owner;
+            return chain.get(types.len - 1);
+        }
+    };
+}
+
+fn eventInit(arena: *lp.Arena, typ: String, value: anytype) !Event {
+    // Round to 2ms for privacy (browsers do this)
+    // Same (already coarsened) clock as the performance time origin, so the
+    // timeStamp getter can report it relative to that origin.
+    const time_stamp = @import("webapi/Performance.zig").highResTimestamp();
+
+    return .{
+        ._rc = .{},
+        ._arena = arena,
+        ._type = unionInit(Event.Type, value),
+        ._type_string = typ,
+        ._time_stamp = time_stamp,
+    };
+}
+
+pub fn blob(_: *const Factory, arena: Allocator, child: anytype) !*@TypeOf(child) {
+    // Special case: Blob has slice and mime fields, so we need manual setup
+    const chain = try PrototypeChain(
+        &.{ Blob, @TypeOf(child) },
+    ).allocate(arena.allocator());
+
+    const blob_ptr = chain.get(0);
+    blob_ptr.* = .{
+        ._rc = .{},
+        ._arena = arena,
+        ._type = unionInit(Blob.Type, chain.get(1)),
+        ._slice = "",
+        ._mime = "",
+    };
+    chain.setLeaf(1, child);
+
+    return chain.get(1);
+}
+
+pub fn abstractRange(_: *const Factory, arena: *lp.Arena, child: anytype, frame: *Frame) !*@TypeOf(child) {
+    const chain = try PrototypeChain(&.{ AbstractRange, @TypeOf(child) }).allocate(arena.allocator());
+
+    const doc = frame.document.asNode();
+    const abstract_range = chain.get(0);
+    abstract_range.* = AbstractRange{
+        ._rc = .{},
+        ._arena = arena,
+        ._end_offset = 0,
+        ._start_offset = 0,
+        ._end_container = doc,
+        ._start_container = doc,
+        ._frame_loader_id = frame._loader_id,
+        ._type = unionInit(AbstractRange.Type, chain.get(1)),
+    };
+    chain.setLeaf(1, child);
+
+    if (abstract_range._type != .static_range) {
+        // StaticRanges are not live, so they don't get added to the frame's
+        // live_ranges list.
+        frame._live_ranges.append(&abstract_range._range_link);
+    }
+
+    return chain.get(1);
+}
+
+pub fn domRect(self: *Factory, rect: DOMRectReadOnly.Data) !*DOMRect {
+    const chain = try PrototypeChain(&.{ DOMRectReadOnly, DOMRect }).allocate(self._recycling.allocator());
+
+    const base = chain.get(0);
+    base.* = .{
+        ._type = .{ .mutable = chain.get(1) },
+        ._x = rect.x,
+        ._y = rect.y,
+        ._width = rect.width,
+        ._height = rect.height,
+    };
+    chain.setLeaf(1, DOMRect{ ._proto = base });
+
+    return chain.get(1);
+}
+
+pub fn node(self: *Factory, owner: *const Document, child: anytype) !*@TypeOf(child) {
+    comptime assert(@TypeOf(child) != Document);
+    const allocator = self._recycling.allocator();
+    return try AutoPrototypeChain(
+        &.{ EventTarget, Node, @TypeOf(child) },
+    ).createOwned(allocator, owner._index, child);
+}
+
+pub const DocumentOpts = struct {
+    url: ?[:0]const u8 = null,
+    charset: ?[]const u8 = null,
+};
+
+// A Document with no more specific type (`new Document()`, XHR's responseXML).
+pub fn genericDocument(self: *Factory, opts: DocumentOpts) !*Document {
+    const chain = try self.documentChain(&.{ EventTarget, Node, Document }, opts);
+    return chain.get(2);
+}
+
+// Documents: {EventTarget, Node, Document, [Leaf]}. The Document is registered
+// in the browser's table as it is built, so it knows its page and slot from
+// the start.
+fn documentChain(self: *Factory, comptime types: []const type, opts: DocumentOpts) !PrototypeChain(types) {
+    comptime assert(types[1] == Node and types[2] == Document);
+    const chain = try PrototypeChain(types).allocate(self._recycling.allocator());
+    const doc = chain.get(2);
+    const index = try self.registerDocument(doc);
+
+    chain.setRoot();
+    chain.setMiddle(1);
+    chain.get(1)._owner = index;
+
+    doc.* = .{
+        ._proto = undefined,
+        ._type = if (comptime types.len == 3) .generic else typeInit(Document, chain.get(3)),
+        ._page = self._page,
+        ._index = index,
+        ._url = opts.url,
+        ._charset = opts.charset,
+    };
+    setProto(doc, chain.get(1));
+    return chain;
+}
+
+// CData nodes: {EventTarget, Node, CData, [Text,] Leaf}.
+// CData is special, it's _type is a bare tag, not a tagged union. A website can
+// have tens of thousands of Text nodes, and this allows a few optimization to
+// both reduce the # of allocations and the size
+pub fn cdataNode(self: *Factory, owner: *const Document, cd: Node.CData, leaf: anytype) !*Node.CData {
+    const types = comptime prototypeTypes(@TypeOf(leaf));
+    comptime assert(types[0] == EventTarget and types[1] == Node and types[2] == Node.CData);
+
+    const chain = try PrototypeChain(types).allocate(self._recycling.allocator());
+    chain.setRoot();
+    chain.setMiddle(1);
+    chain.get(1)._owner = owner._index;
+
+    const cd_ptr = chain.get(2);
+    cd_ptr.* = cd;
+    setProto(cd_ptr, chain.get(1));
+
+    // only the CDATASection chain has a middle here (its Text)
+    inline for (3..types.len - 1) |i| {
+        const ptr = chain.get(i);
+        ptr.* = .{};
+        setProto(ptr, chain.get(i - 1));
+    }
+    chain.setLeaf(types.len - 1, leaf);
+    return cd_ptr;
+}
+
+// The full type list for a leaf. Walks the Proto chain.
+// For example CData.Text -> [_]type{EventTarget, Node, CData, Text}).
+fn prototypeTypes(comptime Leaf: type) []const type {
+    comptime {
+        var types: []const type = &.{Leaf};
+        var T = Leaf;
+        while (reflect.Proto(T)) |P| {
+            T = P;
+            types = &[_]type{P} ++ types;
+        }
+        return types;
+    }
+}
+
+// Byte offset of T within the chain allocation for `Leaf`. This is what lets
+// a child reach its parent without a stored pointer.
+pub fn chainOffsetOf(comptime Leaf: type, comptime T: type) usize {
+    comptime {
+        var offset: usize = 0;
+        for (prototypeTypes(Leaf)) |C| {
+            offset = std.mem.alignForward(usize, offset, @alignOf(C));
+            if (C == T) return offset;
+            offset += @sizeOf(C);
+        }
+        @compileError(@typeName(T) ++ " is not in the prototype chain of " ++ @typeName(Leaf));
+    }
+}
+
+// Offset from T to its Proto
+pub fn protoOffset(comptime T: type) usize {
+    const P = reflect.Proto(T).?;
+    return chainOffsetOf(T, T) - chainOffsetOf(T, P);
+}
+
+// Get the Proto of a value.
+pub fn protoOf(value: anytype) *reflect.Proto(reflect.Struct(@TypeOf(value))).? {
+    const T = reflect.Struct(@TypeOf(value));
+    const proto: *reflect.Proto(T).? = @ptrFromInt(@intFromPtr(value) - comptime protoOffset(T));
+    if (comptime lp.IS_DEBUG) {
+        // In debug, we'll assert that our offset and the _proto field agree.
+        std.debug.assert(proto == if (comptime hasStoredProto(T)) value._proto else value._proto_canary);
+    }
+    return proto;
+}
+
+// Assigns a chain member's stored `_proto`
+fn setProto(ptr: anytype, proto: anytype) void {
+    const T = reflect.Struct(@TypeOf(ptr));
+    if (comptime hasStoredProto(T)) {
+        ptr._proto = proto;
+    } else if (comptime lp.IS_DEBUG and @hasField(T, "_proto_canary")) {
+        ptr._proto_canary = proto;
+    }
+}
+
+fn hasStoredProto(comptime T: type) bool {
+    return @hasField(T, "_proto") and @FieldType(T, "_proto") != void;
+}
+
+// Generic contiguous chain from explicit values, for chains whose middles
+// can't be default-initialized by AutoPrototypeChain. Callers pass every
+// level's value in root-to-leaf order, with `undefined` for `_proto` and for
+// any field that must point at another chain member, patching the latter on
+// the result.
+pub fn chained(self: *Factory, values: anytype) !*ChainedLeaf(@TypeOf(values)) {
+    return chainedWithAllocator(self._recycling.allocator(), values);
+}
+
+pub fn chainedWithAllocator(allocator: Allocator, values: anytype) !*ChainedLeaf(@TypeOf(values)) {
+    const types = @typeInfo(@TypeOf(values)).@"struct".field_types;
+    comptime {
+        for (types[1..], 0..) |T, i| {
+            assert(reflect.Proto(T).? == types[i]);
+        }
+    }
+
+    const chain = try PrototypeChain(types).allocate(allocator);
+    inline for (0..types.len) |i| {
+        const ptr = chain.get(i);
+        ptr.* = values[i];
+        if (i > 0) {
+            setProto(ptr, chain.get(i - 1));
+        }
+    }
+    return chain.get(types.len - 1);
+}
+
+fn ChainedLeaf(comptime Values: type) type {
+    const field_types = @typeInfo(Values).@"struct".field_types;
+    return field_types[field_types.len - 1];
+}
+
+pub fn document(self: *Factory, child: anytype) !*@TypeOf(child) {
+    const chain = try self.documentChain(&.{ EventTarget, Node, Document, @TypeOf(child) }, .{});
+    chain.setLeaf(3, child);
+    return chain.get(3);
+}
+
+pub fn documentFragment(self: *Factory, owner: *const Document, child: anytype) !*@TypeOf(child) {
+    const allocator = self._recycling.allocator();
+    return try AutoPrototypeChain(
+        &.{ EventTarget, Node, Node.DocumentFragment, @TypeOf(child) },
+    ).createOwned(allocator, owner._index, child);
+}
+
+pub fn element(self: *Factory, owner: *const Document, child: anytype) !*@TypeOf(child) {
+    const allocator = self._recycling.allocator();
+    return try AutoPrototypeChain(
+        &.{ EventTarget, Node, Element, @TypeOf(child) },
+    ).createOwned(allocator, owner._index, child);
+}
+
+pub fn htmlElement(self: *Factory, owner: *const Document, child: anytype) !*@TypeOf(child) {
+    const allocator = self._recycling.allocator();
+    return try AutoPrototypeChain(
+        &.{ EventTarget, Node, Element, Element.Html, @TypeOf(child) },
+    ).createOwned(allocator, owner._index, child);
+}
+
+pub fn htmlMediaElement(self: *Factory, owner: *const Document, child: anytype) !*@TypeOf(child) {
+    const allocator = self._recycling.allocator();
+    return try AutoPrototypeChain(
+        &.{ EventTarget, Node, Element, Element.Html, Element.Html.Media, @TypeOf(child) },
+    ).createOwned(allocator, owner._index, child);
+}
+
+pub fn svgElement(self: *Factory, owner: *const Document, tag_name: []const u8, child: anytype) !*@TypeOf(child) {
+    const types = comptime svgPrototypeTypes(@TypeOf(child));
+    const chain = try PrototypeChain(types).allocate(self._recycling.allocator());
+
+    chain.setRoot();
+    inline for (1..types.len - 1) |i| {
+        const T = types[i];
+        if (T == Element.Svg) {
+            const svg_ptr = chain.get(i);
+            svg_ptr.* = .{
+                ._tag_name = try String.init(self._arena, tag_name, .{}),
+                ._type = typeInit(Element.Svg, chain.get(i + 1)),
+            };
+            setProto(svg_ptr, chain.get(i - 1));
+        } else {
+            chain.setMiddle(i);
+        }
+    }
+    chain.setLeaf(types.len - 1, child);
+    chain.get(1)._owner = owner._index;
+    return chain.get(types.len - 1);
+}
+
+fn svgPrototypeTypes(comptime Child: type) []const type {
+    const types = prototypeTypes(Child);
+    if (types.len < 5 or types[0] != EventTarget or types[3] != Element.Svg) {
+        @compileError(@typeName(Child) ++ " is not an SVG prototype chain");
+    }
+    return types;
+}
+
+pub fn xhrEventTarget(_: *const Factory, allocator: Allocator, child: anytype) !*@TypeOf(child) {
+    return try AutoPrototypeChain(
+        &.{ EventTarget, XMLHttpRequestEventTarget, @TypeOf(child) },
+    ).create(allocator, child);
+}
+
+pub fn idbOpenRequest(self: *Factory, child: anytype) !*@TypeOf(child) {
+    return try AutoPrototypeChain(
+        &.{ EventTarget, IDBRequest, @TypeOf(child) },
+    ).create(self._recycling.allocator(), child);
+}
+
+pub fn taskSignal(self: *Factory, child: anytype) !*@TypeOf(child) {
+    return try AutoPrototypeChain(
+        &.{ EventTarget, AbortSignal, @TypeOf(child) },
+    ).create(self._recycling.allocator(), child);
+}
+
+pub fn textTrackCue(self: *Factory, child: anytype) !*@TypeOf(child) {
+    const allocator = self._recycling.allocator();
+    const TextTrackCue = @import("webapi/media/TextTrackCue.zig");
+
+    return try AutoPrototypeChain(
+        &.{ EventTarget, TextTrackCue, @TypeOf(child) },
+    ).create(allocator, child);
+}
+
+pub fn destroy(self: *Factory, value: anytype) void {
+    const S = reflect.Struct(@TypeOf(value));
+
+    if (comptime lp.IS_DEBUG) {
+        // We should always destroy from the leaf down.
+        if (comptime @hasDecl(S, "_prototype_root")) {
+            const is_leaf = if (comptime @hasField(S, "_type")) value._type == .generic else false;
+            if (!is_leaf) {
+                log.fatal(.bug, "factory.destroy.root", .{ .type = @typeName(S) });
+                unreachable;
+            }
+        }
+    }
+
+    if (comptime reflect.Proto(S) != null) {
+        self.destroyChain(value, 0, std.mem.Alignment.@"1");
+    } else {
+        self.destroyStandalone(value);
+    }
+}
+
+pub fn destroyStandalone(self: *Factory, value: anytype) void {
+    const allocator = self._recycling.allocator();
+    allocator.destroy(value);
+}
+
+fn destroyChain(
+    self: *Factory,
+    value: anytype,
+    old_size: usize,
+    old_align: std.mem.Alignment,
+) void {
+    const S = reflect.Struct(@TypeOf(value));
+    const allocator = self._recycling.allocator();
+
+    // aligns the old size to the alignment of this element
+    const current_size = std.mem.alignForward(usize, old_size, @alignOf(S));
+    const new_size = current_size + @sizeOf(S);
+    const new_align = std.mem.Alignment.max(old_align, std.mem.Alignment.of(S));
+
+    if (comptime reflect.Proto(S) != null) {
+        self.destroyChain(protoOf(value), new_size, new_align);
+    } else {
+        // no proto so this is the head of the chain.
+        // we use this as the ptr to the start of the chain.
+        // and we have summed up the length.
+        assert(@hasDecl(S, "_prototype_root"));
+
+        const memory_ptr: [*]u8 = @ptrCast(@constCast(value));
+        const len = std.mem.alignForward(usize, new_size, new_align.toByteUnits());
+        allocator.rawFree(memory_ptr[0..len], new_align, @returnAddress());
+    }
+}
+
+fn createT(self: *Factory, comptime T: type) !*T {
+    const allocator = self._recycling.allocator();
+    return try allocator.create(T);
+}
+
+pub fn create(self: *Factory, value: anytype) !*@TypeOf(value) {
+    const ptr = try self.createT(@TypeOf(value));
+    ptr.* = value;
+    return ptr;
+}
+
+fn unionInit(comptime T: type, value: anytype) T {
+    const V = @TypeOf(value);
+    const field_name = comptime unionFieldName(T, V);
+    return @unionInit(T, field_name, value);
+}
+
+// Initializes Parent._type for the chain member laid out after Parent. For a
+// tagged-union _type the member's pointer is the payload; for a bare-tag _type
+// (e.g. Node, CData) the member is reached by arithmetic and only its tag is
+// stored.
+fn typeInit(comptime Parent: type, value: anytype) Parent.Type {
+    if (comptime @typeInfo(Parent.Type) == .@"enum") {
+        return comptime subtypeTag(Parent, reflect.Struct(@TypeOf(value)));
+    }
+    return unionInit(Parent.Type, value);
+}
+
+fn subtypeTag(comptime Parent: type, comptime V: type) Parent.Type {
+    for (@typeInfo(Parent.Type).@"enum".field_values) |field_value| {
+        const tag: Parent.Type = @fromBackingInt(field_value);
+        if (Parent.Subtype(tag) == V) return tag;
+    }
+    @compileError(@typeName(V) ++ " is not a subtype of " ++ @typeName(Parent));
+}
+
+// There can be friction between comptime and runtime. Comptime has to
+// account for all possible types, even if some runtime flow makes certain
+// cases impossible. At runtime, we always call `unionFieldName` with the
+// correct struct or pointer type. But at comptime time, `unionFieldName`
+// is called with both variants (S and *S). So we use reflect.Struct().
+// This only works because we never have a union with a field S and another
+// field *S.
+fn unionFieldName(comptime T: type, comptime V: type) []const u8 {
+    inline for (@typeInfo(T).@"union".field_names, @typeInfo(T).@"union".field_types) |field_name, field_type| {
+        if (reflect.Struct(field_type) == reflect.Struct(V)) {
+            return field_name;
+        }
+    }
+    @compileError(@typeName(V) ++ " is not a valid type for " ++ @typeName(T) ++ ".type");
+}

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<body>
+  <script src="../testing.js"></script>
+  <h1 id=h>Hello</h1>
+  <p id=p1>One</p>
+  <p id=p2>Two</p>
+</body>
+
+<script id=create_expression>
+{
+  const expr = document.createExpression("//p", null);
+  testing.expectEqual(true, expr instanceof XPathExpression);
+  testing.expectEqual('function', typeof expr.evaluate);
+}
+</script>
+
+<script id=expression_evaluate>
+{
+  const expr = document.createExpression("//p", null);
+  const r = expr.evaluate(document, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+  testing.expectEqual(true, r instanceof XPathResult);
+  testing.expectEqual(2, r.snapshotLength);
+}
+</script>
+
+<script id=expression_reuse_distinct_types>
+{
+  // The cached AST should support multiple evaluations against
+  // different requested types.
+  const expr = document.createExpression("//p", null);
+
+  const snap = expr.evaluate(document, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+  testing.expectEqual(2, snap.snapshotLength);
+
+  const iter = expr.evaluate(document, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+  testing.expectEqual('p1', iter.iterateNext().id);
+  testing.expectEqual('p2', iter.iterateNext().id);
+
+  const first = expr.evaluate(document, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+  testing.expectEqual('p1', first.singleNodeValue.id);
+}
+</script>
+
+<script id=expression_reuse_distinct_contexts>
+{
+  // Re-evaluating with a different context node should rescope.
+  const expr = document.createExpression("p", null);
+
+  const all = expr.evaluate(document.body, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+  testing.expectEqual(2, all.snapshotLength);
+
+  const empty = expr.evaluate(document.querySelector('h1'),
+    XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+  testing.expectEqual(0, empty.snapshotLength);
+}
+</script>
+
+<script id=create_ns_resolver>
+{
+  const resolver = document.createNSResolver(document);
+  testing.expectEqual(document, resolver);
+  const elt = document.createNSResolver(document.body);
+  testing.expectEqual(document.body, elt);
+}
+</script>
+
+<script id=new_xpath_evaluator>
+{
+  const ev = new XPathEvaluator();
+  testing.expectEqual(true, ev instanceof XPathEvaluator);
+  testing.expectEqual('function', typeof ev.evaluate);
+  testing.expectEqual('function', typeof ev.createExpression);
+  testing.expectEqual('function', typeof ev.createNSResolver);
+}
+</script>
+
+<script id=evaluator_evaluate>
+{
+  const ev = new XPathEvaluator();
+  const r = ev.evaluate("//p", document, null,
+    XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+  testing.expectEqual(true, r instanceof XPathResult);
+  testing.expectEqual(2, r.snapshotLength);
+  testing.expectEqual('p1', r.snapshotItem(0).id);
+}
+</script>
+
+<script id=evaluator_create_expression>
+{
+  const ev = new XPathEvaluator();
+  const expr = ev.createExpression("count(//p)", null);
+  testing.expectEqual(true, expr instanceof XPathExpression);
+  const r = expr.evaluate(document, XPathResult.NUMBER_TYPE, null);
+  testing.expectEqual(2, r.numberValue);
+}
+</script>
+
+<script id=evaluator_create_ns_resolver>
+{
+  const ev = new XPathEvaluator();
+  testing.expectEqual(document, ev.createNSResolver(document));
+}
+</script>
+
+<script id=deep_nesting>
+{
+  // The descendant, following and preceding axes used to recurse per level,
+  // which overflowed an 8MB stack at a depth of about 35000 in debug builds.
+  const depth = 50000;
+  // Built bottom-up: appending under a deep parent walks its ancestors.
+  const chain = (prefix) => {
+    let top = document.createElement('div');
+    top.id = prefix + '_deepest';
+    for (let i = 1; i < depth; i++) {
+      const div = document.createElement('div');
+      div.appendChild(top);
+      top = div;
+    }
+    return top;
+  };
+
+  const root = document.createElement('section');
+  root.appendChild(chain('before'));
+  const mid = root.appendChild(document.createElement('span'));
+  root.appendChild(chain('after'));
+
+  const num = (expr, ctx) => document.evaluate(expr, ctx, null, XPathResult.NUMBER_TYPE, null).numberValue;
+  const first = (expr, ctx) => document.evaluate(expr, ctx, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+
+  // .//div takes the fused descendant fast path, descendant::div the axis.
+  testing.expectEqual(depth * 2, num('count(.//div)', root));
+  testing.expectEqual(depth * 2, num('count(descendant::div)', root));
+  testing.expectEqual(depth, num('count(preceding::div)', mid));
+  testing.expectEqual(depth, num('count(following::div)', mid));
+  // preceding is a reverse axis: position 1 is the nearest node, the deepest one.
+  testing.expectEqual('before_deepest', first('preceding::div[1]', mid).id);
+  testing.expectEqual('after_deepest', first('following::div[last()]', mid).id);
+}
+</script>

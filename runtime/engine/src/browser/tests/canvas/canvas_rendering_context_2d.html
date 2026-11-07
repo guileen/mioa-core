@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<script id="native_2d_identity_pixels_resize">
+{
+  const canvas = document.createElement('canvas');
+  canvas.width = 16; canvas.height = 12;
+  const ctx = canvas.getContext('2d');
+  testing.expectTrue(ctx instanceof CanvasRenderingContext2D);
+  testing.expectEqual(canvas, ctx.canvas);
+  testing.expectEqual(ctx, canvas.getContext('2d'));
+  testing.expectEqual(null, canvas.getContext('webgl'));
+  ctx.fillStyle = '#ff0000'; ctx.fillRect(1, 2, 4, 3);
+  testing.expectEqual('255,0,0,255', Array.from(ctx.getImageData(2, 3, 1, 1).data).join());
+  testing.expectEqual(0, ctx.getImageData(0, 0, 1, 1).data[3]);
+  ctx.globalAlpha = .3; ctx.lineWidth = 7; ctx.setLineDash([3]);
+  canvas.width = canvas.width;
+  testing.expectEqual(1, ctx.globalAlpha);
+  testing.expectEqual(1, ctx.lineWidth);
+  testing.expectEqual(0, ctx.getLineDash().length);
+  testing.expectEqual('#000000', ctx.fillStyle);
+  testing.expectEqual(0, ctx.getImageData(2, 3, 1, 1).data[3]);
+}
+</script>
+<script id="native_functional_color_draw_readback_and_png">
+{
+  const canvas = document.createElement('canvas'); canvas.width = 4; canvas.height = 2;
+  const ctx = canvas.getContext('2d');
+  const reference = document.createElement('canvas'); reference.width = 4; reference.height = 2;
+  const expected = reference.getContext('2d');
+  ctx.fillStyle = 'rgba(255, 0, 0, 0.5)'; ctx.fillRect(0, 0, 2, 2);
+  expected.fillStyle = '#ff000080'; expected.fillRect(0, 0, 2, 2);
+  testing.expectEqual('255,0,0,128', Array.from(ctx.getImageData(0, 0, 1, 1).data).join());
+  ctx.fillStyle = 'rgb(0 100% 0 / 100%)'; ctx.fillRect(2, 0, 2, 2);
+  expected.fillStyle = '#00ff00'; expected.fillRect(2, 0, 2, 2);
+  testing.expectEqual('0,255,0,255', Array.from(ctx.getImageData(3, 0, 1, 1).data).join());
+  const validStyle = ctx.fillStyle;
+  ctx.fillStyle = 'rgba(1,2,3,bad)';
+  testing.expectEqual(validStyle, ctx.fillStyle);
+  testing.expectEqual(reference.toDataURL(), canvas.toDataURL());
+  testing.expectTrue(canvas.toDataURL().startsWith('data:image/png;base64,'));
+}
+</script>
+<script id="native_image_data_overloads_dirty_rect">
+{
+  const ctx = document.createElement('canvas').getContext('2d');
+  const image = ctx.createImageData(2, 2);
+  image.data.set([255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,0,255]);
+  const copy = ctx.createImageData(image);
+  testing.expectTrue(copy instanceof ImageData);
+  testing.expectEqual(2, copy.width);
+  testing.expectEqual(0, copy.data[3]);
+  ctx.globalAlpha = .1; ctx.translate(50, 50);
+  ctx.putImageData(image, 4, 5, 1, 0, 1, 2);
+  testing.expectEqual('0,255,0,255', Array.from(ctx.getImageData(5, 5, 1, 1).data).join());
+  testing.expectEqual(0, ctx.getImageData(4, 5, 1, 1).data[3]);
+  testing.expectEqual(2, ctx.getImageData(6, 7, -2, -2).width);
+  testing.expectEqual(0, ctx.getImageData(-1, -1, 1, 1).data[3]);
+  testing.expectError('Index', () => ctx.getImageData(0, 0, 0, 1));
+}
+</script>
+<script id="native_draw_image_overloads">
+{
+  const source = new OffscreenCanvas(2, 2);
+  source.getContext('2d').fillStyle = 'lime';
+  source.getContext('2d').fillRect(0, 0, 2, 2);
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.drawImage(source, 0, 0);
+  ctx.drawImage(source, 4, 0, 4, 4);
+  ctx.drawImage(source, 0, 0, 1, 1, 10, 0, 2, 2);
+  for (const x of [0, 5, 10]) testing.expectEqual('0,255,0,255', Array.from(ctx.getImageData(x, 0, 1, 1).data).join());
+  ctx.globalAlpha = .5; ctx.drawImage(source, 20, 0);
+  const alpha = ctx.getImageData(20, 0, 1, 1).data[3];
+  testing.expectTrue(alpha >= 127 && alpha <= 128);
+}
+</script>
+<script id="native_text_metrics_are_shaped">
+{
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.font = '20px sans-serif';
+  const narrow = ctx.measureText('iiii');
+  const wide = ctx.measureText('WWWW');
+  testing.expectTrue(narrow instanceof TextMetrics);
+  testing.expectTrue(wide.width > narrow.width);
+  testing.expectTrue(wide.actualBoundingBoxAscent > 0);
+  testing.expectTrue(Number.isFinite(wide.actualBoundingBoxRight));
+  testing.expectEqual(0, ctx.measureText('').width);
+  ctx.fillText('Hello 中文', 2, 28);
+  testing.expectTrue(ctx.getImageData(0, 0, 180, 40).data.some((v, i) => i % 4 === 3 && v > 0));
+  ctx.font = '40px sans-serif';
+  testing.expectTrue(ctx.measureText('WWWW').width > wide.width);
+  ctx.font = 'invalid'; testing.expectEqual('40px sans-serif', ctx.font);
+  const before = ctx.getImageData(0, 0, 180, 40).data.join();
+  ctx.measureText('measurement must not paint');
+  testing.expectEqual(before, ctx.getImageData(0, 0, 180, 40).data.join());
+}
+</script>
+<script id="native_path2d_hit_clip_and_evenodd">
+{
+  const canvas = document.createElement('canvas'); canvas.width = canvas.height = 24;
+  const ctx = canvas.getContext('2d');
+  const path = new Path2D(); path.rect(1, 1, 20, 20); path.rect(6, 6, 10, 10);
+  testing.expectTrue(path instanceof Path2D);
+  testing.expectTrue(ctx.isPointInPath(path, 2, 2));
+  testing.expectEqual(false, ctx.isPointInPath(path, 10, 10, 'evenodd'));
+  ctx.fillStyle = 'red'; ctx.fill(path, 'evenodd');
+  testing.expectEqual(255, ctx.getImageData(2, 2, 1, 1).data[0]);
+  testing.expectEqual(0, ctx.getImageData(10, 10, 1, 1).data[3]);
+  ctx.save(); const clip = new Path2D('M0 0 L5 0 L5 5 L0 5 Z'); ctx.clip(clip);
+  ctx.fillStyle = 'blue'; ctx.fillRect(0, 0, 24, 24); ctx.restore();
+  testing.expectEqual(255, ctx.getImageData(2, 2, 1, 1).data[2]);
+  testing.expectEqual(255, ctx.getImageData(18, 2, 1, 1).data[0]);
+  const clone = new Path2D(clip); const translated = new Path2D(); translated.addPath(clone, {e: 10, f: 10});
+  testing.expectTrue(ctx.isPointInPath(translated, 12, 12));
+  testing.expectEqual(false, ctx.isPointInPath(translated, 2, 2));
+  ctx.beginPath();ctx.moveTo(1, 8);ctx.lineTo(21, 8);ctx.lineWidth = 4;
+  testing.expectTrue(ctx.isPointInStroke(10, 8));
+  testing.expectEqual(false, ctx.isPointInStroke(10, 15));
+}
+</script>
+<script id="native_strokes_dashes_and_state">
+{
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.lineWidth = 4; ctx.lineCap = 'square'; ctx.lineJoin = 'bevel'; ctx.miterLimit = 3;
+  ctx.setLineDash([4, 4]); ctx.lineDashOffset = 0;
+  ctx.save();ctx.lineWidth = 1;ctx.lineCap = 'round';ctx.setLineDash([1]);ctx.restore();
+  testing.expectEqual(4,ctx.lineWidth);testing.expectEqual('square',ctx.lineCap);
+  testing.expectEqual('bevel',ctx.lineJoin);testing.expectEqual(3,ctx.miterLimit);
+  testing.expectEqual('4,4',ctx.getLineDash().join());
+  ctx.lineCap = 'butt';ctx.strokeStyle='red';ctx.beginPath();ctx.moveTo(0,4);ctx.lineTo(24,4);ctx.stroke();
+  testing.expectEqual(255,ctx.getImageData(1,4,1,1).data[3]);
+  testing.expectEqual(0,ctx.getImageData(6,4,1,1).data[3]);
+  ctx.setLineDash([-1]);testing.expectEqual('4,4',ctx.getLineDash().join());
+  ctx.setLineDash([3]);testing.expectEqual('3,3',ctx.getLineDash().join());
+  ctx.beginPath();ctx.roundRect(30,0,20,20,[{x:3,y:5},2]);ctx.fill();
+  testing.expectEqual(255,ctx.getImageData(40,10,1,1).data[3]);
+}
+</script>
+<script id="native_gradient_creation_ctm_conic_and_patterns">
+{
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.scale(2,1);const gradient=ctx.createLinearGradient(0,0,10,0);gradient.addColorStop(0,'red');gradient.addColorStop(1,'blue');ctx.resetTransform();
+  ctx.fillStyle=gradient;ctx.fillRect(0,0,20,4);
+  const mid=ctx.getImageData(10,1,1,1).data;testing.expectTrue(mid[0]>80 && mid[2]>80);
+  testing.expectTrue(ctx.fillStyle===gradient);
+  const conic=ctx.createConicGradient(0,30,10);conic.addColorStop(0,'red');conic.addColorStop(.5,'blue');conic.addColorStop(1,'red');
+  ctx.fillStyle=conic;ctx.fillRect(20,0,20,20);testing.expectEqual(255,ctx.getImageData(31,10,1,1).data[3]);
+  const tile=new OffscreenCanvas(2,1);const t=tile.getContext('2d');t.fillStyle='lime';t.fillRect(0,0,1,1);
+  const pattern=ctx.createPattern(tile,'repeat');testing.expectTrue(pattern instanceof CanvasPattern);pattern.setTransform({e:1});
+  ctx.fillStyle=pattern;ctx.fillRect(0,30,8,2);
+  testing.expectEqual(255,ctx.getImageData(1,30,1,1).data[1]);testing.expectEqual(0,ctx.getImageData(2,30,1,1).data[3]);
+  testing.expectError('Syntax',()=>ctx.createPattern(tile,'sideways'));
+}
+</script>
+<script id="native_alpha_compositing_and_transform_overloads">
+{
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.fillStyle='red';ctx.fillRect(0,0,8,8);ctx.globalAlpha=.5;ctx.fillStyle='blue';ctx.fillRect(0,0,8,8);
+  const p=ctx.getImageData(2,2,1,1).data;testing.expectTrue(p[0]>=126 && p[0]<=128);testing.expectTrue(p[2]>=127 && p[2]<=129);testing.expectEqual(255,p[3]);
+  ctx.globalCompositeOperation='destination-out';ctx.globalAlpha=1;ctx.fillRect(0,0,4,4);testing.expectEqual(0,ctx.getImageData(2,2,1,1).data[3]);
+  ctx.globalCompositeOperation='source-over';ctx.setTransform({a:1,d:1,e:12,f:0});ctx.fillRect(0,0,2,2);
+  testing.expectEqual(255,ctx.getImageData(12,0,1,1).data[3]);testing.expectEqual(12,ctx.getTransform().e);
+  ctx.setTransform();testing.expectEqual(0,ctx.getTransform().e);
+  ctx.reset();testing.expectEqual(0,ctx.getImageData(12,0,1,1).data[3]);
+}
+</script>

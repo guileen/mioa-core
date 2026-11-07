@@ -1,0 +1,256 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("../../../js/js.zig");
+const Factory = @import("../../../Factory.zig");
+const Frame = @import("../../../Frame.zig");
+
+const Node = @import("../../Node.zig");
+const Element = @import("../../Element.zig");
+const HtmlElement = @import("../Html.zig");
+const TreeWalker = @import("../../TreeWalker.zig");
+const Select = @import("Select.zig");
+
+const String = lp.String;
+
+const Option = @This();
+
+pub const Proto = HtmlElement;
+
+_proto_canary: if (lp.IS_DEBUG) *HtmlElement else void = undefined,
+_value: ?[]const u8 = null,
+_selected: bool = false,
+_default_selected: bool = false,
+
+pub fn constructor(text_: ?js.NullableString, value_: ?js.NullableString, default_selected_: ?bool, selected_: ?bool, frame: *Frame) !*Option {
+    const node = try Frame.node_factory.createElementNS(frame.document, .html, "option", null);
+    const el = node.as(Element);
+
+    const text = if (text_) |t| t.value else "";
+    if (text.len > 0) {
+        _ = try node.appendChild(try frame.document.createTextNode(text), frame);
+    }
+    if (value_) |v| {
+        try el.setAttributeSafe(comptime .wrap("value"), .wrap(v.value), frame);
+    }
+    if (default_selected_ orelse false) {
+        try el.setAttributeSafe(comptime .wrap("selected"), comptime .wrap(""), frame);
+    }
+
+    const self = el.as(Option);
+    self._selected = selected_ orelse false;
+    return self;
+}
+
+pub fn asElement(self: *Option) *Element {
+    return Factory.protoOf(self).asElement();
+}
+pub fn asConstElement(self: *const Option) *const Element {
+    return Factory.protoOf(self).asElement();
+}
+pub fn asNode(self: *Option) *Node {
+    return self.asElement().asNode();
+}
+
+pub fn getValue(self: *Option, frame: *Frame) []const u8 {
+    // If value attribute exists, use that; otherwise use the text
+    if (self._value) |v| {
+        return v;
+    }
+
+    return self.strippedText(frame.local_arena);
+}
+
+pub fn setValue(self: *Option, value: []const u8, frame: *Frame) !void {
+    const owned = try frame.dupeString(value);
+    try self.asElement().setAttributeSafe(comptime .wrap("value"), .wrap(owned), frame);
+    self._value = owned;
+}
+
+pub fn getText(self: *Option, frame: *Frame) []const u8 {
+    return self.strippedText(frame.call_arena);
+}
+
+// https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+fn strippedText(self: *Option, allocator: std.mem.Allocator) []const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    var pending_space = false;
+    var tw = TreeWalker.FullExcludeSelf.init(self.asNode(), .{});
+    while (tw.next()) |node| {
+        if (node.is(Element)) |el| {
+            if (el.getTag() == .script) {
+                // script tags are called out as being ignored.
+                tw.skipChildren();
+            }
+            continue;
+        }
+        const cdata = node.is(Node.CData) orelse continue;
+        switch (cdata._type) {
+            .text, .cdata_section => {},
+            .comment, .processing_instruction => continue,
+        }
+        const data = cdata._data.str();
+        // +1 for a space pending from the previous node
+        result.ensureUnusedCapacity(allocator, data.len + 1) catch return "";
+        for (data) |c| switch (c) {
+            ' ', '\t', '\n', '\r', '\x0C' => pending_space = result.items.len > 0,
+            else => {
+                if (pending_space) {
+                    result.appendAssumeCapacity(' ');
+                    pending_space = false;
+                }
+                result.appendAssumeCapacity(c);
+            },
+        };
+    }
+    return result.items;
+}
+
+fn setText(self: *Option, value: []const u8, frame: *Frame) !void {
+    try self.asNode().setTextContent(value, frame);
+}
+
+pub fn getSelected(self: *const Option) bool {
+    return self._selected;
+}
+
+pub fn setSelected(self: *Option, selected: bool, frame: *Frame) !void {
+    self.setSelectedness(selected);
+    frame.domChanged();
+}
+
+fn setSelectedness(self: *Option, selected: bool) void {
+    if (self._selected == selected) {
+        // Deselecting an option that isn't selected doesn't ask for a reset.
+        return;
+    }
+    self._selected = selected;
+    if (self.ownerSelect()) |select| {
+        select.optionSelectednessChanged(self);
+    }
+}
+
+/// The <select> this option belongs to, directly or through an <optgroup>.
+pub fn ownerSelect(self: *Option) ?*Select {
+    var node = self.asNode().parentNode();
+    while (node) |n| : (node = n.parentNode()) {
+        if (n.is(Select)) |select| return select;
+        if (n.is(Element.Html.OptGroup) == null) return null;
+    }
+    return null;
+}
+
+fn getDefaultSelected(self: *const Option) bool {
+    return self.asConstElement().hasAttributeInterned("selected");
+}
+
+fn setDefaultSelected(self: *Option, value: bool, frame: *Frame) !void {
+    self._default_selected = value;
+    if (value) {
+        try self.asElement().setAttributeSafe(comptime .wrap("selected"), .wrap(""), frame);
+    } else {
+        try self.asElement().removeAttribute(comptime .wrap("selected"), frame);
+    }
+}
+
+// https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-index
+fn getIndex(self: *Option) u32 {
+    const select = self.ownerSelect() orelse return 0;
+    return select.optionIndex(self) orelse 0;
+}
+
+// https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
+// On getting, return the `label` content attribute if present (verbatim, even
+// when empty), otherwise the value of the `text` IDL attribute. On setting,
+// reflect to the `label` content attribute.
+fn getLabel(self: *Option, frame: *Frame) []const u8 {
+    return self.asElement().getAttributeSafe(comptime .wrap("label")) orelse self.getText(frame);
+}
+
+fn setLabel(self: *Option, label: []const u8, frame: *Frame) !void {
+    try self.asElement().setAttributeSafe(comptime .wrap("label"), .wrap(label), frame);
+}
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(Option);
+
+    pub const Meta = struct {
+        pub const name = "HTMLOptionElement";
+        pub const constructor_alias = "Option";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    const reflect = Element.Reflect(Option);
+
+    pub const constructor = bridge.constructor(Option.constructor, .{});
+    pub const value = bridge.accessor(Option.getValue, Option.setValue, .{ .ce_reactions = true });
+    pub const text = bridge.accessor(Option.getText, Option.setText, .{ .ce_reactions = true });
+    pub const label = bridge.accessor(Option.getLabel, Option.setLabel, .{ .ce_reactions = true });
+    pub const selected = bridge.accessor(Option.getSelected, Option.setSelected, .{});
+    pub const defaultSelected = bridge.accessor(Option.getDefaultSelected, Option.setDefaultSelected, .{ .ce_reactions = true });
+    pub const disabled = reflect.boolean("disabled");
+    pub const index = bridge.accessor(Option.getIndex, null, .{});
+};
+
+pub const Build = struct {
+    pub fn created(node: *Node, _: *Frame) !void {
+        var self = node.as(Option);
+        const element = self.asElement();
+
+        // Check for value attribute
+        self._value = element.getAttributeInterned("value");
+
+        // Check for selected attribute
+        self._default_selected = element.getAttributeInterned("selected") != null;
+        self._selected = self._default_selected;
+    }
+
+    pub fn attributeChange(element: *Element, name: String, _: String, _: *Frame) !void {
+        const attribute = std.meta.stringToEnum(enum { value, selected }, name.str()) orelse return;
+        const self = element.as(Option);
+        switch (attribute) {
+            // `value` is passed by value; for <= 12 bytes, str() points into our
+            // own parameter copy, so we have to re-read the owned bytes.
+            .value => self._value = element.getAttributeInterned("value"),
+            .selected => {
+                self._default_selected = true;
+                self.setSelectedness(true);
+            },
+        }
+    }
+
+    pub fn attributeRemove(element: *Element, name: String, _: *Frame) !void {
+        const attribute = std.meta.stringToEnum(enum { value, selected }, name.str()) orelse return;
+        const self = element.as(Option);
+        switch (attribute) {
+            .value => self._value = null,
+            .selected => {
+                self._default_selected = false;
+                self.setSelectedness(false);
+            },
+        }
+    }
+};
+
+const testing = @import("../../../../testing.zig");
+test "WebApi: HTML.Option" {
+    try testing.htmlRunner("element/html/option.html", .{});
+}

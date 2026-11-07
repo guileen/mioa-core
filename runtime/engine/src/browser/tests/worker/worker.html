@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<body></body>
+<script src="../testing.js"></script>
+
+<script id="worker_creation">
+  {
+    // Just test that Worker constructor works - don't terminate immediately
+    // as that would destroy the context before the script loads
+    const worker = new Worker('./echo-worker.js');
+    testing.expectTrue(worker instanceof Worker);
+  }
+</script>
+
+<script id="worker_message" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+
+      // Give the script time to load before posting
+    setTimeout(() => {
+      worker.postMessage({ greeting: 'hello' });
+    }, 100);
+
+    await state.done((response) => {
+      testing.expectEqual('hello', response.echo.greeting);
+      testing.expectEqual('worker', response.from);
+    });
+  }
+</script>
+
+<script id="worker_structured_clone_date" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+
+    const testDate = new Date('2024-06-15T12:30:00Z');
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+
+    setTimeout(() => {
+      worker.postMessage({ date: testDate });
+    }, 100);
+
+    await state.done((response) => {
+      testing.expectTrue(response.echo.date instanceof Date);
+      testing.expectEqual(testDate.getTime(), response.echo.date.getTime());
+    });
+  }
+</script>
+
+<script id="worker_structured_clone_arraybuffer" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+
+    const buffer = new ArrayBuffer(8);
+    const view = new Uint8Array(buffer);
+    view[0] = 1; view[1] = 2; view[2] = 3; view[3] = 4;
+    view[4] = 5; view[5] = 6; view[6] = 7; view[7] = 8;
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    setTimeout(() => {
+      worker.postMessage({ buffer: buffer });
+    }, 100);
+
+    await state.done((response) => {
+      testing.expectTrue(response.echo.buffer instanceof ArrayBuffer);
+      testing.expectEqual(8, response.echo.buffer.byteLength);
+      const resultView = new Uint8Array(response.echo.buffer);
+      testing.expectEqual(1, resultView[0]);
+      testing.expectEqual(8, resultView[7]);
+    });
+  }
+</script>
+
+<script id="worker_structured_clone_typedarray" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+
+    const arr = new Float64Array([1.5, 2.5, 3.5, 4.5]);
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    setTimeout(() => {
+      worker.postMessage({ arr: arr });
+    }, 100);
+
+    await state.done((response) => {
+      testing.expectTrue(response.echo.arr instanceof Float64Array);
+      testing.expectEqual(4, response.echo.arr.length);
+      testing.expectEqual(1.5, response.echo.arr[0]);
+      testing.expectEqual(4.5, response.echo.arr[3]);
+    });
+  }
+</script>
+
+<script id="worker_structured_clone_map" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+
+    const map = new Map([['a', 1], ['b', 2], ['c', 3]]);
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    setTimeout(() => {
+      worker.postMessage({ map: map });
+    }, 100);
+
+    await state.done((response) => {
+      testing.expectTrue(response.echo.map instanceof Map);
+      testing.expectEqual(3, response.echo.map.size);
+      testing.expectEqual(1, response.echo.map.get('a'));
+      testing.expectEqual(3, response.echo.map.get('c'));
+    });
+  }
+</script>
+
+<script id="worker_structured_clone_set" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+
+    const set = new Set([1, 2, 3, 'four', 'five']);
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    setTimeout(() => {
+      worker.postMessage({ set: set });
+    }, 100);
+
+    await state.done((response) => {
+      testing.expectTrue(response.echo.set instanceof Set);
+      testing.expectEqual(5, response.echo.set.size);
+      testing.expectTrue(response.echo.set.has(1));
+      testing.expectTrue(response.echo.set.has('four'));
+    });
+  }
+</script>
+
+<script id="worker_structured_clone_regexp" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+
+    const regex = /hello.*world/gi;
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    setTimeout(() => {
+      worker.postMessage({ regex: regex });
+    }, 100);
+
+    await state.done((response) => {
+      testing.expectTrue(response.echo.regex instanceof RegExp);
+      testing.expectEqual('hello.*world', response.echo.regex.source);
+      testing.expectTrue(response.echo.regex.global);
+      testing.expectTrue(response.echo.regex.ignoreCase);
+    });
+  }
+</script>
+
+<script id="worker_replaceable" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./replaceable-worker.js');
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker replaceable error: ' + data.err);
+      testing.expectEqual(true, data.results.console_replaced);
+      testing.expectEqual(true, data.results.console_restored);
+      testing.expectEqual(true, data.results.self_replaced);
+      testing.expectEqual(true, data.results.self_restored);
+    });
+  }
+</script>
+
+<script id="worker_webapi_net" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./api-worker.js');
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker api error: ' + data.err);
+      const r = data.results;
+
+      // Headers
+      testing.expectEqual('hello, world', r.headers_get);
+      testing.expectEqual(true, r.headers_has);
+      testing.expectEqual(false, r.headers_has_missing);
+
+      // FormData
+      testing.expectEqual('first', r.formdata_get);
+      testing.expectEqual(2, r.formdata_getall.length);
+      testing.expectEqual('first', r.formdata_getall[0]);
+      testing.expectEqual('second', r.formdata_getall[1]);
+
+      // Request
+      testing.expectEqual('https://example.com/path', r.request_url);
+      testing.expectEqual('POST', r.request_method);
+      testing.expectEqual('header', r.request_headers_custom);
+      testing.expectEqual('request body', r.request_body_text);
+
+      // Response
+      testing.expectEqual(201, r.response_status);
+      testing.expectEqual('Created', r.response_status_text);
+      testing.expectEqual(true, r.response_ok);
+      testing.expectEqual('text/plain', r.response_headers_content_type);
+      testing.expectEqual('response body', r.response_body_text);
+      testing.expectEqual('response body', r.response_clone_text);
+
+      // AbortController / AbortSignal
+      testing.expectEqual(false, r.ac_aborted_before);
+      testing.expectEqual(true, r.ac_aborted_after);
+      testing.expectEqual(true, r.ac_listener_fired);
+      testing.expectEqual('cancelled', r.ac_reason);
+      testing.expectEqual(true, r.pre_aborted);
+      testing.expectEqual(true, r.pre_threw);
+
+      // URL.createObjectURL / revokeObjectURL
+      testing.expectEqual(true, r.blob_url_is_blob);
+
+      // WorkerLocation
+      testing.expectEqual(true, r.loc_is_worker_location);
+      testing.expectEqual(true, r.loc_identity_stable);
+      testing.expectTrue(r.loc_href.endsWith('api-worker.js'));
+      testing.expectEqual(r.loc_href, r.loc_to_string);
+      testing.expectEqual('http:', r.loc_protocol);
+      testing.expectTrue(r.loc_pathname.endsWith('api-worker.js'));
+
+      // DOMPoint
+      testing.expectEqual(5, r.point_x);
+      testing.expectEqual(0.5, r.point_w);
+    });
+  }
+</script>
+
+<script id="worker_navigator" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./navigator-worker.js');
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    worker.postMessage({ pageUserAgent: navigator.userAgent });
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker navigator error: ' + data.err);
+      const r = data.results;
+
+      testing.expectEqual(true, r.has_navigator);
+      testing.expectEqual(true, r.is_worker_navigator);
+      testing.expectEqual('[object WorkerNavigator]', r.to_string_tag);
+      testing.expectEqual(true, r.no_navigator_interface);
+      testing.expectEqual(true, r.user_agent_matches_page);
+      testing.expectEqual('Netscape', r.app_name);
+      testing.expectTrue(r.platform.length > 0);
+      testing.expectEqual(true, r.on_line);
+      testing.expectEqual(true, r.identity_stable);
+
+      // Permissions (transitive: Permissions -> PermissionStatus)
+      testing.expectEqual(true, r.permissions_distinct);
+      testing.expectEqual('geolocation', r.permission_name);
+      testing.expectEqual('prompt', r.permission_state);
+      testing.expectEqual(true, r.permission_is_target);
+
+      // StorageManager (transitive: StorageManager -> StorageEstimate)
+      testing.expectEqual(0, r.storage_usage);
+      testing.expectTrue(r.storage_quota > 0);
+
+      // NavigatorUAData
+      testing.expectEqual(true, r.has_ua_data);
+      testing.expectTrue(typeof r.ua_high_entropy_arch === 'string');
+      testing.expectEqual(navigator.appVersion, r.app_version);
+      testing.expectEqual(navigator.platform, r.platform);
+      testing.expectEqual(JSON.stringify(navigator.userAgentData.toJSON()), r.ua_json);
+      testing.expectEqual(navigator.userAgent.split('/')[1], r.ua_full_version);
+
+      // [Exposed=Window] members aren't part of WorkerNavigator.
+      testing.expectEqual(true, r.no_plugins);
+      testing.expectEqual(true, r.no_register_protocol_handler);
+      testing.expectEqual(true, r.no_model_context);
+      testing.expectEqual(true, r.no_send_beacon);
+      testing.expectEqual(true, r.no_cookie_enabled);
+    });
+  }
+</script>
+
+<script id="worker_dynamic_import" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./import-worker.js');
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+
+    await state.done((response) => {
+      testing.expectTrue(response.ok, 'worker import error: ' + response.err);
+      testing.expectEqual('imported from module', response.message);
+      testing.expectEqual(42, response.product);
+    });
+  }
+</script>
+
+<script id="worker_structured_clone_nested" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+
+    const complex = {
+      string: 'hello',
+      number: 42,
+      boolean: true,
+      null: null,
+      array: [1, 2, { nested: 'value' }],
+      date: new Date('2024-01-01'),
+      buffer: new Uint8Array([10, 20, 30]).buffer
+    };
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    setTimeout(() => {
+      worker.postMessage(complex);
+    }, 100);
+
+    await state.done((response) => {
+      testing.expectEqual('hello', response.echo.string);
+      testing.expectEqual(42, response.echo.number);
+      testing.expectEqual(true, response.echo.boolean);
+      testing.expectEqual(null, response.echo.null);
+      testing.expectEqual(3, response.echo.array.length);
+      testing.expectEqual('value', response.echo.array[2].nested);
+      testing.expectTrue(response.echo.date instanceof Date);
+      testing.expectTrue(response.echo.buffer instanceof ArrayBuffer);
+    });
+  }
+</script>
+
+<script id="worker_timers" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./timers-worker.js');
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker timers error: ' + data.err);
+      const r = data.results;
+
+      testing.expectEqual(true, r.setTimeout_id_is_number);
+      testing.expectEqual(5, r.setTimeout_args);
+      testing.expectEqual(true, r.setTimeout_this_is_self);
+      testing.expectEqual(1, r.setTimeout_length);
+
+      testing.expectEqual(true, r.setInterval_ids_distinct);
+      testing.expectEqual(true, r.setInterval_fired_multiple);
+      testing.expectEqual(true, r.setInterval_clear_stops);
+      testing.expectEqual(true, r.setInterval_pre_clear_silent);
+
+      testing.expectEqual(true, r.clear_invalid_silent);
+
+      testing.expectEqual(true, r.setTimeout_string_id_is_number);
+      testing.expectEqual(42, r.setTimeout_string_ran);
+      testing.expectEqual(true, r.setInterval_string_ran);
+
+      testing.expectEqual(true, r.setTimeout_non_string_id_is_number);
+    });
+  }
+</script>
+
+<script id="importScripts" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('importScripts-worker.js');
+
+    var received = [];
+    worker.onmessage = function(event) {
+      received.push(event);
+      if (received.length == 2) {
+        state.resolve();
+      }
+    };
+
+    await state.done(() => {
+      testing.expectEqual('importScripts-1', received[0].data);
+      testing.expectEqual('importScripts-2', received[1].data);
+    });
+  }
+</script>
+
+<script id="fetch_deferred_behind_importScripts" type=module>
+  // A worker fetch() whose response arrives during a blocking importScripts()
+  // is deferred by the DeferringLayer; the worker must flush it (it has no
+  // ScriptManager). Without the flush the fetch never resolves and its
+  // Response arena leaks (caught by the runner's ArenaPool leak check).
+  {
+    const state = await testing.async();
+    const worker = new Worker('fetch-defer-worker.js');
+    worker.onmessage = (event) => state.resolve(event.data);
+    worker.postMessage(null);
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker fetch failed: ' + data.err);
+      testing.expectEqual(200, data.status);
+    });
+  }
+</script>
+
+<script id="worker_post_before_load" type=module>
+  // Per spec, messages posted before the worker has finished loading must
+  // be buffered and delivered once onmessage is registered. Without the
+  // pending-message queue this hangs: postMessage fires immediately after
+  // new Worker, while the worker script's HTTP fetch is still in flight,
+  // so by the time the worker dispatches the message there is no
+  // onmessage listener yet and the message gets silently dropped.
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    // No setTimeout — post right now while the script is still loading.
+    worker.postMessage({ greeting: 'before-load' });
+
+    await state.done((response) => {
+      testing.expectEqual('before-load', response.echo.greeting);
+      testing.expectEqual('worker', response.from);
+    });
+  }
+</script>
+
+<script id="worker_module_type" type=module>
+  // A module-type worker: its entry script uses top-level static import (only
+  // valid in module workers), and importScripts() throws a TypeError.
+  {
+    const state = await testing.async();
+    const worker = new Worker('./module-worker.js', { type: 'module' });
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    worker.postMessage({ greeting: 'to-module' });
+
+    await state.done((response) => {
+      testing.expectEqual('to-module', response.echo.greeting);
+      testing.expectEqual('module-worker', response.from);
+      testing.expectEqual('from-base', response.baseValue);
+      testing.expectEqual('from-base', response.importedValue);
+      testing.expectEqual('local', response.localValue);
+      testing.expectEqual('TypeError', response.importScriptsError);
+    });
+  }
+</script>
+
+<script id="worker_from_blob_url" type=module>
+  // A blob: worker resolves its initial script through the HTTP client's
+  // synthetic-scheme path against the frame's blob registry, like any URL.
+  {
+    const state = await testing.async();
+    const blob = new Blob(["onmessage = (e) => postMessage({ echo: e.data, from: 'blob-worker' });"], { type: 'text/javascript' });
+    const blobUrl = URL.createObjectURL(blob);
+    const worker = new Worker(blobUrl);
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    worker.postMessage({ greeting: 'from-blob' });
+
+    await state.done((response) => {
+      testing.expectEqual('from-blob', response.echo.greeting);
+      testing.expectEqual('blob-worker', response.from);
+      URL.revokeObjectURL(blobUrl);
+    });
+  }
+</script>
+
+<script id="worker_fetch_page_blob_url" type=module>
+  // A blob URL created on the page must be fetchable from inside the worker:
+  // blob URLs are resolvable from any same-origin context, not just the
+  // creating frame.
+  {
+    const state = await testing.async();
+    const blobUrl = URL.createObjectURL(new Blob(['blob-payload'], { type: 'text/plain' }));
+    const worker = new Worker('./fetch-url-worker.js');
+    worker.onmessage = (event) => state.resolve(event.data);
+    worker.postMessage(blobUrl);
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'worker blob fetch failed: ' + data.err);
+      testing.expectEqual('blob-payload', data.text);
+      URL.revokeObjectURL(blobUrl);
+    });
+  }
+</script>
+
+<script id="worker_importscripts_blob_url" type=module>
+  // importScripts fetches synchronously (syncRequest); the blob URL minted
+  // on the page must resolve through the worker's owner.
+  {
+    const state = await testing.async();
+    const blobUrl = URL.createObjectURL(new Blob(["self.importedValue = 'from-blob-import';"], { type: 'text/javascript' }));
+    const worker = new Worker('./import-blob-worker.js');
+    worker.onmessage = (event) => state.resolve(event.data);
+    worker.postMessage(blobUrl);
+
+    await state.done((data) => {
+      testing.expectTrue(data.ok, 'importScripts(blob) failed: ' + data.err);
+      testing.expectEqual('from-blob-import', data.value);
+      URL.revokeObjectURL(blobUrl);
+    });
+  }
+</script>
+
+<script id="worker_from_blob_url_revoked_before_delivery" type=module>
+  // Revoking right after construction must not invalidate the queued
+  // script response: it's delivered on a later tick, after the blob's
+  // last reference may be gone.
+  {
+    const state = await testing.async();
+    const blob = new Blob(["onmessage = (e) => postMessage({ echo: e.data, from: 'revoked-blob-worker' });"], { type: 'text/javascript' });
+    const blobUrl = URL.createObjectURL(blob);
+    const worker = new Worker(blobUrl);
+    URL.revokeObjectURL(blobUrl);
+
+    worker.onmessage = function(event) {
+      state.resolve(event.data);
+    };
+    worker.postMessage({ greeting: 'still-works' });
+
+    await state.done((response) => {
+      testing.expectEqual('still-works', response.echo.greeting);
+      testing.expectEqual('revoked-blob-worker', response.from);
+    });
+  }
+</script>
+
+<script id="worker_terminate_during_fetch_fires_no_error" type=module>
+  // terminate() cancels the still-inflight script fetch. That's a
+  // cancellation, not a load failure: a terminated worker fires no further
+  // events, error included. Challenge scripts create a blob worker and
+  // terminate it in the same tick, and probe for exactly this.
+  {
+    const state = await testing.async();
+    const blobUrl = URL.createObjectURL(new Blob(["postMessage('loaded');"], { type: 'text/javascript' }));
+    const worker = new Worker(blobUrl);
+    let fired = null;
+    worker.onerror = () => { fired = 'error'; };
+    worker.onmessage = () => { fired = 'message'; };
+    worker.terminate();
+
+    setTimeout(() => state.resolve(fired), 100);
+    await state.done((fired) => {
+      testing.expectEqual(null, fired);
+      URL.revokeObjectURL(blobUrl);
+    });
+  }
+</script>
+
+<script id="worker_reports_callback_exceptions" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./report-error-worker.js');
+    worker.onmessage = (e) => state.resolve(e.data);
+    worker.postMessage('throw');
+
+    await state.done((data) => {
+      testing.expectEqual('listener,onmessage,queueMicrotask,reentrant,setTimeout', data.seen.join(','));
+      testing.expectEqual(1, data.reentrant);
+      worker.terminate();
+    });
+  }
+</script>
+
+<script id="worker_missing_script_fires_error" type=module>
+  // A non-2xx script response is a load failure, and must keep firing the
+  // error event: it travels the same error callback as a cancellation.
+  {
+    const state = await testing.async();
+    const worker = new Worker('./does-not-exist.js');
+    worker.onerror = (e) => {
+      e.preventDefault();
+      state.resolve(e);
+    };
+
+    await state.done((e) => {
+      testing.expectTrue(e instanceof ErrorEvent);
+    });
+  }
+</script>
+
+<script id="worker_offscreen_transfer" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+    const placeholder = document.createElement('canvas');
+    placeholder.width = 2;
+    placeholder.height = 2;
+    const canvas = placeholder.transferControlToOffscreen();
+    worker.onmessage = event => state.resolve(event.data);
+    worker.postMessage({ canvasTransfer: 'draw', canvas, again: canvas }, { transfer: [canvas] });
+    testing.expectEqual(0, canvas.width);
+    let detached = false;
+    try { canvas.getContext('2d'); } catch (error) { detached = error.name === 'InvalidStateError'; }
+    testing.expectTrue(detached);
+    await state.done(data => {
+      testing.expectEqual('drawn', data.canvasTransfer);
+      testing.expectEqual('255,0,0,255', data.pixels.join(','));
+      testing.expectTrue(data.sameReference);
+      testing.expectTrue(data.workerRealm);
+      testing.expectEqual('undefined', data.documentType);
+      worker.terminate();
+    });
+  }
+</script>
+
+<script id="worker_offscreen_transfer_roundtrip" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+    const canvas = new OffscreenCanvas(3, 2);
+    worker.onmessage = event => state.resolve(event.data);
+    worker.postMessage({ canvasTransfer: 'return', canvas }, [canvas]);
+    testing.expectEqual(0, canvas.width);
+    await state.done(data => {
+      testing.expectTrue(data.canvas instanceof OffscreenCanvas);
+      testing.expectEqual(3, data.canvas.width);
+      const context = data.canvas.getContext('2d');
+      context.fillStyle = '#008000';
+      context.fillRect(0, 0, 1, 1);
+      testing.expectEqual('0,128,0,255', Array.from(context.getImageData(0, 0, 1, 1).data).join(','));
+      worker.terminate();
+    });
+  }
+</script>
+
+<script id="worker_offscreen_created_in_native_worker" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./echo-worker.js');
+    worker.onmessage = event => state.resolve(event.data);
+    worker.postMessage({ canvasTransfer: 'create' });
+    await state.done(data => {
+      testing.expectTrue(data.canvas instanceof OffscreenCanvas);
+      testing.expectEqual(2, data.canvas.width);
+      const context = data.canvas.getContext('2d');
+      context.fillStyle = '#0000ff';
+      context.fillRect(0, 0, 1, 1);
+      testing.expectEqual('0,0,255,255', Array.from(context.getImageData(0, 0, 1, 1).data).join(','));
+      worker.terminate();
+    });
+  }
+</script>
+
+<script id="worker_offscreen_transfer_validation">
+  {
+    const worker = new Worker('./echo-worker.js');
+    const expectCloneError = action => {
+      let thrown = false;
+      try { action(); } catch (error) { thrown = error.name === 'DataCloneError'; }
+      testing.expectTrue(thrown);
+    };
+    const duplicate = new OffscreenCanvas(2, 2);
+    expectCloneError(() => worker.postMessage({ canvas: duplicate }, [duplicate, duplicate]));
+    testing.expectEqual(2, duplicate.width);
+    const invalid = new OffscreenCanvas(2, 2);
+    expectCloneError(() => worker.postMessage({ canvas: invalid }, [invalid, {}]));
+    testing.expectEqual(2, invalid.width);
+    const uncloneable = new OffscreenCanvas(2, 2);
+    expectCloneError(() => worker.postMessage({ canvas: uncloneable, bad() {} }, [uncloneable]));
+    testing.expectEqual(2, uncloneable.width);
+    const contextual = new OffscreenCanvas(2, 2);
+    contextual.getContext('2d');
+    expectCloneError(() => worker.postMessage({ canvas: contextual }, [contextual]));
+    const getter = new OffscreenCanvas(2, 2);
+    expectCloneError(() => worker.postMessage({ canvas: getter, get sideEffect() { getter.getContext('2d'); return 1; } }, [getter]));
+    testing.expectEqual(2, getter.width);
+    worker.postMessage({ canvasTransfer: 'return', canvas: duplicate }, [duplicate]);
+    expectCloneError(() => worker.postMessage({ canvas: duplicate }, [duplicate]));
+    worker.terminate();
+  }
+</script>

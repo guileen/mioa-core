@@ -1,0 +1,38 @@
+<!doctype html><meta charset="utf-8"><script src="../testing.js"></script>
+<script id="native_webgl_extensions_match_exposed_implementations">
+{
+  const canvas=document.createElement('canvas');const gl=canvas.getContext('webgl');
+  testing.expectEqual(true,gl instanceof WebGLRenderingContext);
+  const extensions=gl.getSupportedExtensions();testing.expectEqual(true,Array.isArray(extensions));
+  testing.expectEqual(extensions.length,new Set(extensions).size);
+  for(const name of extensions)testing.expectEqual(true,gl.getExtension(name)!==null);
+  testing.expectEqual(null,gl.getExtension('an-extension-this-driver-does-not-implement'));
+  // A native driver extension must not be advertised unless its WebGL object is implemented.
+  testing.expectEqual(null,gl.getExtension('WEBGL_lose_context'));
+}
+</script>
+<script id="native_driver_identity_is_real_and_stable">
+{
+  const canvas=document.createElement('canvas');const gl=canvas.getContext('webgl');
+  const info=gl.getExtension('WEBGL_debug_renderer_info');
+  testing.expectEqual(true,info instanceof WEBGL_debug_renderer_info);
+  testing.expectEqual(0x9245,info.UNMASKED_VENDOR_WEBGL);testing.expectEqual(0x9246,info.UNMASKED_RENDERER_WEBGL);
+  const vendor=gl.getParameter(info.UNMASKED_VENDOR_WEBGL);const renderer=gl.getParameter(info.UNMASKED_RENDERER_WEBGL);
+  testing.expectEqual('string',typeof vendor);testing.expectEqual('string',typeof renderer);
+  testing.expectEqual(true,vendor.length>0);testing.expectEqual(true,renderer.length>0);
+  testing.expectEqual(vendor,gl.getParameter(info.UNMASKED_VENDOR_WEBGL));testing.expectEqual(renderer,gl.getParameter(info.UNMASKED_RENDERER_WEBGL));
+  const precision=gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER,gl.HIGH_FLOAT);
+  // Desktop drivers without the precision-query entrypoint report absence, never a forged value.
+  if(precision!==null){testing.expectEqual(true,precision instanceof WebGLShaderPrecisionFormat);testing.expectEqual(true,precision.rangeMax>=precision.rangeMin);testing.expectEqual(true,precision.precision>=0);}
+}
+</script>
+<script id="native_context_identity_and_exclusive_backing_store">
+{
+  const canvas=document.createElement('canvas');const gl=canvas.getContext('webgl');
+  testing.expectEqual(true,gl===canvas.getContext('webgl'));testing.expectEqual(null,canvas.getContext('2d'));
+  const second=document.createElement('canvas').getContext('webgl');testing.expectEqual(false,gl===second);
+  gl.clearColor(1,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);second.clearColor(0,0,1,1);second.clear(second.COLOR_BUFFER_BIT);
+  const red=new Uint8Array(4),blue=new Uint8Array(4);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,red);second.readPixels(0,0,1,1,second.RGBA,second.UNSIGNED_BYTE,blue);
+  testing.expectEqual('255,0,0,255',Array.from(red).join(','));testing.expectEqual('0,0,255,255',Array.from(blue).join(','));
+}
+</script>

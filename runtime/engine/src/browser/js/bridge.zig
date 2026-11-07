@@ -1,0 +1,1489 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const Frame = @import("../Frame.zig");
+const Factory = @import("../Factory.zig");
+const reflect = @import("../reflect.zig");
+
+const js = @import("js.zig");
+const Caller = @import("Caller.zig");
+const Context = @import("Context.zig");
+
+const v8 = js.v8;
+
+pub fn Builder(comptime T: type) type {
+    return struct {
+        pub const @"type" = T;
+        pub const ClassId = u16;
+
+        pub fn constructor(comptime func: anytype, comptime opts: Constructor.Opts) Constructor {
+            return Constructor.init(T, func, opts);
+        }
+
+        pub fn accessor(comptime getter: anytype, comptime setter: anytype, comptime opts: Caller.Function.Opts) Accessor {
+            return Accessor.init(T, getter, setter, opts);
+        }
+
+        pub fn function(comptime func: anytype, comptime opts: Caller.Function.Opts) Function {
+            return Function.init(T, func, opts);
+        }
+
+        pub fn indexed(comptime getter_func: anytype, comptime enumerator_func: anytype, comptime opts: Indexed.Opts) Indexed {
+            return Indexed.init(T, getter_func, null, null, null, null, enumerator_func, opts);
+        }
+
+        pub fn indexedReadWrite(comptime getter_func: anytype, setter_func: anytype, deleter_func: anytype, query_func: anytype, comptime enumerator_func: anytype, comptime opts: Indexed.Opts) Indexed {
+            return Indexed.init(T, getter_func, setter_func, deleter_func, query_func, null, enumerator_func, opts);
+        }
+
+        pub fn indexedFull(comptime getter_func: anytype, setter_func: anytype, deleter_func: anytype, query_func: anytype, definer_func: anytype, comptime enumerator_func: anytype, comptime opts: Indexed.Opts) Indexed {
+            return Indexed.init(T, getter_func, setter_func, deleter_func, query_func, definer_func, enumerator_func, opts);
+        }
+
+        pub fn namedIndexed(comptime getter_func: anytype, setter_func: anytype, deleter_func: anytype, enumerator_func: anytype, query_func: anytype, comptime opts: NamedIndexed.Opts) NamedIndexed {
+            return NamedIndexed.init(T, getter_func, setter_func, deleter_func, enumerator_func, query_func, null, null, opts);
+        }
+
+        pub fn namedIndexedFull(comptime getter_func: anytype, setter_func: anytype, deleter_func: anytype, enumerator_func: anytype, query_func: anytype, definer_func: anytype, descriptor_func: anytype, comptime opts: NamedIndexed.Opts) NamedIndexed {
+            return NamedIndexed.init(T, getter_func, setter_func, deleter_func, enumerator_func, query_func, definer_func, descriptor_func, opts);
+        }
+
+        pub fn iterator(comptime func: anytype, comptime opts: Iterator.Opts) Iterator {
+            return Iterator.init(T, func, opts);
+        }
+
+        pub fn callable(comptime func: anytype, comptime opts: Callable.Opts) Callable {
+            return Callable.init(T, func, opts);
+        }
+
+        pub fn property(value: anytype, opts: Property.Opts) Property {
+            switch (@typeInfo(@TypeOf(value))) {
+                .bool => return Property.init(.{ .bool = value }, opts),
+                .null => return Property.init(.null, opts),
+                .comptime_int, .int => return Property.init(.{ .int = value }, opts),
+                .comptime_float, .float => return Property.init(.{ .float = value }, opts),
+                .pointer => |ptr| switch (ptr.size) {
+                    .one => {
+                        const one_info = @typeInfo(ptr.child);
+                        if (one_info == .array and one_info.array.child == u8) {
+                            return Property.init(.{ .string = value }, opts);
+                        }
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+            @compileError("Property for " ++ @typeName(@TypeOf(value)) ++ " hasn't been defined yet");
+        }
+    };
+}
+
+pub const Constructor = struct {
+    arity: c_int,
+    func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
+
+    const Opts = struct {
+        // When true, the constructor function receives `new.target` (as a
+        // js.Function) as its first parameter. Used by HTMLElement to support
+        // direct instantiation of custom elements via `new MyElement()`.
+        new_target: bool = false,
+    };
+
+    fn init(comptime T: type, comptime func: anytype, comptime opts: Opts) Constructor {
+        return .{
+            .arity = comptime Function.getArity(@TypeOf(func), if (opts.new_target) 1 else 0),
+            .func = struct {
+                fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                    const v8_isolate = v8.v8__FunctionCallbackInfo__GetIsolate(handle).?;
+                    var caller: Caller = undefined;
+                    if (!caller.init(v8_isolate)) {
+                        return;
+                    }
+                    defer caller.deinit();
+
+                    // Constructors are a JS-execution boundary, just like
+                    // [CEReactions] methods. Open a reactions scope so any
+                    // callbacks queued by the user's constructor body (or
+                    // by attribute_changed reactions queued before invocation)
+                    // drain at the constructor's exit, not later.
+                    const ce_frame: ?*Frame = switch (caller.local.ctx.global) {
+                        .frame => |frame| frame,
+                        .worker => null,
+                    };
+                    const ce_checkpoint: usize = if (ce_frame) |frame| frame._ce_reactions.push() else 0;
+                    defer if (ce_frame) |frame| frame._ce_reactions.popAndInvoke(ce_checkpoint, frame);
+
+                    caller.constructor(T, func, handle.?, .{
+                        .new_target = opts.new_target,
+                    });
+                }
+            }.wrap,
+        };
+    }
+};
+
+pub const Function = struct {
+    static: bool,
+    arity: usize,
+    noop: bool = false,
+    wpt_only: bool = false,
+    js_name: ?[:0]const u8 = null,
+    exposed: Caller.Function.Opts.Exposed = .both,
+    cache: ?Caller.Function.Opts.Caching = null,
+    rejects_bad_receiver: bool,
+    func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
+
+    fn init(comptime T: type, comptime func: anytype, comptime opts: Caller.Function.Opts) Function {
+        return .{
+            .cache = opts.cache,
+            .static = opts.static,
+            .wpt_only = opts.wpt_only,
+            .js_name = opts.js_name,
+            .exposed = opts.exposed,
+            .rejects_bad_receiver = returnsPromise(@TypeOf(func)),
+            .arity = getArity(@TypeOf(func), if (opts.static) 0 else 1),
+            .func = if (opts.noop) noopFunction else struct {
+                fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                    Caller.Function.call(T, handle.?, func, opts);
+                }
+            }.wrap,
+        };
+    }
+
+    pub fn noopFunction(_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {}
+
+    fn returnsPromise(comptime F: type) bool {
+        const R = @typeInfo(F).@"fn".return_type orelse return false;
+        return switch (@typeInfo(R)) {
+            .error_union => |eu| eu.payload,
+            else => R,
+        } == js.Promise;
+    }
+
+    fn getArity(comptime T: type, comptime start: usize) usize {
+        const Execution = js.Execution;
+
+        const Page = @import("../Page.zig");
+        const Session = @import("../Session.zig");
+
+        var count: usize = 0;
+        const param_types = @typeInfo(T).@"fn".param_types;
+        for (param_types[start..]) |param_type| { // start at 1, skip self
+            const PT = param_type.?;
+            if (PT == *Frame or PT == *const Frame) {
+                break;
+            }
+
+            if (PT == *Page or PT == *const Page) {
+                break;
+            }
+
+            if (PT == *Execution or PT == *const Execution) {
+                break;
+            }
+
+            if (PT == *Session or PT == *const Session) {
+                break;
+            }
+
+            if (@typeInfo(PT) == .optional) {
+                break;
+            }
+
+            // a rest parameter contributes 0 to length
+            if (@typeInfo(PT) == .@"struct" and @hasDecl(PT, "js_variadic")) {
+                break;
+            }
+            count += 1;
+        }
+        return count;
+    }
+};
+
+pub const Accessor = struct {
+    static: bool = false,
+    deletable: bool = true,
+    wpt_only: bool = false,
+    unforgeable: bool = false, // Web IDL [LegacyUnforgeable]
+    exposed: Caller.Function.Opts.Exposed = .both,
+    cache: ?Caller.Function.Opts.Caching = null,
+    getter: ?*const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void = null,
+    setter: ?*const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void = null,
+
+    fn init(comptime T: type, comptime getter: anytype, comptime setter: anytype, comptime opts: Caller.Function.Opts) Accessor {
+        var accessor = Accessor{
+            .cache = opts.cache,
+            .static = opts.static,
+            .wpt_only = opts.wpt_only,
+            .deletable = opts.deletable,
+            .unforgeable = opts.unforgeable,
+            .exposed = opts.exposed,
+        };
+
+        if (@typeInfo(@TypeOf(getter)) != .null) {
+            const getter_opts = if (opts.ce_reactions == false) opts else blk: {
+                var o = opts;
+                o.ce_reactions = false;
+                break :blk o;
+            };
+
+            accessor.getter = struct {
+                fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                    Caller.Function.call(T, handle.?, getter, getter_opts);
+                }
+            }.wrap;
+        }
+
+        if (@typeInfo(@TypeOf(setter)) != .null) {
+            accessor.setter = struct {
+                fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                    Caller.Function.call(T, handle.?, setter, opts);
+                }
+            }.wrap;
+        }
+
+        return accessor;
+    }
+};
+
+pub const Indexed = struct {
+    getter: *const fn (idx: u32, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32,
+    enumerator: ?*const fn (handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32,
+    setter: ?*const fn (idx: u32, c_value: ?*const v8.Value, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+    deleter: ?*const fn (idx: u32, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+    query: ?*const fn (idx: u32, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+    // v8 expects an Intercepted (u32) return; the stale void-returning
+    // typedef in binding.h is papered over with a @ptrCast at install time.
+    definer: ?*const fn (idx: u32, desc: ?*v8.PropertyDescriptor, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+
+    const Opts = struct {
+        as_typed_array: bool = false,
+        null_as_undefined: bool = false,
+        // Only applies to setter and deleter; getters don't mutate.
+        ce_reactions: bool = false,
+    };
+
+    fn init(comptime T: type, comptime getter: anytype, setter: anytype, deleter: anytype, query: anytype, definer: anytype, comptime enumerator: anytype, comptime opts: Opts) Indexed {
+        var indexed = Indexed{
+            .enumerator = null,
+            .getter = struct {
+                fn wrap(idx: u32, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                    const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                    var caller: Caller = undefined;
+                    if (!caller.init(v8_isolate)) {
+                        return js.Intercepted.no;
+                    }
+                    defer caller.deinit();
+
+                    return caller.getIndex(T, getter, idx, handle.?, .{
+                        .as_typed_array = opts.as_typed_array,
+                        .null_as_undefined = opts.null_as_undefined,
+                    });
+                }
+            }.wrap,
+        };
+
+        if (@typeInfo(@TypeOf(enumerator)) != .null) {
+            indexed.enumerator = struct {
+                fn wrap(handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                    const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                    var caller: Caller = undefined;
+                    if (!caller.init(v8_isolate)) {
+                        return js.Intercepted.no;
+                    }
+                    defer caller.deinit();
+                    return caller.getEnumerator(T, enumerator, handle.?, .{});
+                }
+            }.wrap;
+        }
+
+        if (@typeInfo(@TypeOf(setter)) != .null) {
+            indexed.setter = struct {
+                fn wrap(idx: u32, c_value: ?*const v8.Value, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                    const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                    var caller: Caller = undefined;
+                    if (!caller.init(v8_isolate)) {
+                        return js.Intercepted.no;
+                    }
+                    defer caller.deinit();
+
+                    const ce_frame: ?*Frame = if (comptime opts.ce_reactions) switch (caller.local.ctx.global) {
+                        .frame => |frame| frame,
+                        .worker => null,
+                    } else null;
+                    var ce_checkpoint: usize = undefined;
+                    if (comptime opts.ce_reactions) {
+                        if (ce_frame) |frame| ce_checkpoint = frame._ce_reactions.push();
+                    }
+                    defer if (comptime opts.ce_reactions) {
+                        if (ce_frame) |frame| frame._ce_reactions.popAndInvoke(ce_checkpoint, frame);
+                    };
+
+                    return caller.setIndex(T, setter, idx, c_value.?, handle.?, .{
+                        .as_typed_array = opts.as_typed_array,
+                        .null_as_undefined = opts.null_as_undefined,
+                    });
+                }
+            }.wrap;
+        }
+
+        if (@typeInfo(@TypeOf(deleter)) != .null) {
+            indexed.deleter = struct {
+                fn wrap(idx: u32, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                    const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                    var caller: Caller = undefined;
+                    if (!caller.init(v8_isolate)) {
+                        return js.Intercepted.no;
+                    }
+                    defer caller.deinit();
+
+                    const ce_frame: ?*Frame = if (comptime opts.ce_reactions) switch (caller.local.ctx.global) {
+                        .frame => |frame| frame,
+                        .worker => null,
+                    } else null;
+                    var ce_checkpoint: usize = undefined;
+                    if (comptime opts.ce_reactions) {
+                        if (ce_frame) |frame| ce_checkpoint = frame._ce_reactions.push();
+                    }
+                    defer if (comptime opts.ce_reactions) {
+                        if (ce_frame) |frame| frame._ce_reactions.popAndInvoke(ce_checkpoint, frame);
+                    };
+
+                    return caller.deleteOrDefineIndex(T, deleter, idx, handle.?, .{
+                        .as_typed_array = opts.as_typed_array,
+                        .null_as_undefined = opts.null_as_undefined,
+                    });
+                }
+            }.wrap;
+        }
+
+        const query_func = if (@typeInfo(@TypeOf(query)) != .null)
+            query
+        else
+            // Generate a Query handler by wrapping getter. With no setter, this
+            // gets the ReadOnly attribute
+            GetterQuery(getter, if (@typeInfo(@TypeOf(setter)) == .null) v8.ReadOnly else v8.None).query;
+
+        indexed.query = struct {
+            fn wrap(idx: u32, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                var caller: Caller = undefined;
+                if (!caller.init(v8_isolate)) {
+                    return js.Intercepted.no;
+                }
+                defer caller.deinit();
+
+                return caller.getIndexQuery(T, query_func, idx, handle.?);
+            }
+        }.wrap;
+
+        if (@typeInfo(@TypeOf(definer)) != .null) {
+            indexed.definer = struct {
+                fn wrap(idx: u32, _: ?*v8.PropertyDescriptor, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                    const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                    var caller: Caller = undefined;
+                    if (!caller.init(v8_isolate)) {
+                        return js.Intercepted.no;
+                    }
+                    defer caller.deinit();
+
+                    // same (self, index) -> bool shape as a deleter
+                    return caller.deleteOrDefineIndex(T, definer, idx, handle.?, .{});
+                }
+            }.wrap;
+        }
+
+        return indexed;
+    }
+};
+
+fn hasNotHandled(comptime E: type) bool {
+    // anyerror includes it
+    const error_names = @typeInfo(E).error_set.error_names orelse return true;
+    for (error_names) |name| {
+        if (std.mem.eql(u8, name, "NotHandled")) return true;
+    }
+    return false;
+}
+
+// Default index query if one isn't provided. Uses the getter to determine the result
+fn GetterQuery(comptime getter: anytype, comptime attrs: u32) type {
+    const param_types = @typeInfo(@TypeOf(getter)).@"fn".param_types;
+    const Self = param_types[0].?;
+    const Index = param_types[1].?;
+
+    // A getter that can return neither null nor error.NotHandled would report
+    // every index as present.
+    const can_be_absent = switch (@typeInfo(@typeInfo(@TypeOf(getter)).@"fn".return_type.?)) {
+        .optional => true,
+        .error_union => |eu| @typeInfo(eu.payload) == .optional or hasNotHandled(eu.error_set),
+        else => false,
+    };
+    if (can_be_absent == false) {
+        @compileError(@typeName(Self) ++ ": an indexed getter that can't return null or error.NotHandled needs an explicit query");
+    }
+
+    return struct {
+        const query = if (param_types.len == 3) withGlobal else plain;
+
+        fn plain(self: Self, idx: Index) !u32 {
+            return attributes(getter(self, idx));
+        }
+
+        fn withGlobal(self: Self, idx: Index, global: param_types[2].?) !u32 {
+            return attributes(getter(self, idx, global));
+        }
+
+        fn attributes(ret: anytype) !u32 {
+            const value = switch (@typeInfo(@TypeOf(ret))) {
+                .error_union => try ret,
+                else => ret,
+            };
+            if (@typeInfo(@TypeOf(value)) == .optional and value == null) {
+                return error.NotHandled;
+            }
+            return attrs;
+        }
+    };
+}
+
+pub const NamedIndexed = struct {
+    getter: *const fn (c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32,
+    setter: ?*const fn (c_name: ?*const v8.Name, c_value: ?*const v8.Value, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+    deleter: ?*const fn (c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+    query: ?*const fn (c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+    // v8 expects an Intercepted (u32) return; the stale void-returning
+    // typedefs in binding.h are papered over with a @ptrCast at install time.
+    definer: ?*const fn (c_name: ?*const v8.Name, desc: ?*v8.PropertyDescriptor, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+    descriptor: ?*const fn (c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+    enumerator: ?*const fn (handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 = null,
+
+    const Opts = struct {
+        as_typed_array: bool = false,
+        null_as_undefined: bool = false,
+        // Mirrors [CEReactions] on a named-property setter/deleter (e.g.,
+        // HTMLElement.dataset, which proxies setAttribute/removeAttribute).
+        // Only applies to setter and deleter; getters don't mutate.
+        ce_reactions: bool = false,
+    };
+
+    fn init(comptime T: type, comptime getter: anytype, setter: anytype, deleter: anytype, enumerator: anytype, query: anytype, definer: anytype, descriptor: anytype, comptime opts: Opts) NamedIndexed {
+        const getter_fn = struct {
+            fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                var caller: Caller = undefined;
+                if (!caller.init(v8_isolate)) {
+                    return js.Intercepted.no;
+                }
+                defer caller.deinit();
+
+                return caller.getNamedIndex(T, getter, c_name.?, handle.?, .{
+                    .as_typed_array = opts.as_typed_array,
+                    .null_as_undefined = opts.null_as_undefined,
+                });
+            }
+        }.wrap;
+
+        const setter_fn = if (@typeInfo(@TypeOf(setter)) == .null) null else struct {
+            fn wrap(c_name: ?*const v8.Name, c_value: ?*const v8.Value, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                var caller: Caller = undefined;
+                if (!caller.init(v8_isolate)) {
+                    return js.Intercepted.no;
+                }
+                defer caller.deinit();
+
+                const ce_frame: ?*Frame = if (comptime opts.ce_reactions) switch (caller.local.ctx.global) {
+                    .frame => |frame| frame,
+                    .worker => null,
+                } else null;
+                var ce_checkpoint: usize = undefined;
+                if (comptime opts.ce_reactions) {
+                    if (ce_frame) |frame| ce_checkpoint = frame._ce_reactions.push();
+                }
+                defer if (comptime opts.ce_reactions) {
+                    if (ce_frame) |frame| frame._ce_reactions.popAndInvoke(ce_checkpoint, frame);
+                };
+
+                return caller.setNamedIndex(T, setter, c_name.?, c_value.?, handle.?, .{
+                    .as_typed_array = opts.as_typed_array,
+                    .null_as_undefined = opts.null_as_undefined,
+                });
+            }
+        }.wrap;
+
+        const deleter_fn = if (@typeInfo(@TypeOf(deleter)) == .null) null else struct {
+            fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                var caller: Caller = undefined;
+                if (!caller.init(v8_isolate)) {
+                    return js.Intercepted.no;
+                }
+                defer caller.deinit();
+
+                const ce_frame: ?*Frame = if (comptime opts.ce_reactions) switch (caller.local.ctx.global) {
+                    .frame => |frame| frame,
+                    .worker => null,
+                } else null;
+                var ce_checkpoint: usize = undefined;
+                if (comptime opts.ce_reactions) {
+                    if (ce_frame) |frame| ce_checkpoint = frame._ce_reactions.push();
+                }
+                defer if (comptime opts.ce_reactions) {
+                    if (ce_frame) |frame| frame._ce_reactions.popAndInvoke(ce_checkpoint, frame);
+                };
+
+                return caller.deleteOrDefineNamedIndex(T, deleter, c_name.?, handle.?, .{
+                    .as_typed_array = opts.as_typed_array,
+                    .null_as_undefined = opts.null_as_undefined,
+                });
+            }
+        }.wrap;
+
+        const definer_fn = if (@typeInfo(@TypeOf(definer)) == .null) null else struct {
+            fn wrap(c_name: ?*const v8.Name, _: ?*v8.PropertyDescriptor, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                var caller: Caller = undefined;
+                if (!caller.init(v8_isolate)) {
+                    return js.Intercepted.no;
+                }
+                defer caller.deinit();
+
+                // same (self, name) -> bool shape as a deleter
+                return caller.deleteOrDefineNamedIndex(T, definer, c_name.?, handle.?, .{});
+            }
+        }.wrap;
+
+        const descriptor_fn = if (@typeInfo(@TypeOf(descriptor)) == .null) null else struct {
+            fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                var caller: Caller = undefined;
+                if (!caller.init(v8_isolate)) {
+                    return js.Intercepted.no;
+                }
+                defer caller.deinit();
+
+                // same (self, name) -> value shape as a getter; the returned
+                // struct is converted to a JS property descriptor object
+                return caller.getNamedIndex(T, descriptor, c_name.?, handle.?, .{});
+            }
+        }.wrap;
+
+        const enumerator_fn = if (@typeInfo(@TypeOf(enumerator)) == .null) null else struct {
+            fn wrap(handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                var caller: Caller = undefined;
+                if (!caller.init(v8_isolate)) {
+                    return js.Intercepted.no;
+                }
+                defer caller.deinit();
+
+                return caller.getEnumerator(T, enumerator, handle.?, .{});
+            }
+        }.wrap;
+
+        const query_fn = if (@typeInfo(@TypeOf(query)) == .null) null else struct {
+            fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+                const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+                var caller: Caller = undefined;
+                if (!caller.init(v8_isolate)) {
+                    return js.Intercepted.no;
+                }
+                defer caller.deinit();
+
+                return caller.getNamedQuery(T, query, c_name.?, handle.?);
+            }
+        }.wrap;
+
+        return .{
+            .getter = getter_fn,
+            .setter = setter_fn,
+            .deleter = deleter_fn,
+            .query = query_fn,
+            .definer = definer_fn,
+            .descriptor = descriptor_fn,
+            .enumerator = enumerator_fn,
+        };
+    }
+};
+
+pub const Iterator = struct {
+    func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
+    async: bool,
+
+    const Opts = struct {
+        async: bool = false,
+        null_as_undefined: bool = false,
+    };
+
+    fn init(comptime T: type, comptime struct_or_func: anytype, comptime opts: Opts) Iterator {
+        if (@typeInfo(@TypeOf(struct_or_func)) == .type) {
+            return .{
+                .async = opts.async,
+                .func = struct {
+                    fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                        const info = Caller.FunctionCallbackInfo{ .handle = handle.? };
+                        info.getReturnValue().set(info.getThis());
+                    }
+                }.wrap,
+            };
+        }
+
+        return .{
+            .async = opts.async,
+            .func = struct {
+                fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                    return Caller.Function.call(T, handle.?, struct_or_func, .{
+                        .null_as_undefined = opts.null_as_undefined,
+                    });
+                }
+            }.wrap,
+        };
+    }
+};
+
+const Callable = struct {
+    func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
+
+    const Opts = struct {
+        null_as_undefined: bool = false,
+    };
+
+    fn init(comptime T: type, comptime func: anytype, comptime opts: Opts) Callable {
+        return .{ .func = struct {
+            fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                Caller.Function.call(T, handle.?, func, .{
+                    .null_as_undefined = opts.null_as_undefined,
+                });
+            }
+        }.wrap };
+    }
+};
+
+pub const Property = struct {
+    value: Value,
+    template: bool,
+    readonly: bool,
+
+    const Value = union(enum) {
+        null,
+        int: i64,
+        float: f64,
+        bool: bool,
+        string: []const u8,
+    };
+
+    const Opts = struct {
+        template: bool,
+        readonly: bool = true,
+    };
+
+    fn init(value: Value, opts: Opts) Property {
+        return .{
+            .value = value,
+            .template = opts.template,
+            .readonly = opts.readonly,
+        };
+    }
+};
+
+pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+    const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+
+    // During snapshot creation, there's no Context in embedder data yet.
+    // I hate this check, but there doesn't seem to be a way to add this method
+    // to the global, without triggering it during snapshot creation.
+    const v8_context = v8.v8__Isolate__GetCurrentContext(v8_isolate) orelse return js.Intercepted.no;
+    const ctx: *Context = @ptrCast(@alignCast(v8.v8__Context__GetAlignedPointerFromEmbedderData(v8_context, 1) orelse return js.Intercepted.no));
+
+    var caller: Caller = undefined;
+    caller.initWithContext(ctx, v8_context);
+    defer caller.deinit();
+
+    const local = &caller.local;
+
+    var hs: js.HandleScope = undefined;
+    hs.init(local.isolate);
+    defer hs.deinit();
+
+    const property: []const u8 = js.String.toSlice(.{ .local = local, .handle = @ptrCast(c_name.?) }) catch {
+        return js.Intercepted.no;
+    };
+
+    // Only Page contexts have document.getElementById lookup
+    switch (local.ctx.global) {
+        .frame => |frame| {
+            const document = frame.document;
+            if (document.getElementById(property)) |el| {
+                const js_val = local.zigValueToJs(el, .{}) catch return js.Intercepted.no;
+                var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
+                pc.getReturnValue().set(js_val);
+                return js.Intercepted.yes;
+            }
+        },
+        .worker => {}, // no global lookup in a worker
+    }
+
+    // @LOG-UNKNOWN-PROPERTY
+    // This was really useful when sites often broke because of an unimplemented
+    // feature. But it hasnt' been useful to me in ~6 months.
+    // if (comptime lp.IS_DEBUG) {
+    //     if (std.mem.startsWith(u8, property, "__")) {
+    //         // some frameworks will extend built-in types using a __ prefix
+    //         // these should always be safe to ignore.
+    //         return js.Intercepted.no;
+    //     }
+
+    //     const ignored = std.StaticStringMap(void).initComptime(.{
+    //         .{ "Deno", {} },
+    //         .{ "process", {} },
+    //         .{ "ShadyDOM", {} },
+    //         .{ "ShadyCSS", {} },
+
+    //         // a lot of sites seem to like having their own window.config.
+    //         .{ "config", {} },
+
+    //         .{ "litNonce", {} },
+    //         .{ "litHtmlVersions", {} },
+    //         .{ "litElementVersions", {} },
+    //         .{ "litHtmlPolyfillSupport", {} },
+    //         .{ "litElementHydrateSupport", {} },
+    //         .{ "litElementPolyfillSupport", {} },
+    //         .{ "reactiveElementVersions", {} },
+
+    //         .{ "recaptcha", {} },
+    //         .{ "grecaptcha", {} },
+    //         .{ "___grecaptcha_cfg", {} },
+    //         .{ "__recaptcha_api", {} },
+    //         .{ "__google_recaptcha_client", {} },
+
+    //         .{ "CLOSURE_FLAGS", {} },
+    //         .{ "__REACT_DEVTOOLS_GLOBAL_HOOK__", {} },
+    //         .{ "ApplePaySession", {} },
+    //     });
+    //     if (!ignored.has(property)) {
+    //         var buf: [2048]u8 = undefined;
+    //         const key = std.mem.print(&buf, "Window:{s}", .{property}) catch return js.Intercepted.no;
+    //         logUnknownProperty(local, key) catch return js.Intercepted.no;
+    //     }
+    // }
+
+    return js.Intercepted.no;
+}
+
+// @LOG-UNKNOWN-PROPERTY
+// Only used for debugging
+// pub fn unknownObjectPropertyCallback(comptime JsApi: type) *const fn (?*const v8.Name, ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+//     if (comptime !lp.IS_DEBUG) {
+//         @compileError("unknownObjectPropertyCallback should only be used in debug builds");
+//     }
+
+//     return struct {
+//         fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+//             const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+
+//             var caller: Caller = undefined;
+//             if (!caller.init(v8_isolate)) {
+//                 return js.Intercepted.no;
+//             }
+//             defer caller.deinit();
+
+//             const local = &caller.local;
+
+//             var hs: js.HandleScope = undefined;
+//             hs.init(local.isolate);
+//             defer hs.deinit();
+
+//             const property: []const u8 = js.String.toSlice(.{ .local = local, .handle = @ptrCast(c_name.?) }) catch {
+//                 return js.Intercepted.no;
+//             };
+
+//             if (std.mem.startsWith(u8, property, "__")) {
+//                 // some frameworks will extend built-in types using a __ prefix
+//                 // these should always be safe to ignore.
+//                 return js.Intercepted.no;
+//             }
+
+//             if (std.mem.startsWith(u8, property, "jQuery")) {
+//                 return js.Intercepted.no;
+//             }
+
+//             if (JsApi == @import("../webapi/cdata/Text.zig").JsApi or JsApi == @import("../webapi/cdata/Comment.zig").JsApi) {
+//                 if (std.mem.eql(u8, property, "tagName")) {
+//                     // knockout does this, a lot.
+//                     return js.Intercepted.no;
+//                 }
+//             }
+
+//             if (JsApi == @import("../webapi/element/Html.zig").JsApi or JsApi == @import("../webapi/Element.zig").JsApi or JsApi == @import("../webapi/element/html/Custom.zig").JsApi) {
+//                 // react ?
+//                 if (std.mem.eql(u8, property, "props")) return js.Intercepted.no;
+//                 if (std.mem.eql(u8, property, "hydrated")) return js.Intercepted.no;
+//                 if (std.mem.eql(u8, property, "isHydrated")) return js.Intercepted.no;
+//             }
+
+//             if (JsApi == @import("../webapi/Console.zig").JsApi) {
+//                 if (std.mem.eql(u8, property, "firebug")) return js.Intercepted.no;
+//             }
+
+//             const ignored = std.StaticStringMap(void).initComptime(.{});
+//             if (!ignored.has(property)) {
+//                 var buf: [2048]u8 = undefined;
+//                 const key = std.mem.print(&buf, "{s}:{s}", .{ if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi), property }) catch return js.Intercepted.no;
+//                 logUnknownProperty(local, key) catch return js.Intercepted.no;
+//             }
+//             return js.Intercepted.no;
+//         }
+//     }.wrap;
+// }
+
+// fn logUnknownProperty(local: *const js.Local, key: []const u8) !void {
+//     const ctx = local.ctx;
+//     const gop = try ctx.unknown_properties.getOrPut(ctx.arena.allocator(), key);
+//     if (gop.found_existing) {
+//         gop.value_ptr.count += 1;
+//     } else {
+//         gop.key_ptr.* = try ctx.arena.dupe(u8, key);
+//         gop.value_ptr.* = .{
+//             .count = 1,
+//             .first_stack = try ctx.arena.dupe(u8, (try local.stackTrace()) orelse "???"),
+//         };
+//     }
+// }
+
+fn flattenTypes(comptime Types: []const type) [countFlattenedTypes(Types)]type {
+    @setEvalBranchQuota(10_000);
+    var index: usize = 0;
+    var flat: [countFlattenedTypes(Types)]type = undefined;
+    for (Types) |T| {
+        if (@hasDecl(T, "registerTypes")) {
+            for (T.registerTypes()) |TT| {
+                flat[index] = TT.JsApi;
+                index += 1;
+            }
+        } else {
+            flat[index] = T.JsApi;
+            index += 1;
+        }
+    }
+    return flat;
+}
+
+fn countFlattenedTypes(comptime Types: []const type) usize {
+    @setEvalBranchQuota(10_000);
+    var c: usize = 0;
+    for (Types) |T| {
+        c += if (@hasDecl(T, "registerTypes")) T.registerTypes().len else 1;
+    }
+    return c;
+}
+
+//  T => T
+// *T => T
+pub fn Struct(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .@"struct" => T,
+        .pointer => |ptr| ptr.child,
+        else => @compileError("Expecting Struct or *Struct, got: " ++ @typeName(T)),
+    };
+}
+
+pub const JsApiLookup = struct {
+    /// Integer type we use for `JsApiLookup` enum. Can be u8 at min.
+    pub const BackingInt = std.math.IntFittingRange(0, @max(std.math.maxInt(u8), JsApis.len));
+
+    /// Imagine we have a type `Cat` which has a getter:
+    ///
+    ///    fn get_owner(self: *Cat) *Owner {
+    ///        return self.owner;
+    ///    }
+    ///
+    /// When we execute `caller.getter`, we'll end up doing something like:
+    ///
+    ///    const res = @call(.auto, Cat.get_owner, .{cat_instance});
+    ///
+    /// How do we turn `res`, which is an *Owner, into something we can return
+    /// to v8? We need the ObjectTemplate associated with Owner. How do we
+    /// get that? Well, we store all the ObjectTemplates in an array that's
+    /// tied to env. So we do something like:
+    ///
+    ///    env.templates[index_of_owner].initInstance(...);
+    ///
+    /// But how do we get that `index_of_owner`? `Index` is an enum
+    /// that looks like:
+    ///
+    ///    pub const Enum = enum(BackingInt) {
+    ///        cat = 0,
+    ///        owner = 1,
+    ///        ...
+    ///    }
+    ///
+    /// (`BackingInt` is calculated at comptime regarding to interfaces we have)
+    /// So to get the template index of `owner`, simply do:
+    ///
+    ///    const index_id = types.getId(@TypeOf(res));
+    ///
+    pub const Enum = blk: {
+        var names: [JsApis.len][:0]const u8 = undefined;
+        for (JsApis, 0..) |JsApi, i| {
+            names[i] = @typeName(JsApi);
+        }
+
+        break :blk @Enum(BackingInt, .exhaustive, &names, &std.simd.iota(BackingInt, JsApis.len));
+    };
+
+    /// Returns a boolean indicating if a type exist in the lookup.
+    pub inline fn has(t: type) bool {
+        return @hasField(Enum, @typeName(t));
+    }
+
+    /// Returns the `Enum` for the given type.
+    pub inline fn getIndex(t: type) Enum {
+        return @field(Enum, @typeName(t));
+    }
+
+    /// Returns the ID for the given type.
+    pub inline fn getId(t: type) BackingInt {
+        return @backingInt(getIndex(t));
+    }
+};
+
+pub const SubType = enum {
+    @"error",
+    array,
+    arraybuffer,
+    dataview,
+    date,
+    generator,
+    iterator,
+    map,
+    node,
+    promise,
+    proxy,
+    regexp,
+    set,
+    typedarray,
+    wasmvalue,
+    weakmap,
+    weakset,
+    webassemblymemory,
+};
+
+// APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+pub const PageJsApis = flattenTypes(&.{
+    @import("../webapi/AbortController.zig"),
+    @import("../webapi/AbortSignal.zig"),
+    @import("../webapi/Scheduler.zig"),
+    @import("../webapi/TaskController.zig"),
+    @import("../webapi/TaskSignal.zig"),
+    @import("../webapi/event/TaskPriorityChangeEvent.zig"),
+    @import("../webapi/CData.zig"),
+    @import("../webapi/cdata/Comment.zig"),
+    @import("../webapi/cdata/Text.zig"),
+    @import("../webapi/cdata/CDATASection.zig"),
+    @import("../webapi/cdata/ProcessingInstruction.zig"),
+    @import("../webapi/collections.zig"),
+    @import("../webapi/Console.zig"),
+    @import("../webapi/Crypto.zig"),
+    @import("../webapi/Permissions.zig"),
+    @import("../webapi/StorageManager.zig"),
+    @import("../webapi/CSS.zig"),
+    @import("../webapi/css/CSSRule.zig"),
+    @import("../webapi/css/CSSRuleList.zig"),
+    @import("../webapi/css/CSSStyleDeclaration.zig"),
+    @import("../webapi/css/CSSStyleRule.zig"),
+    @import("../webapi/css/CSSStyleSheet.zig"),
+    @import("../webapi/css/CSSStyleProperties.zig"),
+    @import("../webapi/css/FontFace.zig"),
+    @import("../webapi/css/FontFaceSet.zig"),
+    @import("../webapi/css/MediaQueryList.zig"),
+    @import("../webapi/css/StyleSheetList.zig"),
+    @import("../webapi/Document.zig"),
+    @import("../webapi/HTMLDocument.zig"),
+    @import("../webapi/XMLDocument.zig"),
+    @import("../webapi/History.zig"),
+    @import("../webapi/KeyValueList.zig"),
+    @import("../webapi/DocumentFragment.zig"),
+    @import("../webapi/DocumentType.zig"),
+    @import("../webapi/ShadowRoot.zig"),
+    @import("../webapi/DOMException.zig"),
+    @import("../webapi/QuotaExceededError.zig"),
+    @import("../webapi/DOMImplementation.zig"),
+    @import("../webapi/DOMTreeWalker.zig"),
+    @import("../webapi/DOMNodeIterator.zig"),
+    @import("../webapi/DOMRectReadOnly.zig"),
+    @import("../webapi/DOMRect.zig"),
+    @import("../webapi/DOMMatrixReadOnly.zig"),
+    @import("../webapi/DOMMatrix.zig"),
+    @import("../webapi/DOMPointReadOnly.zig"),
+    @import("../webapi/DOMPoint.zig"),
+    @import("../webapi/DOMParser.zig"),
+    @import("../webapi/XMLSerializer.zig"),
+    @import("../webapi/AbstractRange.zig"),
+    @import("../webapi/Range.zig"),
+    @import("../webapi/StaticRange.zig"),
+    @import("../webapi/NodeFilter.zig"),
+    @import("../webapi/Element.zig"),
+    @import("../webapi/element/DOMStringMap.zig"),
+    @import("../webapi/element/Attribute.zig"),
+    @import("../webapi/element/Html.zig"),
+    @import("../webapi/element/html/IFrame.zig"),
+    @import("../webapi/element/html/Anchor.zig"),
+    @import("../webapi/element/html/Area.zig"),
+    @import("../webapi/element/html/Audio.zig"),
+    @import("../webapi/element/html/Base.zig"),
+    @import("../webapi/element/html/Body.zig"),
+    @import("../webapi/element/html/BR.zig"),
+    @import("../webapi/element/html/Button.zig"),
+    @import("../webapi/element/html/Canvas.zig"),
+    @import("../webapi/element/html/Custom.zig"),
+    @import("../webapi/element/html/Data.zig"),
+    @import("../webapi/element/html/DataList.zig"),
+    @import("../webapi/element/html/Details.zig"),
+    @import("../webapi/element/html/Dialog.zig"),
+    @import("../webapi/element/html/Directory.zig"),
+    @import("../webapi/element/html/DList.zig"),
+    @import("../webapi/element/html/Div.zig"),
+    @import("../webapi/element/html/Embed.zig"),
+    @import("../webapi/element/html/FieldSet.zig"),
+    @import("../webapi/element/html/Font.zig"),
+    @import("../webapi/element/html/FrameSet.zig"),
+    @import("../webapi/element/html/Form.zig"),
+    @import("../webapi/element/html/Generic.zig"),
+    @import("../webapi/element/html/Head.zig"),
+    @import("../webapi/element/html/Heading.zig"),
+    @import("../webapi/element/html/HR.zig"),
+    @import("../webapi/element/html/Html.zig"),
+    @import("../webapi/element/html/Image.zig"),
+    @import("../webapi/element/html/Input.zig"),
+    @import("../webapi/element/html/Label.zig"),
+    @import("../webapi/element/html/Legend.zig"),
+    @import("../webapi/element/html/LI.zig"),
+    @import("../webapi/element/html/Link.zig"),
+    @import("../webapi/element/html/Map.zig"),
+    @import("../webapi/element/html/Marquee.zig"),
+    @import("../webapi/element/html/Media.zig"),
+    @import("../webapi/element/html/Meta.zig"),
+    @import("../webapi/element/html/Meter.zig"),
+    @import("../webapi/element/html/Mod.zig"),
+    @import("../webapi/element/html/Object.zig"),
+    @import("../webapi/element/html/OL.zig"),
+    @import("../webapi/element/html/OptGroup.zig"),
+    @import("../webapi/element/html/Option.zig"),
+    @import("../webapi/element/html/Output.zig"),
+    @import("../webapi/element/html/Paragraph.zig"),
+    @import("../webapi/element/html/Picture.zig"),
+    @import("../webapi/element/html/Param.zig"),
+    @import("../webapi/element/html/Pre.zig"),
+    @import("../webapi/element/html/Progress.zig"),
+    @import("../webapi/element/html/Quote.zig"),
+    @import("../webapi/element/html/Script.zig"),
+    @import("../webapi/element/html/Select.zig"),
+    @import("../webapi/element/html/Slot.zig"),
+    @import("../webapi/element/html/Source.zig"),
+    @import("../webapi/element/html/Span.zig"),
+    @import("../webapi/element/html/Style.zig"),
+    @import("../webapi/element/html/Table.zig"),
+    @import("../webapi/element/html/TableCaption.zig"),
+    @import("../webapi/element/html/TableCell.zig"),
+    @import("../webapi/element/html/TableCol.zig"),
+    @import("../webapi/element/html/TableRow.zig"),
+    @import("../webapi/element/html/TableSection.zig"),
+    @import("../webapi/element/html/Template.zig"),
+    @import("../webapi/element/html/TextArea.zig"),
+    @import("../webapi/element/html/Time.zig"),
+    @import("../webapi/element/html/Title.zig"),
+    @import("../webapi/element/html/Track.zig"),
+    @import("../webapi/element/html/Video.zig"),
+    @import("../webapi/element/html/UL.zig"),
+    @import("../webapi/element/html/Unknown.zig"),
+    @import("../webapi/element/html/ValidityState.zig"),
+    @import("../webapi/ElementInternals.zig"),
+    @import("../webapi/CustomStateSet.zig"),
+    @import("../webapi/element/Svg.zig"),
+    @import("../webapi/element/svg/Generic.zig"),
+    @import("../webapi/element/svg/Graphics.zig"),
+    @import("../webapi/element/svg/Geometry.zig"),
+    @import("../webapi/element/svg/Svg.zig"),
+    @import("../webapi/element/svg/G.zig"),
+    @import("../webapi/element/svg/A.zig"),
+    @import("../webapi/element/svg/Use.zig"),
+    @import("../webapi/element/svg/Image.zig"),
+    @import("../webapi/element/svg/Defs.zig"),
+    @import("../webapi/element/svg/Symbol.zig"),
+    @import("../webapi/element/svg/Switch.zig"),
+    @import("../webapi/element/svg/ForeignObject.zig"),
+    @import("../webapi/element/svg/TextContent.zig"),
+    @import("../webapi/element/svg/TextPositioning.zig"),
+    @import("../webapi/element/svg/Text.zig"),
+    @import("../webapi/element/svg/TSpan.zig"),
+    @import("../webapi/element/svg/TextPath.zig"),
+    @import("../webapi/element/svg/View.zig"),
+    @import("../webapi/element/svg/Title.zig"),
+    @import("../webapi/element/svg/Desc.zig"),
+    @import("../webapi/element/svg/Metadata.zig"),
+    @import("../webapi/element/svg/GradientElement.zig"),
+    @import("../webapi/element/svg/LinearGradient.zig"),
+    @import("../webapi/element/svg/RadialGradient.zig"),
+    @import("../webapi/element/svg/ClipPath.zig"),
+    @import("../webapi/element/svg/Marker.zig"),
+    @import("../webapi/element/svg/Mask.zig"),
+    @import("../webapi/element/svg/Pattern.zig"),
+    @import("../webapi/element/svg/Stop.zig"),
+    @import("../webapi/element/svg/Rect.zig"),
+    @import("../webapi/element/svg/Circle.zig"),
+    @import("../webapi/element/svg/Ellipse.zig"),
+    @import("../webapi/element/svg/Line.zig"),
+    @import("../webapi/element/svg/Path.zig"),
+    @import("../webapi/element/svg/Polygon.zig"),
+    @import("../webapi/element/svg/Polyline.zig"),
+    @import("../webapi/svg/AnimatedString.zig"),
+    @import("../webapi/svg/Number.zig"),
+    @import("../webapi/svg/Length.zig"),
+    @import("../webapi/svg/Angle.zig"),
+    @import("../webapi/svg/Transform.zig"),
+    @import("../webapi/svg/AnimatedLength.zig"),
+    @import("../webapi/svg/AnimatedNumber.zig"),
+    @import("../webapi/svg/AnimatedEnumeration.zig"),
+    @import("../webapi/svg/PreserveAspectRatio.zig"),
+    @import("../webapi/svg/AnimatedPreserveAspectRatio.zig"),
+    @import("../webapi/svg/PointList.zig"),
+    @import("../webapi/svg/TransformList.zig"),
+    @import("../webapi/svg/AnimatedTransformList.zig"),
+    @import("../webapi/svg/StringList.zig"),
+    @import("../webapi/encoding/TextDecoder.zig"),
+    @import("../webapi/encoding/TextEncoder.zig"),
+    @import("../webapi/encoding/TextEncoderStream.zig"),
+    @import("../webapi/encoding/TextDecoderStream.zig"),
+    @import("../webapi/compression/CompressionStream.zig"),
+    @import("../webapi/compression/DecompressionStream.zig"),
+    @import("../webapi/Event.zig"),
+    @import("../webapi/event/CompositionEvent.zig"),
+    @import("../webapi/event/CustomEvent.zig"),
+    @import("../webapi/event/ErrorEvent.zig"),
+    @import("../webapi/event/MessageEvent.zig"),
+    @import("../webapi/event/ProgressEvent.zig"),
+    @import("../webapi/event/NavigationCurrentEntryChangeEvent.zig"),
+    @import("../webapi/event/PageTransitionEvent.zig"),
+    @import("../webapi/event/PopStateEvent.zig"),
+    @import("../webapi/event/HashChangeEvent.zig"),
+    @import("../webapi/event/MediaQueryListEvent.zig"),
+    @import("../webapi/event/AnimationPlaybackEvent.zig"),
+    @import("../webapi/event/BeforeUnloadEvent.zig"),
+    @import("../webapi/event/StorageEvent.zig"),
+    @import("../webapi/event/DeviceMotionEvent.zig"),
+    @import("../webapi/event/GamepadEvent.zig"),
+    @import("../webapi/event/DeviceOrientationEvent.zig"),
+    @import("../webapi/event/TouchEvent.zig"),
+    @import("../webapi/event/Touch.zig"),
+    @import("../webapi/event/TouchList.zig"),
+    @import("../webapi/event/UIEvent.zig"),
+    @import("../webapi/event/MouseEvent.zig"),
+    @import("../webapi/event/PointerEvent.zig"),
+    @import("../webapi/event/KeyboardEvent.zig"),
+    @import("../webapi/event/FocusEvent.zig"),
+    @import("../webapi/event/WheelEvent.zig"),
+    @import("../webapi/event/DragEvent.zig"),
+    @import("../webapi/event/TextEvent.zig"),
+    @import("../webapi/event/InputEvent.zig"),
+    @import("../webapi/event/PromiseRejectionEvent.zig"),
+    @import("../webapi/event/SubmitEvent.zig"),
+    @import("../webapi/event/FormDataEvent.zig"),
+    @import("../webapi/event/ToggleEvent.zig"),
+    @import("../webapi/MessageChannel.zig"),
+    @import("../webapi/MessagePort.zig"),
+    @import("../webapi/BroadcastChannel.zig"),
+    @import("../webapi/Worker.zig"),
+    @import("../webapi/SharedWorker.zig"),
+    @import("../webapi/ServiceWorker.zig"),
+    @import("../webapi/ServiceWorkerContainer.zig"),
+    @import("../webapi/ServiceWorkerRegistration.zig"),
+    @import("../webapi/media/MediaError.zig"),
+    @import("../webapi/media/TextTrack.zig"),
+    @import("../webapi/media/TextTrackCue.zig"),
+    @import("../webapi/media/TextTrackCueList.zig"),
+    @import("../webapi/media/TextTrackList.zig"),
+    @import("../webapi/media/VTTCue.zig"),
+    @import("../webapi/media/VTTRegion.zig"),
+    @import("../webapi/animation/Animation.zig"),
+    @import("../webapi/EventTarget.zig"),
+    @import("../webapi/Location.zig"),
+    @import("../webapi/ModelContext.zig"),
+    @import("../webapi/Navigator.zig"),
+    @import("../webapi/NavigatorUAData.zig"),
+    @import("../webapi/Notification.zig"),
+    @import("../webapi/net/FormData.zig"),
+    @import("../webapi/net/Headers.zig"),
+    @import("../webapi/net/Request.zig"),
+    @import("../webapi/net/Response.zig"),
+    @import("../webapi/net/URLSearchParams.zig"),
+    @import("../webapi/net/XMLHttpRequest.zig"),
+    @import("../webapi/net/XMLHttpRequestEventTarget.zig"),
+    @import("../webapi/net/XMLHttpRequestUpload.zig"),
+    @import("../webapi/net/WebSocket.zig"),
+    @import("../webapi/net/EventSource.zig"),
+    @import("../webapi/event/CloseEvent.zig"),
+    @import("../webapi/streams/ReadableStream.zig"),
+    @import("../webapi/streams/ReadableStreamDefaultReader.zig"),
+    @import("../webapi/streams/ReadableStreamDefaultController.zig"),
+    @import("../webapi/streams/WritableStream.zig"),
+    @import("../webapi/streams/WritableStreamDefaultWriter.zig"),
+    @import("../webapi/streams/CountQueuingStrategy.zig"),
+    @import("../webapi/streams/ByteLengthQueuingStrategy.zig"),
+    @import("../webapi/streams/WritableStreamDefaultController.zig"),
+    @import("../webapi/streams/TransformStream.zig"),
+    @import("../webapi/Node.zig"),
+    @import("../webapi/storage/storage.zig"),
+    @import("../webapi/storage/CookieStore.zig"),
+    @import("../webapi/storage/idb/idb.zig"),
+    @import("../webapi/cache/CacheStorage.zig"),
+    @import("../webapi/cache/Cache.zig"),
+    @import("../webapi/event/CookieChangeEvent.zig"),
+    @import("../webapi/URL.zig"),
+    @import("../webapi/URLPattern.zig"),
+    @import("../webapi/Window.zig"),
+    @import("../webapi/Performance.zig"),
+    @import("../webapi/EventCounts.zig"),
+    @import("../webapi/PluginArray.zig"),
+    @import("../webapi/MutationObserver.zig"),
+    @import("../webapi/IntersectionObserver.zig"),
+    @import("../webapi/geolocation/Geolocation.zig"),
+    @import("../webapi/geolocation/GeolocationPosition.zig"),
+    @import("../webapi/geolocation/GeolocationCoordinates.zig"),
+    @import("../webapi/geolocation/GeolocationPositionError.zig"),
+    @import("../webapi/CustomElementRegistry.zig"),
+    @import("../webapi/ResizeObserver.zig"),
+    @import("../webapi/IdleDeadline.zig"),
+    @import("../webapi/Blob.zig"),
+    @import("../webapi/File.zig"),
+    @import("../webapi/FileList.zig"),
+    @import("../webapi/FileReader.zig"),
+    @import("../webapi/DataTransfer.zig"),
+    @import("../webapi/Screen.zig"),
+    @import("../webapi/VisualViewport.zig"),
+    @import("../webapi/PerformanceObserver.zig"),
+    @import("../webapi/navigation/Navigation.zig"),
+    @import("../webapi/navigation/NavigationHistoryEntry.zig"),
+    @import("../webapi/navigation/NavigationActivation.zig"),
+    @import("../webapi/canvas/CanvasRenderingContext2D.zig"),
+    @import("../webapi/canvas/WebGLRenderingContext.zig"),
+    @import("../webapi/canvas/OffscreenCanvas.zig"),
+    @import("../webapi/canvas/OffscreenCanvasRenderingContext2D.zig"),
+    @import("../webapi/canvas/TextMetrics.zig"),
+    @import("../webapi/canvas/CanvasGradient.zig"),
+    @import("../webapi/canvas/CanvasPattern.zig"),
+    @import("../webapi/canvas/Path2D.zig"),
+    @import("../webapi/canvas/OffscreenCanvas.zig").ImageBitmap,
+    @import("../webapi/SubtleCrypto.zig"),
+    @import("../webapi/CryptoKey.zig"),
+    @import("../webapi/Selection.zig"),
+    @import("../webapi/ImageData.zig"),
+    @import("../webapi/XPathResult.zig"),
+    @import("../webapi/XPathExpression.zig"),
+    @import("../webapi/XPathEvaluator.zig"),
+    @import("../webapi/collections/DOMStringList.zig"),
+    @import("../webapi/Sanitizer.zig"),
+    @import("../webapi/Lock.zig"),
+    @import("../webapi/LockManager.zig"),
+    @import("../webapi/webcodecs/encoded_chunk.zig"),
+    @import("../webapi/webcodecs/AudioData.zig"),
+    @import("../webapi/webcodecs/VideoColorSpace.zig"),
+    @import("../webapi/webcodecs/VideoFrame.zig"),
+    @import("../webapi/webcodecs/AudioDecoder.zig"),
+    @import("../webapi/webcodecs/AudioEncoder.zig"),
+    @import("../webapi/webcodecs/VideoDecoder.zig"),
+    @import("../webapi/webcodecs/VideoEncoder.zig"),
+    @import("../webapi/webaudio/AudioBuffer.zig"),
+    @import("../webapi/webaudio/AudioParam.zig"),
+    @import("../webapi/webaudio/PeriodicWave.zig"),
+    @import("../webapi/webaudio/BaseAudioContext.zig"),
+    @import("../webapi/webaudio/OfflineAudioContext.zig"),
+    @import("../webapi/webaudio/OfflineAudioCompletionEvent.zig"),
+    @import("../webapi/webaudio/AudioNode.zig"),
+    @import("../webapi/webaudio/AudioDestinationNode.zig"),
+    @import("../webapi/webaudio/AudioScheduledSourceNode.zig"),
+    @import("../webapi/webaudio/AudioBufferSourceNode.zig"),
+    @import("../webapi/webaudio/ConstantSourceNode.zig"),
+    @import("../webapi/webaudio/OscillatorNode.zig"),
+    @import("../webapi/webaudio/GainNode.zig"),
+    @import("../webapi/webaudio/DynamicsCompressorNode.zig"),
+});
+
+const webcodecs_apis = [_]type{
+    @import("../webapi/webcodecs/encoded_chunk.zig"),
+    @import("../webapi/webcodecs/AudioData.zig"),
+    @import("../webapi/webcodecs/VideoColorSpace.zig"),
+    @import("../webapi/webcodecs/VideoFrame.zig"),
+    @import("../webapi/webcodecs/AudioDecoder.zig"),
+    @import("../webapi/webcodecs/AudioEncoder.zig"),
+    @import("../webapi/webcodecs/VideoDecoder.zig"),
+    @import("../webapi/webcodecs/VideoEncoder.zig"),
+};
+
+// APIs available on EVERY worker global — dedicated, shared and service. This
+// is the WebIDL `[Exposed=Worker]` set, which covers all three. Each kind's
+// snapshot context adds its own global-scope type on top; dedicated and shared
+// additionally get worker_extended_apis below.
+// This is a subset of PageJsApis plus WorkerGlobalScope.
+// TODO: Expand this list to include all worker-appropriate APIs.
+const worker_common_apis = [_]type{
+    @import("../webapi/WorkerGlobalScope.zig"),
+    @import("../webapi/WorkerLocation.zig"),
+    @import("../webapi/WorkerNavigator.zig"),
+    @import("../webapi/NavigatorUAData.zig"),
+    @import("../webapi/Permissions.zig"),
+    @import("../webapi/StorageManager.zig"),
+    @import("../webapi/EventTarget.zig"),
+    @import("../webapi/Event.zig"),
+    @import("../webapi/event/MessageEvent.zig"),
+    @import("../webapi/event/ErrorEvent.zig"),
+    @import("../webapi/event/PromiseRejectionEvent.zig"),
+    @import("../webapi/event/CloseEvent.zig"),
+    @import("../webapi/DOMException.zig"),
+    @import("../webapi/QuotaExceededError.zig"),
+    @import("../webapi/DOMRectReadOnly.zig"),
+    @import("../webapi/DOMRect.zig"),
+    @import("../webapi/DOMMatrixReadOnly.zig"),
+    @import("../webapi/DOMMatrix.zig"),
+    @import("../webapi/DOMPointReadOnly.zig"),
+    @import("../webapi/DOMPoint.zig"),
+    @import("../webapi/net/URLSearchParams.zig"),
+    @import("../webapi/encoding/TextEncoder.zig"),
+    @import("../webapi/encoding/TextDecoder.zig"),
+    @import("../webapi/Blob.zig"),
+    @import("../webapi/File.zig"),
+    @import("../webapi/Console.zig"),
+    @import("../webapi/Crypto.zig"),
+    @import("../webapi/SubtleCrypto.zig"),
+    @import("../webapi/CryptoKey.zig"),
+    @import("../webapi/net/FormData.zig"),
+    @import("../webapi/net/Headers.zig"),
+    @import("../webapi/net/Request.zig"),
+    @import("../webapi/net/Response.zig"),
+    @import("../webapi/streams/TransformStream.zig"),
+    @import("../webapi/streams/ReadableStream.zig"),
+    @import("../webapi/streams/ReadableStreamDefaultReader.zig"),
+    @import("../webapi/streams/ReadableStreamDefaultController.zig"),
+    @import("../webapi/streams/WritableStream.zig"),
+    @import("../webapi/streams/WritableStreamDefaultWriter.zig"),
+    @import("../webapi/streams/CountQueuingStrategy.zig"),
+    @import("../webapi/streams/ByteLengthQueuingStrategy.zig"),
+    @import("../webapi/streams/WritableStreamDefaultController.zig"),
+    @import("../webapi/encoding/TextEncoderStream.zig"),
+    @import("../webapi/encoding/TextDecoderStream.zig"),
+    @import("../webapi/compression/CompressionStream.zig"),
+    @import("../webapi/compression/DecompressionStream.zig"),
+    @import("../webapi/AbortSignal.zig"),
+    @import("../webapi/AbortController.zig"),
+    @import("../webapi/Scheduler.zig"),
+    @import("../webapi/TaskController.zig"),
+    @import("../webapi/TaskSignal.zig"),
+    @import("../webapi/event/TaskPriorityChangeEvent.zig"),
+    @import("../webapi/URL.zig"),
+    @import("../webapi/URLPattern.zig"),
+    @import("../webapi/canvas/OffscreenCanvas.zig"),
+    @import("../webapi/canvas/OffscreenCanvasRenderingContext2D.zig"),
+    @import("../webapi/canvas/TextMetrics.zig"),
+    @import("../webapi/canvas/CanvasGradient.zig"),
+    @import("../webapi/canvas/CanvasPattern.zig"),
+    @import("../webapi/canvas/Path2D.zig"),
+    @import("../webapi/canvas/OffscreenCanvas.zig").ImageBitmap,
+    @import("../webapi/canvas/WebGLRenderingContext.zig"),
+    @import("../webapi/net/WebSocket.zig"),
+    @import("../webapi/net/EventSource.zig"),
+    @import("../webapi/FileReader.zig"),
+    @import("../webapi/ImageData.zig"),
+    @import("../webapi/Performance.zig"),
+    @import("../webapi/PerformanceObserver.zig"),
+    @import("../webapi/storage/idb/idb.zig"),
+    @import("../webapi/cache/CacheStorage.zig"),
+    @import("../webapi/cache/Cache.zig"),
+    @import("../webapi/BroadcastChannel.zig"),
+    @import("../webapi/event/CustomEvent.zig"),
+    @import("../webapi/event/ProgressEvent.zig"),
+    @import("../webapi/Notification.zig"),
+    @import("../webapi/FileList.zig"),
+    @import("../webapi/MessageChannel.zig"),
+    @import("../webapi/MessagePort.zig"),
+    @import("../webapi/collections/DOMStringList.zig"),
+    @import("../webapi/Lock.zig"),
+    @import("../webapi/LockManager.zig"),
+};
+
+// Additionally available on a dedicated or shared worker, but NOT on a service
+// worker. Both are blocking APIs that a service worker — which has to stay
+// responsive to lifecycle and (eventually) fetch events — must not have:
+// XMLHttpRequest is [Exposed=(Window,DedicatedWorker,SharedWorker)] and
+// FileReaderSync is [Exposed=(DedicatedWorker,SharedWorker)].
+const worker_extended_apis = worker_common_apis ++ [_]type{
+    @import("../webapi/net/XMLHttpRequest.zig"),
+    @import("../webapi/net/XMLHttpRequestEventTarget.zig"),
+    @import("../webapi/net/XMLHttpRequestUpload.zig"),
+    @import("../webapi/FileReaderSync.zig"),
+};
+
+pub const DedicatedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/DedicatedWorkerGlobalScope.zig")} ++ worker_extended_apis ++ webcodecs_apis));
+pub const SharedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/SharedWorkerGlobalScope.zig")} ++ worker_extended_apis));
+
+pub const ServiceWorkerJsApis = flattenTypes(&([_]type{
+    @import("../webapi/ServiceWorkerGlobalScope.zig"),
+    @import("../webapi/ServiceWorker.zig"),
+    @import("../webapi/ServiceWorkerRegistration.zig"),
+    @import("../webapi/event/ExtendableEvent.zig"),
+    @import("../webapi/storage/CookieStore.zig"),
+} ++ worker_common_apis));
+
+// Master list of ALL JS APIs across all contexts.
+// Used by Env (class IDs, templates), JsApiLookup, and anywhere that needs
+// to know about all possible types. Individual snapshots use their own
+// subsets (PageJsApis, WorkerSnapshot.JsApis).
+pub const JsApis = blk: {
+    const base = PageJsApis ++ [_]type{
+        // Worker-only, so it isn't in PageJsApis.
+        @import("../webapi/FileReaderSync.zig").JsApi,
+        @import("../webapi/DedicatedWorkerGlobalScope.zig").JsApi,
+        @import("../webapi/SharedWorkerGlobalScope.zig").JsApi,
+        @import("../webapi/ServiceWorkerGlobalScope.zig").JsApi,
+        //ServiceWorker-only, so it isn't in PageJsApis either.
+        @import("../webapi/event/ExtendableEvent.zig").JsApi,
+        @import("../webapi/WorkerGlobalScope.zig").JsApi,
+        @import("../webapi/WorkerLocation.zig").JsApi,
+        @import("../webapi/WorkerNavigator.zig").JsApi,
+    };
+    if (lp.build_config.wpt_extensions == false) {
+        break :blk base;
+    }
+    break :blk base ++ [_]type{@import("../webapi/WebDriver.zig").JsApi};
+};
+
+// Whether Child is Ancestor or inherits from it, following the Proto chain.
+pub fn inheritsOrIs(comptime Child: type, comptime Ancestor: type) bool {
+    comptime {
+        const target = Ancestor.bridge.type;
+        var T = Child.bridge.type;
+        while (true) {
+            if (T == target) {
+                return true;
+            }
+            T = reflect.Proto(T) orelse return false;
+        }
+    }
+}

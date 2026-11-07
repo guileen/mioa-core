@@ -1,0 +1,160 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+const js = @import("js.zig");
+const v8 = js.v8;
+
+const Module = @This();
+
+local: *const js.Local,
+handle: *const v8.Module,
+
+pub const Status = enum(u32) {
+    kUninstantiated = v8.kUninstantiated,
+    kInstantiating = v8.kInstantiating,
+    kInstantiated = v8.kInstantiated,
+    kEvaluating = v8.kEvaluating,
+    kEvaluated = v8.kEvaluated,
+    kErrored = v8.kErrored,
+};
+
+pub fn getStatus(self: Module) Status {
+    return @fromBackingInt(@intCast(v8.v8__Module__GetStatus(self.handle)));
+}
+
+pub fn getException(self: Module) js.Value {
+    return .{
+        .local = self.local,
+        .handle = v8.v8__Module__GetException(self.handle).?,
+    };
+}
+
+pub fn getModuleRequests(self: Module) Requests {
+    return .{
+        .handle = v8.v8__Module__GetModuleRequests(self.handle).?,
+    };
+}
+
+pub fn instantiate(self: Module, cb: v8.ResolveModuleCallback) !bool {
+    var out: v8.MaybeBool = undefined;
+    v8.v8__Module__InstantiateModule(self.handle, self.local.handle, cb, &out);
+    if (out.has_value) {
+        return out.value;
+    }
+    return error.JsException;
+}
+
+pub fn evaluate(self: Module) !js.Value {
+    const status = self.getStatus();
+    switch (status) {
+        .kInstantiated, .kEvaluated, .kErrored => {},
+        .kUninstantiated, .kInstantiating, .kEvaluating => {
+            // V8 aborts the process (a CHECK, not an exception) on any of these.
+            // This CHECK has been reported in production (https://github.com/lightpanda-io/browser/pull/3343)
+            // but I can't see how we're getting there. Digging through v8's
+            // source code, it would appear that we're reaching here when
+            // status == kEvaluating (the other status' would fail differently).
+            // There's no harm in adding this (it will cause a JS module error
+            // but not a process crash).
+            // NOTE to future me: yes, the dynamic module path can legitimately
+            // try to evaluate a module when status == .kEvaluating and we DO
+            // guard against that, but that's via a reentrant path that
+            // shoulnd't be possible here.
+            if (comptime lp.IS_DEBUG) {
+                std.debug.panic("Module.evaluate on {s}", .{@tagName(status)});
+            }
+            return error.InvalidModuleStatus;
+        },
+    }
+
+    const res = v8.v8__Module__Evaluate(self.handle, self.local.handle) orelse return error.JsException;
+
+    if (self.getStatus() == .kErrored) {
+        // `res` is the evaluation promise, already rejected. It never reaches
+        // the page, so it isn't an unhandled rejection: the caller reports
+        // the exception itself.
+        const promise: js.Promise = .{ .local = self.local, .handle = @ptrCast(res) };
+        promise.markAsHandled();
+        return error.JsException;
+    }
+
+    return .{
+        .local = self.local,
+        .handle = res,
+    };
+}
+
+pub fn getIdentityHash(self: Module) u32 {
+    return @bitCast(v8.v8__Module__GetIdentityHash(self.handle));
+}
+
+pub fn getModuleNamespace(self: Module) js.Value {
+    return .{
+        .local = self.local,
+        .handle = v8.v8__Module__GetModuleNamespace(self.handle).?,
+    };
+}
+
+pub fn persist(self: Module) !Global {
+    var ctx = self.local.ctx;
+    var global: v8.Global = undefined;
+    v8.v8__Global__New(ctx.isolate.handle, self.handle, &global);
+    try ctx.global_modules.append(ctx.arena.allocator(), global);
+    return .{ .handle = global };
+}
+
+pub const Global = struct {
+    handle: v8.Global,
+
+    pub fn deinit(self: *Global) void {
+        v8.v8__Global__Reset(&self.handle);
+    }
+
+    pub fn local(self: *const Global, l: *const js.Local) Module {
+        return .{
+            .local = l,
+            .handle = @ptrCast(v8.v8__Global__Get(&self.handle, l.isolate.handle)),
+        };
+    }
+
+    pub fn isEqual(self: *const Global, other: Module) bool {
+        return v8.v8__Global__IsEqual(&self.handle, other.handle);
+    }
+};
+
+const Requests = struct {
+    handle: *const v8.FixedArray,
+
+    pub fn len(self: Requests) usize {
+        return @intCast(v8.v8__FixedArray__Length(self.handle));
+    }
+
+    pub fn get(self: Requests, idx: usize) Request {
+        return .{ .handle = v8.v8__FixedArray__Get(self.handle, @intCast(idx)).? };
+    }
+};
+
+const Request = struct {
+    handle: *const v8.ModuleRequest,
+
+    pub fn specifier(self: Request, local: *const js.Local) js.String {
+        return .{ .local = local, .handle = v8.v8__ModuleRequest__GetSpecifier(self.handle).? };
+    }
+};

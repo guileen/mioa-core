@@ -428,6 +428,7 @@ class NativePage:
         self._native_input_batch: tuple[asyncio.Task, list[dict[str, Any]]] | None = None
         self._site_icon: NativeSiteIcon | None = None
         self._site_icon_version: tuple[str, int] | None = None
+        self._site_icons_subscribed = False
 
     @property
     def url(self) -> str:
@@ -507,7 +508,6 @@ class NativePage:
     async def _initialize(self) -> None:
         await self._send("Page.enable")
         await self._send("Network.enable")
-        await self._send("Page.subscribeSiteIcons")
         tree = await self._send("Page.getFrameTree")
         frame = tree.get("frameTree", {}).get("frame", {})
         if not isinstance(frame.get("id"), str) or not frame["id"]:
@@ -636,6 +636,10 @@ class NativePage:
 
     async def site_icon(self) -> NativeSiteIcon | None:
         """Read document icon metadata; unchanged revisions omit image bytes."""
+        # Optional metadata must not prevent basic page startup on other backends.
+        if not self._site_icons_subscribed:
+            await self._send("Page.subscribeSiteIcons")
+            self._site_icons_subscribed = True
         epoch = self.observation_id
         known = self._site_icon_version
         params = {} if known is None else {"knownDocument": known[0], "knownRevision": known[1]}

@@ -1,0 +1,659 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+
+const js = @import("../js/js.zig");
+const Page = @import("../Page.zig");
+const Frame = @import("../Frame.zig");
+
+const Node = @import("Node.zig");
+const Element = @import("Element.zig");
+
+const log = lp.log;
+const String = lp.String;
+
+pub fn registerTypes() []const type {
+    return &.{
+        MutationObserver,
+        MutationRecord,
+    };
+}
+
+const MutationObserver = @This();
+
+_rc: lp.RC = .{},
+_arena: *lp.Arena,
+_callback: js.Function.Global,
+_observing: std.ArrayList(Observing) = .empty,
+// these are RC'd (by us, and v8)
+_pending_records: std.ArrayList(*MutationRecord) = .empty,
+/// Intrusively linked to next element (see Frame.zig).
+node: std.DoublyLinkedList.Node = .{},
+
+const Observing = struct {
+    target: *Node,
+    options: ResolvedOptions,
+};
+
+/// Internal options with all nullable bools resolved to concrete values.
+const ResolvedOptions = struct {
+    attributes: bool = false,
+    attributeOldValue: bool = false,
+    childList: bool = false,
+    characterData: bool = false,
+    characterDataOldValue: bool = false,
+    subtree: bool = false,
+    attributeFilter: ?[]const []const u8 = null,
+};
+
+const ObserveOptions = struct {
+    attributeFilter: ?[]const []const u8 = null,
+    attributeOldValue: ?bool = null,
+    attributes: ?bool = null,
+    characterData: ?bool = null,
+    characterDataOldValue: ?bool = null,
+    childList: bool = false,
+    subtree: bool = false,
+};
+
+pub fn init(callback: js.Function.Global, frame: *Frame) !*MutationObserver {
+    const arena = try frame.getArena(.small, "MutationObserver");
+    errdefer arena.release();
+    const self = try arena.create(MutationObserver);
+    self.* = .{
+        ._arena = arena,
+        ._callback = callback,
+    };
+    return self;
+}
+
+pub fn deinit(self: *MutationObserver, page: *Page) void {
+    releaseAll(self._pending_records.items, page);
+    self._callback.release();
+    self._arena.release();
+}
+
+pub fn releaseRef(self: *MutationObserver, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *MutationObserver) void {
+    self._rc.acquire();
+}
+
+pub fn observe(self: *MutationObserver, target: *Node, options: ObserveOptions, frame: *Frame) !void {
+    const arena = self._arena;
+
+    // Per spec: if attributeOldValue/attributeFilter present and attributes
+    // not explicitly set, imply attributes=true. Same for characterData.
+    var resolved = options;
+    if (resolved.attributes == null and (resolved.attributeOldValue != null or resolved.attributeFilter != null)) {
+        resolved.attributes = true;
+    }
+    if (resolved.characterData == null and resolved.characterDataOldValue != null) {
+        resolved.characterData = true;
+    }
+
+    const attributes = resolved.attributes orelse false;
+    const character_data = resolved.characterData orelse false;
+
+    // Validate: at least one of childList/attributes/characterData must be true
+    if (!resolved.childList and !attributes and !character_data) {
+        return error.TypeError;
+    }
+
+    // Validate: attributeOldValue/attributeFilter require attributes != false
+    if ((resolved.attributeOldValue orelse false) and !attributes) {
+        return error.TypeError;
+    }
+    if (resolved.attributeFilter != null and !attributes) {
+        return error.TypeError;
+    }
+
+    // Validate: characterDataOldValue requires characterData != false
+    if ((resolved.characterDataOldValue orelse false) and !character_data) {
+        return error.TypeError;
+    }
+
+    // Build resolved options with concrete bool values
+    var store_options = ResolvedOptions{
+        .attributes = attributes,
+        .attributeOldValue = resolved.attributeOldValue orelse false,
+        .childList = resolved.childList,
+        .characterData = character_data,
+        .characterDataOldValue = resolved.characterDataOldValue orelse false,
+        .subtree = resolved.subtree,
+        .attributeFilter = resolved.attributeFilter,
+    };
+
+    // Deep copy attributeFilter if present
+    if (options.attributeFilter) |filter| {
+        const filter_copy = try arena.alloc([]const u8, filter.len);
+        for (filter, 0..) |name, i| {
+            filter_copy[i] = try arena.dupe(u8, name);
+        }
+        store_options.attributeFilter = filter_copy;
+    }
+
+    // Check if already observing this target
+    for (self._observing.items) |*obs| {
+        if (obs.target == target) {
+            obs.options = store_options;
+            return;
+        }
+    }
+
+    try self._observing.append(arena.allocator(), .{
+        .target = target,
+        .options = store_options,
+    });
+
+    if (self._observing.items.len == 1) {
+        try Frame.observers.registerMutationObserver(frame, self);
+    }
+}
+
+pub fn disconnect(self: *MutationObserver, frame: *Frame) void {
+    releaseAll(self._pending_records.items, frame.page);
+    self._pending_records.clearRetainingCapacity();
+
+    if (self._observing.items.len > 0) {
+        Frame.observers.unregisterMutationObserver(frame, self);
+    }
+    self._observing.clearRetainingCapacity();
+}
+
+fn takeRecords(self: *MutationObserver, frame: *Frame) !js.Value {
+    const local = frame.js.local orelse return error.NotHandled;
+    const records = try self.takePendingRecords(frame);
+    // whether we safely deliver these to v8 or not, we're done with these
+    defer releaseAll(records, frame.page);
+    return local.zigValueToJs(records, .{});
+}
+
+fn takePendingRecords(self: *MutationObserver, frame: *Frame) ![]*MutationRecord {
+    const records = try frame.call_arena.dupe(*MutationRecord, self._pending_records.items);
+    self._pending_records.clearRetainingCapacity();
+    return records;
+}
+
+fn releaseAll(records: []const *MutationRecord, page: *Page) void {
+    for (records) |record| {
+        record.releaseRef(page);
+    }
+}
+
+// Called when an attribute changes on any element
+pub fn notifyAttributeChange(
+    self: *MutationObserver,
+    target: *Element,
+    attribute_name: String,
+    old_value: ?String,
+    frame: *Frame,
+) !void {
+    const target_node = target.asNode();
+
+    for (self._observing.items) |obs| {
+        if (obs.target != target_node) {
+            if (!obs.options.subtree) {
+                continue;
+            }
+            if (!obs.target.contains(target_node)) {
+                continue;
+            }
+        }
+        if (!obs.options.attributes) {
+            continue;
+        }
+        if (obs.options.attributeFilter) |filter| {
+            for (filter) |name| {
+                if (attribute_name.eqlSlice(name)) {
+                    break;
+                }
+            } else {
+                continue;
+            }
+        }
+
+        const arena = try frame.getArena(.tiny, "MutationRecord");
+        const record = try arena.create(MutationRecord);
+        record.* = .{
+            ._rc = .init(1),
+            ._arena = arena,
+            ._type = .attributes,
+            ._target = target_node,
+            ._attribute_name = try arena.dupe(u8, attribute_name.str()),
+            ._old_value = if (obs.options.attributeOldValue and old_value != null)
+                try arena.dupe(u8, old_value.?.str())
+            else
+                null,
+            ._added_nodes = &.{},
+            ._removed_nodes = &.{},
+            ._previous_sibling = null,
+            ._next_sibling = null,
+        };
+
+        try self._pending_records.append(self._arena.allocator(), record);
+
+        try Frame.observers.scheduleMutationDelivery(frame);
+        break;
+    }
+}
+
+// Called when character data changes on a text node
+pub fn notifyCharacterDataChange(
+    self: *MutationObserver,
+    target: *Node,
+    old_value: ?String,
+    frame: *Frame,
+) !void {
+    for (self._observing.items) |obs| {
+        if (obs.target != target) {
+            if (!obs.options.subtree) {
+                continue;
+            }
+            if (!obs.target.contains(target)) {
+                continue;
+            }
+        }
+        if (!obs.options.characterData) {
+            continue;
+        }
+
+        const arena = try frame.getArena(.tiny, "MutationRecord");
+        const record = try arena.create(MutationRecord);
+        record.* = .{
+            ._rc = .init(1),
+            ._arena = arena,
+            ._type = .characterData,
+            ._target = target,
+            ._attribute_name = null,
+            ._old_value = if (obs.options.characterDataOldValue and old_value != null)
+                try arena.dupe(u8, old_value.?.str())
+            else
+                null,
+            ._added_nodes = &.{},
+            ._removed_nodes = &.{},
+            ._previous_sibling = null,
+            ._next_sibling = null,
+        };
+
+        try self._pending_records.append(self._arena.allocator(), record);
+
+        try Frame.observers.scheduleMutationDelivery(frame);
+        break;
+    }
+}
+
+// Called when children are added or removed from a node
+pub fn notifyChildListChange(
+    self: *MutationObserver,
+    target: *Node,
+    added_nodes: []const *Node,
+    removed_nodes: []const *Node,
+    previous_sibling: ?*Node,
+    next_sibling: ?*Node,
+    frame: *Frame,
+) !void {
+    for (self._observing.items) |obs| {
+        if (obs.target != target) {
+            if (!obs.options.subtree) {
+                continue;
+            }
+            if (!obs.target.contains(target)) {
+                continue;
+            }
+        }
+        if (!obs.options.childList) {
+            continue;
+        }
+
+        const arena = try frame.getArena(.tiny, "MutationRecord");
+        const record = try arena.create(MutationRecord);
+        record.* = .{
+            ._rc = .init(1),
+            ._arena = arena,
+            ._type = .childList,
+            ._target = target,
+            ._attribute_name = null,
+            ._old_value = null,
+            ._added_nodes = try arena.dupe(*Node, added_nodes),
+            ._removed_nodes = try arena.dupe(*Node, removed_nodes),
+            ._previous_sibling = previous_sibling,
+            ._next_sibling = next_sibling,
+        };
+
+        try self._pending_records.append(self._arena.allocator(), record);
+
+        try Frame.observers.scheduleMutationDelivery(frame);
+        break;
+    }
+}
+
+pub fn deliverRecords(self: *MutationObserver, frame: *Frame) !void {
+    if (self._pending_records.items.len == 0) {
+        return;
+    }
+
+    // Take a copy of the records and clear the list before calling callback
+    // This ensures mutations triggered during the callback go into a fresh list
+    const records = try self.takePendingRecords(frame);
+    // whether we safely deliver these to v8 or not, we're done with these
+    defer releaseAll(records, frame.page);
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    ls.toLocal(self._callback).callWithThisReport(self, .{ records, self }) catch |err| {
+        log.debug(.frame, "MutObserver.deliverRecords", .{ .err = err });
+        return err;
+    };
+}
+
+pub const MutationRecord = struct {
+    _rc: lp.RC = .{},
+    _type: Type,
+    _target: *Node,
+    _arena: *lp.Arena,
+    _attribute_name: ?[]const u8,
+    _old_value: ?[]const u8,
+    _added_nodes: []const *Node,
+    _removed_nodes: []const *Node,
+    _previous_sibling: ?*Node,
+    _next_sibling: ?*Node,
+
+    pub const Type = enum {
+        attributes,
+        childList,
+        characterData,
+    };
+
+    pub fn deinit(self: *MutationRecord, _: *Page) void {
+        self._arena.release();
+    }
+
+    pub fn releaseRef(self: *MutationRecord, session: *Page) void {
+        self._rc.release(self, session);
+    }
+
+    pub fn acquireRef(self: *MutationRecord) void {
+        self._rc.acquire();
+    }
+
+    pub fn getType(self: *const MutationRecord) []const u8 {
+        return switch (self._type) {
+            .attributes => "attributes",
+            .childList => "childList",
+            .characterData => "characterData",
+        };
+    }
+
+    pub fn getTarget(self: *const MutationRecord) *Node {
+        return self._target;
+    }
+
+    fn getAttributeNamespace(self: *const MutationRecord) ?[]const u8 {
+        _ = self;
+        // Non-namespaced attribute mutations return null. Full namespace tracking
+        // for setAttributeNS mutations is not yet implemented.
+        return null;
+    }
+
+    fn getAttributeName(self: *const MutationRecord) ?[]const u8 {
+        return self._attribute_name;
+    }
+
+    fn getOldValue(self: *const MutationRecord) ?[]const u8 {
+        return self._old_value;
+    }
+
+    fn getAddedNodes(self: *const MutationRecord) []const *Node {
+        return self._added_nodes;
+    }
+
+    fn getRemovedNodes(self: *const MutationRecord) []const *Node {
+        return self._removed_nodes;
+    }
+
+    fn getPreviousSibling(self: *const MutationRecord) ?*Node {
+        return self._previous_sibling;
+    }
+
+    fn getNextSibling(self: *const MutationRecord) ?*Node {
+        return self._next_sibling;
+    }
+
+    pub const JsApi = struct {
+        pub const bridge = js.Bridge(MutationRecord);
+
+        pub const Meta = struct {
+            pub const name = "MutationRecord";
+            pub var class_id: bridge.ClassId = undefined;
+        };
+
+        pub const @"type" = bridge.accessor(MutationRecord.getType, null, .{});
+        pub const target = bridge.accessor(MutationRecord.getTarget, null, .{});
+        pub const attributeName = bridge.accessor(MutationRecord.getAttributeName, null, .{});
+        pub const attributeNamespace = bridge.accessor(MutationRecord.getAttributeNamespace, null, .{});
+        pub const oldValue = bridge.accessor(MutationRecord.getOldValue, null, .{});
+        pub const addedNodes = bridge.accessor(MutationRecord.getAddedNodes, null, .{});
+        pub const removedNodes = bridge.accessor(MutationRecord.getRemovedNodes, null, .{});
+        pub const previousSibling = bridge.accessor(MutationRecord.getPreviousSibling, null, .{});
+        pub const nextSibling = bridge.accessor(MutationRecord.getNextSibling, null, .{});
+    };
+};
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(MutationObserver);
+
+    pub const Meta = struct {
+        pub const name = "MutationObserver";
+        pub var class_id: bridge.ClassId = undefined;
+    };
+
+    pub const constructor = bridge.constructor(MutationObserver.init, .{});
+
+    pub const observe = bridge.function(MutationObserver.observe, .{});
+    pub const disconnect = bridge.function(MutationObserver.disconnect, .{});
+    pub const takeRecords = bridge.function(MutationObserver.takeRecords, .{});
+};
+
+const testing = @import("../../testing.zig");
+test "WebApi: MutationObserver" {
+    try testing.htmlRunner("mutation_observer", .{});
+}
+
+test "WebApi: runaway MutationObserver delivery is disconnected" {
+    testing.silenceLog(&.{.frame});
+
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    try ls.local.eval(
+        \\(function() {
+        \\  const target = document.createElement('div');
+        \\  const children = [target.appendChild(document.createElement('div'))];
+        \\  let n = 0;
+        \\  const mutate = () => {
+        \\    n++;
+        \\    for (const child of children) child.style.transform = `translate3d(${n}px,0,0)`;
+        \\  };
+        \\  new MutationObserver(() => {
+        \\    setTimeout(mutate, 0);
+        \\    mutate();
+        \\  }).observe(target, {attributes: true, subtree: true, attributeFilter: ['style']});
+        \\  mutate();
+        \\})()
+    , null);
+
+    for (0..200) |_| {
+        frame.js.env.runMicrotasks();
+        try frame.js.env.runMacrotasks();
+        if (!Frame.observers.hasMutationObservers(frame)) break;
+    }
+
+    try testing.expectEqual(false, Frame.observers.hasMutationObservers(frame));
+}
+
+// Production watchdog path (lightpanda-io/browser#3130 follow-up): the
+// terminate lands inside a MutationObserver callback, so ExecutionTerminated
+// must unwind out of deliverRecords, stay sticky against further V8 entries,
+// and leave the observer machinery usable after a top-level cancel.
+test "WebApi: MutationObserver requested termination unwinds delivery" {
+    const v8 = js.v8;
+
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const env = frame.js.env;
+    defer env.cancelTerminate();
+
+    const State = struct {
+        env: *js.Env,
+
+        fn kill(self: *@This()) void {
+            self.env.requestTerminate();
+        }
+    };
+    var state = State{ .env = env };
+    const kill_cb = local.newCallback(State.kill, &state);
+
+    // An observer whose callback wedges until the requested termination
+    // lands, like a storefront spinning inside its MutationObserver callback
+    // when the watchdog fires.
+    const setup = try local.exec(
+        \\(function(kill) {
+        \\  const target = document.createElement('div');
+        \\  window.__delivered = 0;
+        \\  window.__wedge = true;
+        \\  window.__target = target;
+        \\  new MutationObserver(() => {
+        \\    window.__delivered++;
+        \\    if (window.__wedge) { kill(); for(;;){} }
+        \\  }).observe(target, { attributes: true });
+        \\  target.setAttribute('x', '1');
+        \\})
+    , null);
+    const setup_fn = js.Function{ .local = local, .handle = @ptrCast(setup.handle) };
+    try setup_fn.call(void, .{kill_cb});
+
+    // The queued delivery microtask wedges; the terminate unwinds it and the
+    // unwind must stop at deliverRecords without another V8 entry.
+    env.runMicrotasks();
+
+    try testing.expectEqual(true, env.terminatePending());
+    try testing.expectEqual(false, v8.v8__Isolate__IsExecutionTerminating(env.isolate.handle));
+
+    // Sticky: no fresh eval may enter V8 while the termination is pending.
+    try testing.expectError(error.ExecutionTerminated, local.exec("1 + 1", null));
+
+    // A top-level cancel restores execution AND mutation delivery.
+    env.cancelTerminate();
+    try testing.expectEqual(1, try (try local.exec("window.__delivered", null)).toI32());
+    try local.eval("window.__wedge = false; window.__target.setAttribute('x', '2');", null);
+    env.runMicrotasks();
+    try testing.expectEqual(2, try (try local.exec("window.__delivered", null)).toI32());
+}
+
+test "WebApi: MutationObserver terminate requested between observers releases records" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const env = frame.js.env;
+    defer env.cancelTerminate();
+
+    const State = struct {
+        env: *js.Env,
+
+        fn kill(self: *@This()) void {
+            self.env.requestTerminate();
+        }
+    };
+    var state = State{ .env = env };
+    const kill_cb = local.newCallback(State.kill, &state);
+
+    const setup = try local.exec(
+        \\(function(kill) {
+        \\  const target = document.createElement('div');
+        \\  new MutationObserver(() => { kill(); }).observe(target, { attributes: true });
+        \\  new MutationObserver(() => {}).observe(target, { attributes: true });
+        \\  target.setAttribute('x', '1');
+        \\})
+    , null);
+    const setup_fn = js.Function{ .local = local, .handle = @ptrCast(setup.handle) };
+    try setup_fn.call(void, .{kill_cb});
+
+    env.runMicrotasks();
+    try testing.expectEqual(true, env.terminatePending());
+}
+
+test "WebApi: MutationObserver terminated page tears down" {
+    const frame = try testing.createFrame();
+    const env = frame.js.env;
+    defer env.cancelTerminate();
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        const local = &ls.local;
+
+        const State = struct {
+            env: *js.Env,
+
+            fn kill(self: *@This()) void {
+                self.env.requestTerminate();
+            }
+        };
+        var state = State{ .env = env };
+        const kill_cb = local.newCallback(State.kill, &state);
+        const setup = try local.exec(
+            \\(function(kill) {
+            \\  const target = document.createElement('div');
+            \\  new MutationObserver(() => { kill(); for(;;){} })
+            \\      .observe(target, { attributes: true });
+            \\  target.setAttribute('x', '1');
+            \\})
+        , null);
+        const setup_fn = js.Function{ .local = local, .handle = @ptrCast(setup.handle) };
+        try setup_fn.call(void, .{kill_cb});
+    }
+
+    env.runMicrotasks();
+    try testing.expectEqual(true, env.terminatePending());
+    try testing.expectEqual(false, js.v8.v8__Isolate__IsExecutionTerminating(env.isolate.handle));
+
+    testing.test_session.closeAllPages();
+    try testing.expectEqual(@as(usize, 0), env.contexts.items.len);
+}

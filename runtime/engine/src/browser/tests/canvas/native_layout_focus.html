@@ -1,0 +1,41 @@
+<!doctype html><meta charset="utf-8"><title>Native focus and CSS layout agreement</title>
+<script src="../testing.js"></script>
+<style>
+#control {display:block;box-sizing:border-box;border:0;padding:0;width:60px;height:20px;}
+#control:focus {width:100px;}
+#control:focus-visible {height:35px;}
+</style>
+<div id="container"><input id="control"></div>
+<script id="native_focus_projection_and_computed_style">
+{
+  const control=document.getElementById('control');
+  const container=document.getElementById('container');
+  testing.expectEqual(60,control.getBoundingClientRect().width);
+  control.focus();
+  testing.expectEqual(true,control.matches(':focus'));
+  testing.expectEqual(true,control.matches(':focus-visible'));
+  testing.expectEqual(true,container.matches(':focus-within'));
+  testing.expectEqual('100px',getComputedStyle(control).width);
+  testing.expectEqual('35px',getComputedStyle(control).height);
+  testing.expectEqual(100,control.getBoundingClientRect().width);
+  testing.expectEqual(35,control.getBoundingClientRect().height);
+  control.blur();
+  testing.expectEqual(false,control.matches(':focus'));
+  testing.expectEqual(false,container.matches(':focus-within'));
+  testing.expectEqual(60,control.getBoundingClientRect().width);
+  testing.expectEqual(20,control.getBoundingClientRect().height);
+}
+</script>
+<script id="native_shadow_focus_ancestry">
+{
+  const host=document.createElement('section');document.body.appendChild(host);
+  const shadow=host.attachShadow({mode:'open'});
+  const input=document.createElement('input');shadow.appendChild(input);
+  input.focus();
+  testing.expectEqual(true,input.matches(':focus'));
+  testing.expectEqual(true,input.matches(':focus-visible'));
+  testing.expectEqual(true,host.matches(':focus-within'));
+  input.blur();
+  testing.expectEqual(false,host.matches(':focus-within'));
+}
+</script>

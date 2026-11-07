@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<script id=reportErrorBasic>
+{
+  let errorEventFired = false;
+  let capturedEvent = null;
+
+  window.addEventListener('error', (e) => {
+    e.preventDefault();
+    errorEventFired = true;
+    capturedEvent = e;
+  });
+
+  const err = new Error('Test error');
+  window.reportError(err);
+
+  testing.expectEqual(true, errorEventFired);
+  testing.expectEqual('error', capturedEvent.type);
+  testing.expectEqual(true, capturedEvent.message.includes('Test error'));
+}
+</script>
+
+<script id=reportErrorWithProperties>
+{
+  let evt = null;
+  window.addEventListener('error', (e) => {
+    e.preventDefault();
+    evt = e;
+  });
+
+  const err = new Error('Detailed error');
+  err.fileName = 'script.js';
+  err.lineNumber = 100;
+  err.columnNumber = 25;
+
+  window.reportError(err);
+
+  testing.expectEqual(true, evt.message.includes('Detailed error'));
+  testing.expectEqual(err, evt.error);
+}
+</script>
+
+<script id=reportErrorCancelable>
+{
+  let eventCancelable = false;
+
+  window.addEventListener('error', (e) => {
+    eventCancelable = e.cancelable;
+    e.preventDefault();
+  });
+
+  window.reportError(new Error('Cancelable error'));
+
+  testing.expectEqual(true, eventCancelable);
+}
+</script>
+
+<script id=reportErrorNotBubbling>
+{
+  let parentCalled = false;
+  let windowCalled = false;
+
+  document.addEventListener('error', () => {
+    parentCalled = true;
+  });
+
+  window.addEventListener('error', (e) => {
+    e.preventDefault();
+    windowCalled = true;
+  });
+
+  window.reportError(new Error('Non-bubbling error'));
+
+  testing.expectEqual(false, parentCalled);
+  testing.expectEqual(true, windowCalled);
+}
+</script>
+
+<script id=reportErrorWithString>
+{
+  let evt = null;
+
+  window.addEventListener('error', (e) => {
+    e.preventDefault();
+    evt = e;
+  });
+
+  window.reportError('Plain string error');
+
+  testing.expectEqual('Plain string error', evt.message);
+  // A non-Error value is located at the reportError call, as in Chrome.
+  testing.expectEqual(true, evt.filename.endsWith('report_error.html'));
+  testing.expectEqual(true, evt.lineno > 0);
+  testing.expectEqual(true, evt.colno > 0);
+}
+</script>
+
+<script id=reportErrorMultipleCalls>
+{
+  let callCount = 0;
+
+  window.addEventListener('error', (e) => {
+    e.preventDefault();
+    callCount++;
+  });
+
+  window.reportError(new Error('First error'));
+  window.reportError(new Error('Second error'));
+  window.reportError(new Error('Third error'));
+
+  testing.expectEqual(3, callCount);
+}
+</script>
+
+<script id=reportErrorErrorLocation>
+{
+  const events = [];
+  const listener = (e) => {
+    e.preventDefault();
+    events.push(e);
+  };
+  window.addEventListener('error', listener);
+
+  // An Error is located where it was created, not where it was reported.
+  const first = new Error('first');
+  const second = new Error('second');
+  window.reportError(second);
+  window.reportError(first);
+  window.removeEventListener('error', listener);
+
+  testing.expectEqual(true, events[0].filename.endsWith('report_error.html'));
+  testing.expectEqual(events[1].lineno + 1, events[0].lineno);
+  testing.expectEqual(18, events[0].colno);
+}
+</script>
+
+<script id=reportErrorEventTarget>
+{
+  let evt = null;
+
+  window.addEventListener('error', (e) => {
+    e.preventDefault();
+    evt = e;
+  });
+
+  const err = new Error('Target test');
+  window.reportError(err);
+
+  testing.expectEqual(window, evt.target);
+  // currentTarget is only set while listeners are invoked; null post-dispatch
+  testing.expectEqual(null, evt.currentTarget);
+}
+</script>
+
+<script id=reportErrorWithNull>
+{
+  let eventFired = false;
+  let evt = null;
+
+  window.addEventListener('error', (e) => {
+    e.preventDefault();
+    eventFired = true;
+    evt = e;
+  });
+
+  window.reportError(null);
+
+  testing.expectEqual(true, eventFired);
+  testing.expectEqual('error', evt.type);
+  // A non-Error value is located at the reportError call, as in Chrome.
+  testing.expectEqual(true, evt.filename.endsWith('report_error.html'));
+  testing.expectEqual(true, evt.lineno > 0);
+  testing.expectEqual(true, evt.colno > 0);
+}
+</script>
+
+<script id=reportErrorWithUndefined>
+{
+  let eventFired = false;
+  let evt = null;
+
+  window.addEventListener('error', (e) => {
+    e.preventDefault();
+    eventFired = true;
+    evt = e;
+  });
+
+  window.reportError(undefined);
+
+  testing.expectEqual(true, eventFired);
+  testing.expectEqual('error', evt.type);
+  // A non-Error value is located at the reportError call, as in Chrome.
+  testing.expectEqual(true, evt.filename.endsWith('report_error.html'));
+  testing.expectEqual(true, evt.lineno > 0);
+  testing.expectEqual(true, evt.colno > 0);
+}
+</script>
+
+<script id=reportErrorPreventDefault>
+{
+  let preventDefaultCalled = false;
+  let listenerCalled = false;
+
+  window.addEventListener('error', (e) => {
+    listenerCalled = true;
+    testing.expectEqual(true, e.cancelable);
+    e.preventDefault();
+    preventDefaultCalled = true;
+    testing.expectEqual(true, e.defaultPrevented);
+  });
+
+  window.reportError(new Error('Should be prevented'));
+
+  testing.expectEqual(true, listenerCalled);
+  testing.expectEqual(true, preventDefaultCalled);
+}
+</script>

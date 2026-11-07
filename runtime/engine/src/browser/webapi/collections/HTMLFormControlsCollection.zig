@@ -1,0 +1,194 @@
+// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+const std = @import("std");
+const lp = @import("lightpanda");
+const js = @import("../../js/js.zig");
+const Page = @import("../../Page.zig");
+const Frame = @import("../../Frame.zig");
+const Element = @import("../Element.zig");
+
+const NodeList = @import("NodeList.zig");
+const RadioNodeList = @import("RadioNodeList.zig");
+const HTMLCollection = @import("HTMLCollection.zig");
+
+const HTMLFormControlsCollection = @This();
+
+pub const Proto = HTMLCollection;
+
+_proto: *HTMLCollection,
+
+// The refcount lives on the proto, but the finalizer anchors here so deinit
+// destroys the whole {HTMLCollection, self} chain from its leaf.
+pub fn deinit(self: *HTMLFormControlsCollection, page: *Page) void {
+    page.factory.destroy(self);
+}
+
+pub fn acquireRef(self: *HTMLFormControlsCollection) void {
+    self._proto.acquireRef();
+}
+
+pub fn releaseRef(self: *HTMLFormControlsCollection, page: *Page) void {
+    self._proto._rc.release(self, page);
+}
+
+pub fn length(self: *HTMLFormControlsCollection, frame: *Frame) u32 {
+    return self._proto.length(frame);
+}
+
+pub fn getAtIndex(self: *HTMLFormControlsCollection, index: usize, frame: *Frame) ?*Element {
+    return self._proto.getAtIndex(index, frame);
+}
+
+pub const NamedItemResult = union(enum) {
+    element: *Element,
+    radio_node_list: *RadioNodeList,
+};
+
+fn namedItem(self: *HTMLFormControlsCollection, name: []const u8, frame: *Frame) !?NamedItemResult {
+    if (name.len == 0) {
+        return null;
+    }
+
+    // We need special handling for radio, where multiple inputs can have the
+    // same name, but we also need to handle the [incorrect] case where non-
+    // radios share names.
+
+    var count: u32 = 0;
+    var first_element: ?*Element = null;
+
+    var it = try self.iterator();
+    while (it.next()) |element| {
+        if (matchesName(element, name)) {
+            if (first_element == null) {
+                first_element = element;
+            }
+            count += 1;
+
+            if (count == 2) {
+                return .{ .radio_node_list = try self.radioNodeList(name, frame) };
+            }
+        }
+    }
+
+    if (count == 0) {
+        return null;
+    }
+
+    // case == 2 was handled inside the loop
+    if (comptime lp.IS_DEBUG) {
+        std.debug.assert(count == 1);
+    }
+
+    return .{ .element = first_element.? };
+}
+
+// The live list of every control named "name".
+pub fn radioNodeList(self: *HTMLFormControlsCollection, name: []const u8, frame: *Frame) !*RadioNodeList {
+    const radio_node_list = try frame._factory.chained(.{
+        NodeList{ ._data = undefined },
+        RadioNodeList{
+            ._proto = undefined,
+            ._form_collection = self,
+            ._name = try frame.dupeString(name),
+        },
+    });
+    radio_node_list._proto._data = .{ .radio_node_list = radio_node_list };
+
+    // The RadioNodeList outlives this call; its NodeList releases
+    // the ref in deinit.
+    self.acquireRef();
+
+    return radio_node_list;
+}
+
+pub fn matchesName(element: *Element, name: []const u8) bool {
+    if (element.getId()) |id| {
+        if (std.mem.eql(u8, id, name)) {
+            return true;
+        }
+    }
+    if (element.getName()) |elem_name| {
+        if (std.mem.eql(u8, elem_name, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// used internally, by HTMLFormControlsCollection and RadioNodeList
+pub fn iterator(self: *HTMLFormControlsCollection) !Iterator {
+    const form_collection = self._proto._data.form;
+    return .{
+        .tw = form_collection._tw.clone(),
+        .nodes = form_collection,
+    };
+}
+
+// Used internally. Presents a nicer (more zig-like) iterator and strips away
+// some of the abstraction.
+pub const Iterator = struct {
+    tw: TreeWalker,
+    nodes: NodeLive,
+
+    const NodeLive = @import("node_live.zig").NodeLive(.form);
+    const TreeWalker = @import("../TreeWalker.zig").FullExcludeSelf;
+
+    pub fn next(self: *Iterator) ?*Element {
+        return self.nodes.nextTw(&self.tw);
+    }
+};
+
+pub const JsApi = struct {
+    pub const bridge = js.Bridge(HTMLFormControlsCollection);
+
+    pub const Meta = struct {
+        pub const name = "HTMLFormControlsCollection";
+        pub var class_id: bridge.ClassId = undefined;
+        pub const manage = false;
+    };
+
+    pub const length = bridge.accessor(HTMLFormControlsCollection.length, null, .{});
+    pub const @"[int]" = bridge.indexed(HTMLFormControlsCollection.getAtIndex, null, .{ .null_as_undefined = true });
+    pub const @"[str]" = bridge.namedIndexed(HTMLFormControlsCollection.namedItem, null, null, null, struct {
+        fn wrap(self: *HTMLFormControlsCollection, name: []const u8) !u32 {
+            if (try hasNamed(self, name)) {
+                // Named properties are [LegacyUnenumerableNamedProperties]
+                return js.v8.DontEnum;
+            }
+            return error.NotHandled;
+        }
+    }.wrap, .{ .null_as_undefined = true });
+
+    pub const namedItem = bridge.function(HTMLFormControlsCollection.namedItem, .{});
+
+    // Presence only, `namedItem` is relativel expensive / RC'd
+    fn hasNamed(self: *HTMLFormControlsCollection, name: []const u8) !bool {
+        if (name.len == 0) {
+            return false;
+        }
+
+        var it = try self.iterator();
+        while (it.next()) |element| {
+            if (matchesName(element, name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
