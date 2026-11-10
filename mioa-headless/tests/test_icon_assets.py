@@ -59,3 +59,25 @@ class IconAssetTests(unittest.TestCase):
                 self.assertEqual(list(store.path.iterdir()), [])
             finally:
                 store.close()
+
+    def test_retention_failure_still_reclaims_other_assets_and_allows_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = IconAssets(Path(root))
+            png = store.publish(resource(PNG, "image/png"))
+            ico = store.publish(resource(ICO, "image/x-icon"))
+            blocked = Path(png["path"])
+            blocked.unlink()
+            blocked.mkdir()
+            foreign = blocked / "foreign"
+            foreign.write_bytes(b"not an icon asset")
+            try:
+                with self.assertRaises(OSError):
+                    store.retain(set())
+                self.assertFalse(Path(ico["path"]).exists())
+                self.assertEqual(foreign.read_bytes(), b"not an icon asset")
+            finally:
+                foreign.unlink()
+                blocked.rmdir()
+                blocked.write_bytes(PNG)
+                store.close()
+            self.assertFalse(store.path.exists())

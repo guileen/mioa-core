@@ -1,4 +1,8 @@
-"""Original browser image resources in one session-owned private directory."""
+"""Original browser image resources in one session-owned private directory.
+
+Retention attempts every obsolete asset before reporting the first I/O failure.
+Failed entries remain owned for retry; cleanup never recursively removes paths.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -39,10 +43,17 @@ class IconAssets:
         return {"path": str(path), "sha256": digest, "mime": mime}
 
     def retain(self, digests: set[str]) -> None:
+        error: OSError | None = None
         for digest in tuple(self._files):
             if digest not in digests:
-                self._files[digest].unlink(missing_ok=True)
-                del self._files[digest]
+                try:
+                    self._files[digest].unlink(missing_ok=True)
+                except OSError as exc:
+                    error = error or exc
+                else:
+                    del self._files[digest]
+        if error is not None:
+            raise error
 
     def close(self) -> None:
         self.retain(set())
