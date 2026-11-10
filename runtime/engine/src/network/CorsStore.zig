@@ -65,17 +65,20 @@ pub const Entry = struct {
             list.deinit(allocator);
         }
 
+        // Reserve before copying so failed growth cannot orphan a header.
         outerA: for (a) |s| {
             for (list.items) |existing| {
                 if (std.ascii.eqlIgnoreCase(existing, s)) continue :outerA;
             }
-            try list.append(allocator, try allocator.dupe(u8, s));
+            try list.ensureUnusedCapacity(allocator, 1);
+            list.appendAssumeCapacity(try allocator.dupe(u8, s));
         }
         outerB: for (b) |s| {
             for (list.items) |existing| {
                 if (std.ascii.eqlIgnoreCase(existing, s)) continue :outerB;
             }
-            try list.append(allocator, try allocator.dupe(u8, s));
+            try list.ensureUnusedCapacity(allocator, 1);
+            list.appendAssumeCapacity(try allocator.dupe(u8, s));
         }
 
         return list.toOwnedSlice(allocator);
@@ -415,4 +418,41 @@ test "CorsStore: covers never lets a wildcard cover Authorization" {
 
     try testing.expect(!try store.coversRequest(allocator, key, .GET, &.{"authorization"}));
     try testing.expect(try store.coversRequest(allocator, key, .GET, &.{"x-anything"}));
+}
+
+test "CorsStore.Entry: merging owns unique headers across allocation failures" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, a: []const []const u8, b: []const []const u8, expected: []const []const u8) !void {
+            const original: Entry = .{
+                .methods_wildcard = false,
+                .methods = .initOne(.POST),
+                .headers_wildcard = false,
+                .headers = a,
+                .expires_at = 200,
+            };
+            const incoming: Entry = .{
+                .methods_wildcard = true,
+                .methods = .initOne(.PUT),
+                .headers_wildcard = true,
+                .headers = b,
+                .expires_at = 100,
+            };
+            const merged = try original.merge(allocator, incoming);
+            defer merged.deinit(allocator);
+            try std.testing.expectEqual(expected.len, merged.headers.len);
+            for (expected, merged.headers) |want, actual| {
+                try std.testing.expectEqualStrings(want, actual);
+            }
+            try std.testing.expect(merged.methods.contains(.POST) and merged.methods.contains(.PUT));
+            try std.testing.expect(merged.methods_wildcard and merged.headers_wildcard);
+            try std.testing.expectEqual(@as(u64, 100), merged.expires_at);
+        }
+    };
+    const headers: []const []const u8 = &.{ "X-One", "x-two", "x-three", "x-four", "x-five", "x-six", "x-seven", "x-eight", "x-nine", "x-ten", "x-eleven", "x-twelve" };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{
+        headers, &.{ "x-one", "X-TWO" }, headers,
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{
+        &.{"X-One"}, headers, headers,
+    });
 }
