@@ -118,7 +118,11 @@ async def fixture_server():
     # Snapshot only fixture bytes, never expose profiles, output or repository roots.
     files = {"/" + path.relative_to(HERE / "web").as_posix(): path.read_bytes()
              for path in (HERE / "web").rglob("*") if path.is_file() and path.suffix in {".html", ".js", ".css"}}
+    handlers, writers = set(), set()
     async def handle(reader, writer):
+        task = asyncio.current_task()
+        handlers.add(task)
+        writers.add(writer)
         try:
             request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
             method, target, _ = request.split(b"\r\n", 1)[0].decode("ascii").split(" ")
@@ -135,11 +139,21 @@ async def fixture_server():
             writer.close()
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
+            writers.discard(writer)
+            handlers.discard(task)
     server = await asyncio.start_server(handle, "127.0.0.1", 0, limit=16384)
     try:
         yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
     finally:
         server.close()
+        # start_server does not own client callbacks. Reap them before
+        # wait_closed, which also waits for active clients on Python 3.12+.
+        for writer in tuple(writers):
+            writer.close()
+        pending = tuple(handlers)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         await server.wait_closed()
 
 

@@ -24,6 +24,12 @@ navigation, without dispatching the old history entry or replacing the new URL.
 Stable history and child-frame-only changes still permit Back. These are scripted
 peer regressions, not native-browser task or OS-isolation qualification.
 
+`fixture_server` closes active clients and reaps their handlers before awaiting
+server shutdown; Python 3.12+ includes active connections in `wait_closed`.
+Real unfinished-HTTP regressions cover failure and cancellation without masking
+the original outcome or requiring client EOF. This is fixture cleanup evidence,
+not qualification of streaming HTML or independent-window semantics.
+
 ## One entry, explicit layers
 
 From the Core checkout, using the Python environment in which Core/headless and

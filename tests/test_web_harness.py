@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 import zlib
 
 import run_web as web
@@ -122,6 +124,61 @@ class ToonStructureTests(unittest.TestCase):
 
 
 class AsyncHarnessTests(unittest.IsolatedAsyncioTestCase):
+    async def _assert_pending_request_cleanup(self, *, cancel):
+        connected, entered = asyncio.Event(), asyncio.Event()
+        connections = []
+        original = asyncio.start_server
+        failure = web.CaseFailure("FAIL", "original scenario failure")
+
+        async def start_server(callback, *args, **kwargs):
+            async def accepted(reader, writer):
+                connected.set()
+                await callback(reader, writer)
+            return await original(accepted, *args, **kwargs)
+
+        async def exercise():
+            async with web.fixture_server() as origin:
+                address = web.urlsplit(origin)
+                reader, writer = await asyncio.open_connection(address.hostname, address.port)
+                connections.append((reader, writer))
+                writer.write(b"GET /fixtures/empty.html HTTP/1.1\r\n")
+                await writer.drain()
+                await connected.wait()
+                entered.set()
+                if cancel:
+                    await asyncio.Event().wait()
+                raise failure
+
+        with patch.object(web.asyncio, "start_server", start_server):
+            task = asyncio.create_task(exercise())
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                if cancel:
+                    task.cancel()
+                done, _ = await asyncio.wait({task}, timeout=0.5)
+                self.assertIn(task, done, "fixture waited for a live client before closing it")
+                with self.assertRaises(asyncio.CancelledError if cancel else web.CaseFailure) as caught:
+                    await task
+                if not cancel:
+                    self.assertIs(caught.exception, failure)
+                # Closing a socket with unread request bytes may reset it.
+                with contextlib.suppress(ConnectionResetError):
+                    self.assertEqual(await asyncio.wait_for(connections[0][0].read(), 1), b"")
+            finally:
+                for _, writer in connections:
+                    writer.close()
+                    with contextlib.suppress(ConnectionResetError):
+                        await writer.wait_closed()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_fixture_failure_closes_unfinished_http_client_without_masking_cause(self):
+        await self._assert_pending_request_cleanup(cancel=False)
+
+    async def test_fixture_cancellation_closes_unfinished_http_client(self):
+        await self._assert_pending_request_cleanup(cancel=True)
+
     async def test_real_deadline_cancels_unfinished_work_and_reports_timeout(self):
         cancelled = asyncio.Event()
         async def unfinished():
