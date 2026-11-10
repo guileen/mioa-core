@@ -6,6 +6,12 @@ checkout, a product CLI, Playwright, NumPy or SciPy. Python 3.12 and the existin
 Core/headless dependencies are sufficient; the production LPFR ring uses its
 existing C11 helper/compiler or `MIOA_FRAME_ATOMICS` prebuilt library.
 
+`tests/toon.py` is the standard-library evidence encoder. Harness regressions
+cover empty-object list items, anonymous nested object arrays, and the content
+depth of a list carried on an object's first-field line (TOON §9.4 / §10).
+These preserve value types and scope; they are not full codec conformance or
+native-browser qualification.
+
 ## One entry, explicit layers
 
 From the Core checkout, using the Python environment in which Core/headless and

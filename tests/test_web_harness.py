@@ -11,6 +11,7 @@ import unittest
 import zlib
 
 import run_web as web
+import toon
 
 
 class HarnessTests(unittest.TestCase):
@@ -67,6 +68,23 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(web.failure_record(RuntimeError('PASS'), -11)['status'], 'CRASH')
         self.assertEqual(web.failure_record(RuntimeError('PASS'))['status'], 'ERROR')
 
+
+
+class ToonStructureTests(unittest.TestCase):
+    def test_nested_evidence_preserves_value_types_and_scope(self):
+        cases = [
+            ({"results": [{}, None]},
+             "results[2]:\n  -\n  - null"),
+            ([[{"id": 1}, {"id": 2}]],
+             "[1]:\n  - [2]:\n    - id: 1\n    - id: 2"),
+            ([{"checks": [{}, {"status": "FAIL"}], "meta": {}}],
+             "[1]:\n  - checks[2]:\n      -\n      - status: FAIL\n    meta:"),
+            ([{"checks": [{"id": 1}, {"id": 2}], "meta": {}}],
+             "[1]:\n  - checks[2]{id}:\n      1\n      2\n    meta:"),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(toon.encode(value), expected)
 
 
 class AsyncHarnessTests(unittest.IsolatedAsyncioTestCase):
