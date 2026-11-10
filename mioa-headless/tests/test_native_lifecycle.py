@@ -532,3 +532,74 @@ class NativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(remove_signal_handler.call_count, 2)
             self.assertTrue(transports[0].is_closing())
             self.assert_cleaned()
+
+
+class NativeTransportCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def blocked_close(self, *, cancel):
+        client, peer = socket.socketpair()
+        client.setblocking(False)
+        peer.setblocking(False)
+        reader, writer = await asyncio.open_connection(sock=client)
+        peer_reader, peer_writer = await asyncio.open_connection(sock=peer)
+        cdp = _CDP(_WebSocket(reader, writer))
+        entered, stopped = asyncio.Event(), asyncio.Event()
+
+        async def listener():
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+
+        cdp._task(listener())
+        request = asyncio.create_task(cdp.send("Page.getFrameTree"))
+        closing = None
+        locked = False
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            header = await asyncio.wait_for(peer_reader.readexactly(2), 1)
+            length = header[1] & 127
+            if length == 126:
+                length, = struct.unpack("!H", await peer_reader.readexactly(2))
+            elif length == 127:
+                length, = struct.unpack("!Q", await peer_reader.readexactly(8))
+            await asyncio.wait_for(peer_reader.readexactly(4 + length), 1)
+            await cdp.socket.lock.acquire()
+            locked = True
+            closing = asyncio.create_task(cdp.close())
+            if cancel:
+                await asyncio.sleep(0)
+                closing.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, 3)
+            else:
+                await asyncio.wait_for(closing, 3)
+            self.assertEqual(await asyncio.wait_for(peer_reader.read(1), 1), b"")
+            with self.assertRaises(NativeError) as rejected:
+                await asyncio.wait_for(request, 1)
+            self.assertEqual(rejected.exception.code, "protocol_error")
+            await asyncio.wait_for(stopped.wait(), 1)
+            with self.assertRaises(NativeError) as rejected:
+                await cdp.send("Page.getFrameTree")
+            self.assertEqual(rejected.exception.code, "protocol_error")
+        finally:
+            tasks = [request, cdp.reader, *cdp.event_tasks]
+            if closing is not None:
+                tasks.append(closing)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if locked:
+                cdp.socket.lock.release()
+            writer.close()
+            peer_writer.close()
+            await asyncio.gather(writer.wait_closed(), peer_writer.wait_closed(),
+                                 return_exceptions=True)
+
+
+    async def test_close_frame_timeout_still_releases_channel_and_waiters(self):
+        await self.blocked_close(cancel=False)
+
+
+    async def test_cancelled_close_still_releases_channel_and_waiters(self):
+        await self.blocked_close(cancel=True)

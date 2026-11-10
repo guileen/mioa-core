@@ -31,3 +31,7 @@ the prior tree. Startup never silently accepts a different pinned binary/font.
 
 The send lock fences closure: publishing a Close frame seals the channel before
 the write; queued commands recheck that state under the same lock and cannot follow it.
+
+WebSocket close-frame delivery is best effort within its existing timeout.
+Cancellation still closes the owned transport and drains CDP reader/event tasks;
+pending requests fail rather than retaining the channel.

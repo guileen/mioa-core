@@ -168,12 +168,14 @@ class _WebSocket:
     async def close(self) -> None:
         if self.closed:
             return
-        with contextlib.suppress(OSError, NativeError):
-            await asyncio.wait_for(self.send(struct.pack("!H", 1000), 8), 1)
-        self.closed = True
-        self.writer.close()
-        with contextlib.suppress(OSError, asyncio.TimeoutError):
-            await asyncio.wait_for(self.writer.wait_closed(), 2)
+        try:
+            with contextlib.suppress(OSError, NativeError):
+                await asyncio.wait_for(self.send(struct.pack("!H", 1000), 8), 1)
+        finally:
+            self.closed = True
+            self.writer.close()
+            with contextlib.suppress(OSError, asyncio.TimeoutError):
+                await asyncio.wait_for(self.writer.wait_closed(), 2)
 
 
 class _CDP:
@@ -255,14 +257,16 @@ class _CDP:
                 future.cancel()
 
     async def close(self) -> None:
-        await self.socket.close()
-        self.reader.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self.reader
-        for task in tuple(self.event_tasks):
-            task.cancel()
-        if self.event_tasks:
-            await asyncio.gather(*self.event_tasks, return_exceptions=True)
+        try:
+            await self.socket.close()
+        finally:
+            self.reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.reader
+            for task in tuple(self.event_tasks):
+                task.cancel()
+            if self.event_tasks:
+                await asyncio.gather(*self.event_tasks, return_exceptions=True)
 
 
 @dataclass
