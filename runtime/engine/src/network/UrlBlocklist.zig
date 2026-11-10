@@ -45,11 +45,7 @@ pub fn init(allocator: std.mem.Allocator, patterns: []const []const u8) !UrlBloc
 
     for (patterns) |pattern| {
         if (pattern.len == 0) continue;
-        const normalized = try allocator.alloc(u8, pattern.len);
-        for (pattern, normalized) |char, *lower| {
-            lower.* = std.ascii.toLower(char);
-        }
-        owned[initialized] = normalized;
+        owned[initialized] = try std.ascii.allocLowerString(allocator, pattern);
         initialized += 1;
     }
 
@@ -59,31 +55,34 @@ pub fn init(allocator: std.mem.Allocator, patterns: []const []const u8) !UrlBloc
     };
 }
 
+/// Own normalized patterns and their decisions together, without a temporary URL array.
 pub fn initPatterns(allocator: std.mem.Allocator, patterns: []const Pattern) !UrlBlocklist {
     var count: usize = 0;
     for (patterns) |pattern| {
         if (pattern.urlPattern.len > 0) count += 1;
     }
 
-    // Pre-filter empty patterns here too so `blocks` stays aligned with the
-    // (also-filtered) patterns compiled by init().
-    const urls = try allocator.alloc([]const u8, count);
-    defer allocator.free(urls);
+    const owned = try allocator.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |pattern| allocator.free(pattern);
+        allocator.free(owned);
+    }
     const blocks = try allocator.alloc(bool, count);
     errdefer allocator.free(blocks);
-    {
-        var i: usize = 0;
-        for (patterns) |pattern| {
-            if (pattern.urlPattern.len == 0) continue;
-            urls[i] = pattern.urlPattern;
-            blocks[i] = pattern.block;
-            i += 1;
-        }
+
+    for (patterns) |pattern| {
+        if (pattern.urlPattern.len == 0) continue;
+        owned[initialized] = try std.ascii.allocLowerString(allocator, pattern.urlPattern);
+        blocks[initialized] = pattern.block;
+        initialized += 1;
     }
 
-    var blocklist = try init(allocator, urls);
-    blocklist.blocks = blocks;
-    return blocklist;
+    return .{
+        .allocator = allocator,
+        .patterns = owned,
+        .blocks = blocks,
+    };
 }
 
 pub fn deinit(self: *UrlBlocklist) void {
@@ -198,4 +197,25 @@ test "UrlBlocklist: owns compiled patterns" {
 
     @memset(&pattern, 'x');
     try std.testing.expect(!blocklist.isBlocked("https://example.com/ads/script.js"));
+}
+
+test "UrlBlocklist: constructors release partial allocations" {
+    const Scenario = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var plain = try UrlBlocklist.init(allocator, &.{ "", "*ADS*", "https://other.test/*" });
+            defer plain.deinit();
+            try std.testing.expect(plain.isBlocked("https://example.test/ads/script.js"));
+            try std.testing.expect(!plain.isBlocked("https://example.test/content"));
+
+            var selective = try UrlBlocklist.initPatterns(allocator, &.{
+                .{ .urlPattern = "", .block = true },
+                .{ .urlPattern = "*ALLOW*", .block = false },
+                .{ .urlPattern = "*", .block = true },
+            });
+            defer selective.deinit();
+            try std.testing.expect(!selective.isBlocked("https://example.test/allow/image"));
+            try std.testing.expect(selective.isBlocked("https://example.test/other"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
