@@ -21,12 +21,11 @@ const std = @import("std");
 /// Block size of the CPU.
 const block_size = @sizeOf(usize);
 
-/// Whether a byte is allowed in a header key; controls (including space),
-/// the `:` delimiter and DEL are excluded.
-fn isHeaderKeyByte(byte: u8) bool {
+/// HTTP token bytes, shared by field names and methods (RFC 9110 §§5.1, 5.6.2).
+fn isTokenByte(byte: u8) bool {
     return switch (byte) {
-        0...' ', ':', 0x7f => false,
-        else => true,
+        '0'...'9', 'A'...'Z', 'a'...'z', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
     };
 }
 
@@ -65,22 +64,25 @@ fn matchHeaderKey(cursor: *Cursor) void {
         const Int = @Int(.unsigned, vec_size);
 
         while (cursor.hasLength(vec_size)) {
-            const spaces: Vec = @splat(' ');
-            const colons: Vec = @splat(':');
-            const deletes: Vec = @splat(0x7f);
             const chunk = cursor.asVector(vec_size);
-
-            // Per-lane `isHeaderKeyByte`: a lane is 1 when its byte is valid,
-            // above space (which also rules out the controls) and neither the
-            // `:` delimiter nor DEL. Inverting the mask makes invalid lanes
-            // 1s, so `@ctz` yields the index of the first invalid byte, or
-            // `vec_size` when the whole chunk is valid.
-            const mask = @intFromBool(chunk > spaces) & ~(@intFromBool(chunk == colons) | @intFromBool(chunk == deletes));
+            const case_bit: Vec = @splat(0x20);
+            const lower = chunk | case_bit;
+            const a: Vec = @splat('a');
+            const z: Vec = @splat('z');
+            const zero: Vec = @splat('0');
+            const nine: Vec = @splat('9');
+            const hyphen: Vec = @splat('-');
+            // Common field-name characters stay vectorized. Stop at other
+            // bytes and let the token scan below distinguish legal punctuation
+            // from delimiters and invalid bytes without rescanning this prefix.
+            const mask = (@intFromBool(lower >= a) & @intFromBool(lower <= z)) |
+                (@intFromBool(chunk >= zero) & @intFromBool(chunk <= nine)) |
+                @intFromBool(chunk == hyphen);
             const advance_by = @ctz(~@as(Int, @bitCast(mask)));
             // Advance.
             cursor.advance(advance_by);
             if (advance_by != vec_size) {
-                return;
+                break;
             }
         }
     }
@@ -88,9 +90,9 @@ fn matchHeaderKey(cursor: *Cursor) void {
     // NOTE: SWAR is not preferred here, this might change in the future
     // but honestly header keys are not so long.
 
-    // Fallback for len < `vec_size`.
+    // Scalar tail and uncommon token punctuation.
     while (cursor.end - cursor.idx > 0) : (cursor.advance(1)) {
-        if (isHeaderKeyByte(cursor.char()) == false) {
+        if (isTokenByte(cursor.char()) == false) {
             return;
         }
     }
@@ -379,10 +381,7 @@ fn parseMethod(cursor: *Cursor) !Method {
     // above are known tokens and keep their fast path.
     const method_start = cursor.current();
     while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {
-        switch (cursor.char()) {
-            '0'...'9', 'A'...'Z', 'a'...'z', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
-            else => return error.Invalid,
-        }
+        if (!isTokenByte(cursor.char())) return error.Invalid;
     }
     if (cursor.reachedEnd()) {
         return error.Incomplete;
@@ -695,6 +694,36 @@ test "header_parser: parse HTTP header invalid" {
     }
 }
 
+test "header_parser: field names require HTTP token bytes" {
+    const token_bytes = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const suffix = ": v\r\nrest";
+    var bytes: [64]u8 = undefined;
+    for ([_]usize{ 1, 15, 16, 17, 31, 32, 33, 48 }) |len| {
+        for (0..len) |pos| {
+            for (0..256) |value| {
+                const byte: u8 = @intCast(value);
+                // A colon ends the field name rather than belonging to it.
+                if (byte == ':') continue;
+                @memset(bytes[0..len], 'a');
+                @memcpy(bytes[len..][0..suffix.len], suffix);
+                bytes[pos] = byte;
+                var cursor = initCursor(bytes[0 .. len + suffix.len]);
+                var header = Header{ .key = "unchanged", .value = "unchanged" };
+                if (std.mem.indexOfScalar(u8, token_bytes, byte) != null) {
+                    try header.parse(&cursor);
+                    try testing.expectString(bytes[0..len], header.key);
+                    try testing.expectString("v", header.value);
+                    try testing.expectString("rest", cursor.remaining());
+                } else {
+                    try testing.expectError(error.Invalid, header.parse(&cursor));
+                    try testing.expectString("unchanged", header.key);
+                    try testing.expectString("unchanged", header.value);
+                }
+            }
+        }
+    }
+}
+
 test "header_parser: header iterator" {
     // Headers iterate until the terminating blank line; afterwards the
     // iterator stays exhausted and the cursor is left at the body.
@@ -964,7 +993,7 @@ test "header_parser: parse request invalid" {
 
 fn expectMatchesReference(bytes: []const u8) !void {
     var key_expected: usize = 0;
-    while (key_expected < bytes.len and isHeaderKeyByte(bytes[key_expected])) key_expected += 1;
+    while (key_expected < bytes.len and isTokenByte(bytes[key_expected])) key_expected += 1;
     var value_expected: usize = 0;
     while (value_expected < bytes.len and isHeaderValueByte(bytes[value_expected])) value_expected += 1;
 
