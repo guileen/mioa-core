@@ -25,7 +25,8 @@ def parse_proxy(url: str | None) -> dict[str, str] | None:
     if not parts.hostname:
         raise NetworkError(f"proxy URL has no host: {url!r}")
     port = parts.port or PROXY_SCHEMES[parts.scheme]
-    proxy: dict[str, str] = {"server": f"{parts.scheme}://{parts.hostname}:{port}"}
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    proxy: dict[str, str] = {"server": f"{parts.scheme}://{host}:{port}"}
     if parts.username:
         if parts.scheme.startswith("socks"):
             raise NetworkError(

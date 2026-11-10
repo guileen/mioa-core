@@ -16,6 +16,9 @@ native webpage execution/layout/paint sources and fonts under `runtime/`,
 with its locked builder and compact browser tests. Native component licenses
 are separate from this Python package's MIT license.
 
+`net.parse_proxy` preserves bracketed IPv6 authorities, including when adding
+default ports or separating credentials.
+
 Page startup requires only the basic page/network/runtime protocol. Site-icon
 subscription starts on the first `NativePage.site_icon()` call; a backend
 without that extension reports `capability_unavailable` for the icon request,

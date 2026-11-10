@@ -51,6 +51,17 @@ class ProbeEgressProxyTransportTests(unittest.TestCase):
         self.assertEqual(call.kwargs["proxies"], {"http": url, "https": url})
         self.assertEqual(call.kwargs["timeout"], 3.5)
 
+    def test_parse_ipv6_proxy_preserves_authority_and_credentials(self):
+        for url, expected in (
+            ("http://[::1]", {"server": "http://[::1]:8080"}),
+            ("socks5h://[2001:db8::1]:9999", {"server": "socks5h://[2001:db8::1]:9999"}),
+            ("https://user:p%40ss@[::1]:8443", {
+                "server": "https://[::1]:8443", "username": "user", "password": "p@ss",
+            }),
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(parse_proxy(url), expected)
+
     def test_parse_proxy_credentials_are_encoded_exactly_once(self):
         proxy = parse_proxy("https://us%65r%40corp:p%40ss%2Fword@proxy.example:8443")
         self.assertEqual(proxy, {
