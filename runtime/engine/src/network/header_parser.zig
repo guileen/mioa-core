@@ -480,15 +480,13 @@ pub fn parseDisposition(value: []const u8) !Disposition {
         }
         rest = std.mem.trimStart(u8, rest[1..], " \t");
 
-        // An unquoted value cannot contain a `;`, so the next one (or the end
-        // of the header) bounds this parameter when it has to be skipped.
+        // Bound both searches to this parameter so missing "=" parameters
+        // do not repeatedly scan the remaining header.
         const semi = std.mem.findScalar(u8, rest, ';') orelse rest.len;
-        const eq = std.mem.findScalar(u8, rest, '=') orelse rest.len;
-        if (eq >= semi) {
-            // No `=` in this parameter; skip it.
+        const eq = std.mem.findScalar(u8, rest[0..semi], '=') orelse {
             rest = rest[semi..];
             continue;
-        }
+        };
         const key = std.mem.trimEnd(u8, rest[0..eq], " \t");
         const after_eq = std.mem.trimStart(u8, rest[eq + 1 ..], " \t");
 
@@ -858,6 +856,19 @@ test "header_parser: disposition parameter whitespace" {
         const parsed = try parseDisposition(value);
         try testing.expectEqual(null, parsed.name);
         try testing.expect(parsed.filename != null);
+        try testing.expectString("ok.txt", parsed.filename.?);
+    }
+}
+
+test "header_parser: skip disposition parameters without equals" {
+    const cases = [_][]const u8{
+        "form-data; broken; name=field; filename=ok.txt",
+        "form-data; ; \t ; broken; name=\"field\"; filename=\"ok.txt\"; trailing",
+    };
+    for (cases) |value| {
+        const parsed = try parseDisposition(value);
+        try testing.expect(parsed.name != null and parsed.filename != null);
+        try testing.expectString("field", parsed.name.?);
         try testing.expectString("ok.txt", parsed.filename.?);
     }
 }
