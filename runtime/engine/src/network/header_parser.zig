@@ -450,9 +450,9 @@ pub const Disposition = struct {
 };
 
 // Content-Disposition parameters accept MIME tokens or quoted-strings
-// (RFC 2183 §2 / RFC 2045 §5.1). Quoted values preserve raw semicolons;
-// writeMultipartName percent-escapes CR/LF/" before encoding them.
-// Malformed parameters and unknown keys, including filename*, are ignored.
+// (RFC 2183 §2 / RFC 2045 §5.1), with SP/HTAB around "=" (RFC 822 §3.4.2).
+// Quoted values preserve internal whitespace and semicolons; writeMultipartName
+// percent-escapes CR/LF/". Malformed parameters and unknown keys are ignored.
 pub fn parseDisposition(value: []const u8) !Disposition {
     // `Header.parse` already excludes the surrounding OWS from the value.
     var rest = value;
@@ -481,8 +481,8 @@ pub fn parseDisposition(value: []const u8) !Disposition {
             rest = rest[semi..];
             continue;
         }
-        const key = rest[0..eq];
-        const after_eq = rest[eq + 1 ..];
+        const key = std.mem.trimEnd(u8, rest[0..eq], " \t");
+        const after_eq = std.mem.trimStart(u8, rest[eq + 1 ..], " \t");
 
         const param_value = if (after_eq.len != 0 and after_eq[0] == '"') quoted: {
             const end = std.mem.findScalarPos(u8, after_eq, 1, '"') orelse {
@@ -492,7 +492,7 @@ pub fn parseDisposition(value: []const u8) !Disposition {
             rest = after_eq[end + 1 ..];
             break :quoted after_eq[1..end];
         } else token: {
-            const bytes = std.mem.trimEnd(u8, after_eq[0 .. semi - eq - 1], " \t");
+            const bytes = std.mem.trim(u8, rest[eq + 1 .. semi], " \t");
             rest = rest[semi..];
             if (bytes.len == 0) continue;
             for (bytes) |byte| {
@@ -787,6 +787,40 @@ test "header_parser: token Content-Disposition parameters" {
         try testing.expect(parsed.filename != null);
         try testing.expectEqual(null, parsed.name);
         try testing.expectString("valid.txt", parsed.filename.?);
+    }
+}
+
+test "header_parser: disposition parameter whitespace" {
+    const cases = [_]struct { header: []const u8, name: []const u8, filename: []const u8 }{
+        .{
+            .header = "Content-Disposition: form-data; name = field; filename= report.txt\r\n",
+            .name = "field",
+            .filename = "report.txt",
+        },
+        .{
+            .header = "Content-Disposition: Form-Data; name\t=\t\" field \"; filename \t= \t\"a;b.txt\"\r\n",
+            .name = " field ",
+            .filename = "a;b.txt",
+        },
+    };
+    for (cases) |case| {
+        var cursor = initCursor(case.header);
+        var header: Header = undefined;
+        try header.parse(&cursor);
+        const parsed = try parseDisposition(header.value);
+        try testing.expect(parsed.name != null and parsed.filename != null);
+        try testing.expectString(case.name, parsed.name.?);
+        try testing.expectString(case.filename, parsed.filename.?);
+    }
+
+    for ([_][]const u8{
+        "form-data; name = \t; filename = ok.txt",
+        "form-data; na me = field; filename = ok.txt",
+    }) |value| {
+        const parsed = try parseDisposition(value);
+        try testing.expectEqual(null, parsed.name);
+        try testing.expect(parsed.filename != null);
+        try testing.expectString("ok.txt", parsed.filename.?);
     }
 }
 
