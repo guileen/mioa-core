@@ -139,6 +139,8 @@ class _WebSocket:
             if first & 0x70 or second & 0x80:
                 raise NativeError("protocol_error", "unexpected websocket extension or masked server frame")
             length = second & 127
+            if opcode >= 8 and (not fin or length > 125):
+                raise NativeError("protocol_error", "invalid websocket control frame")
             if length == 126:
                 length = struct.unpack("!H", await self.reader.readexactly(2))[0]
             elif length == 127:
@@ -147,8 +149,6 @@ class _WebSocket:
                 raise NativeError("protocol_error", "native websocket message exceeds bound")
             payload = await self.reader.readexactly(length)
             if opcode >= 8:
-                if not fin or length > 125:
-                    raise NativeError("protocol_error", "invalid websocket control frame")
                 if opcode == 8:
                     raise NativeError("protocol_error", "native websocket peer closed")
                 if opcode == 9:

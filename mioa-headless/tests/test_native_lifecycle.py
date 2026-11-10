@@ -234,6 +234,47 @@ class Output(io.StringIO):
         return [json.loads(line) for line in self.getvalue().splitlines()]
 
 
+class WebSocketFrameTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_control_header_rejected_without_waiting_for_payload(self):
+        for header in (b"\x09\x01", b"\x89\x7e", b"\x8a\x7f"):
+            with self.subTest(header=header):
+                client, peer = socket.socketpair()
+                reader, writer = await asyncio.open_connection(sock=client)
+                peer_reader, peer_writer = await asyncio.open_connection(sock=peer)
+                channel = _WebSocket(reader, writer)
+                try:
+                    peer_writer.write(header)
+                    await peer_writer.drain()
+                    with self.assertRaises(NativeError) as error:
+                        await asyncio.wait_for(channel.receive(), 0.5)
+                    self.assertEqual(error.exception.code, "protocol_error")
+                finally:
+                    writer.close()
+                    peer_writer.close()
+                    await writer.wait_closed()
+                    await peer_writer.wait_closed()
+
+    async def test_valid_ping_and_text_remain_readable(self):
+        client, peer = socket.socketpair()
+        reader, writer = await asyncio.open_connection(sock=client)
+        peer_reader, peer_writer = await asyncio.open_connection(sock=peer)
+        channel = _WebSocket(reader, writer)
+        try:
+            payload = b"x" * 125
+            peer_writer.write(b"\x89\x7d" + payload + b"\x81\x02ok")
+            await peer_writer.drain()
+            self.assertEqual(await asyncio.wait_for(channel.receive(), 0.5), b"ok")
+            pong = await asyncio.wait_for(peer_reader.readexactly(131), 0.5)
+            self.assertEqual(pong[:2], b"\x8a\xfd")
+            self.assertEqual(bytes(byte ^ pong[2 + (index & 3)]
+                                   for index, byte in enumerate(pong[6:])), payload)
+        finally:
+            writer.close()
+            peer_writer.close()
+            await writer.wait_closed()
+            await peer_writer.wait_closed()
+
+
 class WebSocketCloseOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_queued_command_cannot_follow_close_frame(self):
         client, peer = socket.socketpair()
