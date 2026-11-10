@@ -401,10 +401,13 @@ pub const HttpVersion = enum(u1) { @"1.1", @"1.0" };
 pub fn parseRequest(bytes: []const u8) !struct { Method, []const u8, HttpVersion, Header.Iterator } {
     var cursor = Cursor{ .idx = bytes.ptr, .start = bytes.ptr, .end = bytes.ptr + bytes.len };
     const method = try parseMethod(&cursor);
-    // Parse path.
+    // Scan the target without decoding it. Controls cannot belong to a URI
+    // or hide a request-line boundary (RFC 9112 §3.2).
     const path_start = cursor.current();
-    // Find the first space.
-    while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {}
+    while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {
+        const byte = cursor.char();
+        if (byte < ' ' or byte == 0x7f) return error.Invalid;
+    }
     const path_end = cursor.current();
     // 0 length path.
     if (path_start == path_end) {
@@ -901,7 +904,7 @@ test "header_parser: parse request" {
     const req = try parseRequest("GET /   HTTP/1.1\r\n\r\n");
     try testing.expectString("/", req[1]);
 
-    // Longer paths are accepted (but not validated).
+    // Longer paths and query strings are preserved without URI decoding.
     const req2 = try parseRequest("GET /chat/room?id=1 HTTP/1.1\r\n\r\n");
     try testing.expectString("/chat/room?id=1", req2[1]);
 }
@@ -959,6 +962,42 @@ test "header_parser: custom methods require HTTP token bytes" {
             }
         }
         request[pos] = original;
+    }
+}
+
+test "header_parser: request targets reject controls without decoding escapes" {
+    const target = "/json/version";
+    var request = ("GET " ++ target ++ " HTTP/1.1\r\n\r\n").*;
+    for (0..target.len) |pos| {
+        const offset = "GET ".len + pos;
+        const original = request[offset];
+        for (0..33) |value| {
+            request[offset] = if (value == 32) 0x7f else @intCast(value);
+            try testing.expectError(error.Invalid, parseRequest(&request));
+        }
+        request[offset] = original;
+    }
+
+    // Preserve encoded octets and each target form; URI interpretation belongs
+    // to the consumer, not this allocation-free request-line boundary.
+    const cases = [_]struct { method: []const u8, target: []const u8, tag: std.meta.Tag(Method) }{
+        .{ .method = "GET", .target = "/path?x=%00%09%0A%7F", .tag = .get },
+        .{ .method = "GET", .target = "http://example.test/path?q=1", .tag = .get },
+        .{ .method = "CONNECT", .target = "example.test:443", .tag = .connect },
+        .{ .method = "OPTIONS", .target = "*", .tag = .options },
+    };
+    for (cases) |case| {
+        var buffer: [128]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&buffer, "{s} {s} HTTP/1.1\r\nHost: example\r\n\r\nbody", .{ case.method, case.target });
+        const method, const path, const version, var headers = try parseRequest(bytes);
+        try testing.expectEqual(case.tag, std.meta.activeTag(method));
+        try testing.expectString(case.target, path);
+        try testing.expectEqual(.@"1.1", version);
+        const header = (try headers.next()).?;
+        try testing.expectString("Host", header.key);
+        try testing.expectString("example", header.value);
+        try testing.expectEqual(null, try headers.next());
+        try testing.expectString("body", headers.cursor.remaining());
     }
 }
 
