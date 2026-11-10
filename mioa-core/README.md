@@ -37,3 +37,9 @@ Cancellation still closes the owned transport and drains CDP reader/event tasks;
 pending requests fail rather than retaining the channel. Session shutdown also
 drains log tasks when CDP close fails and propagates the close error.
 Transport closure does not prove child exit or storage durability.
+
+Matching requests retain pending ownership through response decoding and delivery.
+If decoding fails, connection-loss cleanup rejects the matching caller as well as
+other pending callers; none waits for its command timeout solely because its
+response was removed early. A normal protocol error still rejects only its own
+command and does not terminate unrelated work.

@@ -631,3 +631,59 @@ class NativeTransportCloseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_close_still_releases_channel_and_waiters(self):
         await self.blocked_close(cancel=True)
+
+
+class NativeResponseIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def error_exchange(self, error, *, malformed):
+        client, peer = socket.socketpair()
+        client.setblocking(False)
+        peer.setblocking(False)
+        reader, writer = await asyncio.open_connection(sock=client)
+        peer_reader, peer_writer = await asyncio.open_connection(sock=peer)
+        cdp = _CDP(_WebSocket(reader, writer))
+        requests = [asyncio.create_task(cdp.send(method)) for method in
+                    ("Page.unsupportedMethod", "Page.getFrameTree")]
+
+        async def respond(value):
+            data = json.dumps(value).encode()
+            peer_writer.write(bytes((0x81, len(data))) + data)
+            await peer_writer.drain()
+
+        try:
+            for _ in requests:
+                header = await asyncio.wait_for(peer_reader.readexactly(2), 1)
+                length = header[1] & 127
+                self.assertLess(length, 126)
+                await asyncio.wait_for(peer_reader.readexactly(4 + length), 1)
+            await respond({"id": 1, "error": error})
+            if malformed:
+                await asyncio.wait_for(asyncio.shield(cdp.reader), 1)
+                # Callers may resume after the reader task has completed.
+                for request in requests:
+                    with self.assertRaises(NativeError) as rejected:
+                        await asyncio.wait_for(asyncio.shield(request), 1)
+                    self.assertEqual(rejected.exception.code, "protocol_error")
+                with self.assertRaises(NativeError) as rejected:
+                    await cdp.send("Page.getFrameTree")
+                self.assertEqual(rejected.exception.code, "protocol_error")
+            else:
+                await respond({"id": 2, "result": {"frameTree": {"frame": {"id": "main"}}}})
+                with self.assertRaises(NativeError) as rejected:
+                    await asyncio.wait_for(requests[0], 1)
+                self.assertEqual(rejected.exception.code, "capability_unavailable")
+                self.assertEqual(await asyncio.wait_for(requests[1], 1),
+                                 {"frameTree": {"frame": {"id": "main"}}})
+                self.assertIsNone(cdp.failure)
+        finally:
+            for request in requests:
+                request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
+            await cdp.close()
+            peer_writer.close()
+            await peer_writer.wait_closed()
+
+    async def test_malformed_error_settles_matching_and_other_commands(self):
+        await self.error_exchange(None, malformed=True)
+
+    async def test_valid_error_does_not_fail_another_pending_command(self):
+        await self.error_exchange({"code": -32601, "message": "unknown method"}, malformed=False)

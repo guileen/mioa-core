@@ -206,11 +206,13 @@ class _CDP:
             while True:
                 message = json.loads(await self.socket.receive())
                 if "id" in message:
-                    pending = self.pending.pop(message["id"], None)
+                    # Retain cleanup ownership until decoding and delivery finish.
+                    pending = self.pending.get(message["id"])
                     if pending is None:
                         continue
                     future, method, session = pending
                     if future.done():
+                        self.pending.pop(message["id"], None)
                         continue
                     if message.get("sessionId") != session:
                         future.set_exception(NativeError("protocol_error", f"{method}: response session mismatch"))
@@ -222,6 +224,7 @@ class _CDP:
                             future.set_exception(NativeError("protocol_error", f"{method}: non-object result"))
                         else:
                             future.set_result(result or {})
+                    self.pending.pop(message["id"], None)
                 else:
                     for listener in tuple(self.listeners):
                         self._task(listener(message))
