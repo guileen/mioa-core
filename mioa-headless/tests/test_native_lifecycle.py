@@ -12,8 +12,32 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from mioa_core.native import NativeContext, NativeError, NativePage, _CDP
+from mioa_core.native import NativeContext, NativeError, NativePage, _CDP, _WebSocket
 from mioa_headless.native_service import NativeProtocol
+
+
+class WebSocketMessageBoundTests(unittest.IsolatedAsyncioTestCase):
+    async def receive_fragments(self, first_size, pong_size, total_size):
+        # Exercise the production byte parser without a connection/OS provider.
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            b"\x01\x7e" + struct.pack("!H", first_size) + b"x" * first_size
+            + bytes((0x8a, pong_size)) + b"p" * pong_size
+            + bytes((0x80, total_size - first_size)) + b"x" * (total_size - first_size))
+        reader.feed_eof()
+        with patch("mioa_core.native.MAX_MESSAGE", 128):
+            return await _WebSocket.receive(SimpleNamespace(reader=reader))
+
+    async def test_pong_does_not_consume_fragmented_data_budget(self):
+        for first_size, pong_size in ((128, 1), (128, 125), (127, 125)):
+            with self.subTest(first_size=first_size, pong_size=pong_size):
+                self.assertEqual(await self.receive_fragments(first_size, pong_size, 128),
+                                 b"x" * 128)
+
+    async def test_pong_does_not_reset_fragmented_data_budget(self):
+        with self.assertRaises(NativeError) as rejected:
+            await self.receive_fragments(128, 1, 129)
+        self.assertEqual(rejected.exception.code, "protocol_error")
 
 
 class NavigationHistoryTests(unittest.IsolatedAsyncioTestCase):

@@ -24,6 +24,12 @@ navigation, without dispatching the old history entry or replacing the new URL.
 Stable history and child-frame-only changes still permit Back. These are scripted
 peer regressions, not native-browser task or OS-isolation qualification.
 
+`WebSocketMessageBoundTests` drives the production frame parser with a real
+`StreamReader` and a reduced data-message limit. Interleaved Pong payloads neither
+consume nor reset the fragmented message budget; genuine data overflow remains
+a protocol error. This is parser regression evidence, not native-engine or
+live-peer interoperability qualification.
+
 `fixture_server` closes active clients and reaps their handlers before awaiting
 server shutdown; Python 3.12+ includes active connections in `wait_closed`.
 Real unfinished-HTTP regressions cover failure and cancellation without masking

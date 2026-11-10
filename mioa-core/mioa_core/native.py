@@ -139,7 +139,7 @@ class _WebSocket:
                 length = struct.unpack("!H", await self.reader.readexactly(2))[0]
             elif length == 127:
                 length = struct.unpack("!Q", await self.reader.readexactly(8))[0]
-            if length > MAX_MESSAGE or size + length > MAX_MESSAGE:
+            if length > MAX_MESSAGE or (opcode < 8 and size + length > MAX_MESSAGE):
                 raise NativeError("protocol_error", "native websocket message exceeds bound")
             payload = await self.reader.readexactly(length)
             if opcode >= 8:
