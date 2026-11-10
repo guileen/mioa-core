@@ -449,13 +449,10 @@ pub const Disposition = struct {
     filename: ?[]const u8 = null,
 };
 
-// Parses a part's Content-Disposition value: `form-data` followed by
-// `; key="value"` params. Values are quoted-strings whose CR/LF/" were
-// percent-escaped by the encoder (writeMultipartName), so the next raw '"'
-// always closes the value; a raw ';' inside quotes is legal and preserved.
-// Parameters that are not `key="quoted"` pairs — e.g. RFC 5987
-// `filename*=UTF-8''...`, which real servers emit — are skipped rather than
-// failing the whole parse, matching browser leniency.
+// Content-Disposition parameters accept MIME tokens or quoted-strings
+// (RFC 2183 §2 / RFC 2045 §5.1). Quoted values preserve raw semicolons;
+// writeMultipartName percent-escapes CR/LF/" before encoding them.
+// Malformed parameters and unknown keys, including filename*, are ignored.
 pub fn parseDisposition(value: []const u8) !Disposition {
     // `Header.parse` already excludes the surrounding OWS from the value.
     var rest = value;
@@ -465,7 +462,7 @@ pub fn parseDisposition(value: []const u8) !Disposition {
     rest = rest["form-data".len..];
 
     var disposition = Disposition{};
-    while (true) {
+    parameters: while (true) {
         rest = std.mem.trimStart(u8, rest, " \t");
         if (rest.len == 0) {
             return disposition;
@@ -487,17 +484,25 @@ pub fn parseDisposition(value: []const u8) !Disposition {
         const key = rest[0..eq];
         const after_eq = rest[eq + 1 ..];
 
-        if (after_eq.len == 0 or after_eq[0] != '"') {
-            // Unquoted value; skip it.
+        const param_value = if (after_eq.len != 0 and after_eq[0] == '"') quoted: {
+            const end = std.mem.findScalarPos(u8, after_eq, 1, '"') orelse {
+                // Unterminated quoted value; ignore the rest of the header.
+                return disposition;
+            };
+            rest = after_eq[end + 1 ..];
+            break :quoted after_eq[1..end];
+        } else token: {
+            const bytes = std.mem.trimEnd(u8, after_eq[0 .. semi - eq - 1], " \t");
             rest = rest[semi..];
-            continue;
-        }
-        const end = std.mem.findScalarPos(u8, after_eq, 1, '"') orelse {
-            // Unterminated quoted value; ignore the rest of the header.
-            return disposition;
+            if (bytes.len == 0) continue;
+            for (bytes) |byte| {
+                switch (byte) {
+                    0...' ', 0x7f...0xff, '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=' => continue :parameters,
+                    else => {},
+                }
+            }
+            break :token bytes;
         };
-        const param_value = after_eq[1..end];
-        rest = after_eq[end + 1 ..];
 
         if (std.ascii.eqlIgnoreCase(key, "name")) {
             disposition.name = param_value;
@@ -746,15 +751,11 @@ test "header_parser: parse Content-Disposition" {
     d = try parseDisposition("form-data; foo=\"bar\"; name=\"a;b\"");
     try testing.expectString("a;b", d.name.?);
 
-    // Parameters without `=` or with an unquoted value — e.g. RFC 5987
-    // `filename*` — are skipped without failing the parse; later well-formed
-    // parameters still apply.
+    // Unknown parameters — including RFC 5987 filename* — are ignored;
+    // later recognized parameters still apply.
     d = try parseDisposition("form-data; filename*=UTF-8''file%20name.jpg; name=\"n\"");
     try testing.expectString("n", d.name.?);
     try testing.expectEqual(null, d.filename);
-    d = try parseDisposition("form-data; foo; name=bare; filename=\"f.txt\"");
-    try testing.expectEqual(null, d.name);
-    try testing.expectString("f.txt", d.filename.?);
 
     // An unterminated quoted value ends the parse, keeping what was found.
     d = try parseDisposition("form-data; name=\"a\"; filename=\"f");
@@ -765,6 +766,28 @@ test "header_parser: parse Content-Disposition" {
     // rejected.
     try testing.expectError(error.InvalidFormData, parseDisposition("attachment; name=\"a\""));
     try testing.expectError(error.InvalidFormData, parseDisposition("form-data name=\"a\""));
+}
+
+test "header_parser: token Content-Disposition parameters" {
+    const disposition = try parseDisposition("form-data; name=field; filename=report.txt");
+    try testing.expect(disposition.name != null and disposition.filename != null);
+    try testing.expectString("field", disposition.name.?);
+    try testing.expectString("report.txt", disposition.filename.?);
+
+    const punctuation = try parseDisposition("form-data; name=field-1_2.3%22; filename=\"a;b.txt\"");
+    try testing.expect(punctuation.name != null and punctuation.filename != null);
+    try testing.expectString("field-1_2.3%22", punctuation.name.?);
+    try testing.expectString("a;b.txt", punctuation.filename.?);
+
+    const invalid = [_][]const u8{ "", "two words", "a/b", "a=b", "a\x01b", "\xff" };
+    for (invalid) |value| {
+        var buffer: [128]u8 = undefined;
+        const header = try std.fmt.bufPrint(&buffer, "form-data; name={s}; filename=valid.txt", .{value});
+        const parsed = try parseDisposition(header);
+        try testing.expect(parsed.filename != null);
+        try testing.expectEqual(null, parsed.name);
+        try testing.expectString("valid.txt", parsed.filename.?);
+    }
 }
 
 test "header_parser: cursor" {
