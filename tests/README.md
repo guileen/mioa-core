@@ -12,6 +12,12 @@ depth of a list carried on an object's first-field line (TOON §9.4 / §10).
 These preserve value types and scope; they are not full codec conformance or
 native-browser qualification.
 
+`evidence_view.py` projects validator-owned outcomes without changing verdicts.
+Malformed script `subtests` remain ERROR diagnostics, not rendering exceptions
+or invented pass counts; valid assertion failures retain counts and diagnostics.
+The projection depends only on the standard library and `toon.py`, not the
+controller, standards ledger, OS providers or Desktop.
+
 ## One entry, explicit layers
 
 From the Core checkout, using the Python environment in which Core/headless and

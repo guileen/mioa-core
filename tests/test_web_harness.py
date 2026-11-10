@@ -12,6 +12,7 @@ import zlib
 
 import run_web as web
 import toon
+import evidence_view
 
 
 class HarnessTests(unittest.TestCase):
@@ -68,6 +69,39 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(web.failure_record(RuntimeError('PASS'), -11)['status'], 'CRASH')
         self.assertEqual(web.failure_record(RuntimeError('PASS'))['status'], 'ERROR')
 
+
+    def test_malformed_script_results_remain_readable_error_evidence(self):
+        for invalid in (7, True, "invalid", {"status": "PASS"}, None):
+            with self.subTest(subtests=invalid):
+                value = {"complete": True, "subtests": invalid}
+                with self.assertRaises(web.CaseFailure) as caught:
+                    web.validate_assertions(value, ["geometry"])
+                record = dict(id="script-geometry", **web.failure_record(caught.exception))
+                for row in (record, {"id": record["id"], "status": record["status"],
+                                    "result": {"results": [record]}}):
+                    report = {"status": "ERROR", "results": [row]}
+                    projected = evidence_view.view(report)["results"][0]
+                    self.assertEqual(projected["status"], "ERROR")
+                    self.assertEqual(projected["message"], str(caught.exception))
+                    self.assertNotIn("subtests", projected)
+                    self.assertNotIn("failures", projected)
+                    self.assertIn("ERROR", evidence_view.render(report))
+
+    def test_assertion_failure_projection_keeps_counts_and_failure_diagnostics(self):
+        value = {"complete": True,
+                 "subtests": [{"name": "append", "status": "PASS", "assertions": 1},
+                              {"name": "remove", "status": "FAIL", "assertions": 1,
+                               "message": "node retained"}]}
+        with self.assertRaises(web.CaseFailure) as caught:
+            web.validate_assertions(value, ["append", "remove"])
+        report = {"status": "FAIL", "results": [
+            dict(id="script-dom", **web.failure_record(caught.exception))]}
+        projected = evidence_view.view(report)["results"][0]
+        self.assertEqual(projected["status"], "FAIL")
+        self.assertEqual(projected["subtests"], {"passed": 1, "total": 2})
+        self.assertEqual(projected["failures"], [
+            {"status": "FAIL", "name": "remove", "message": "node retained"}])
+        self.assertIn("node retained", evidence_view.render(report))
 
 
 class ToonStructureTests(unittest.TestCase):
