@@ -292,7 +292,7 @@ pub const Method = union(enum) {
     custom: []const u8,
 };
 
-/// Parses an HTTP method, checks for shortest possible request length too.
+/// Parses a case-sensitive HTTP method token (RFC 9110 §§5.6.2, 9.1).
 fn parseMethod(cursor: *Cursor) !Method {
     // Though the shortest standardized HTTP method is GET, we can receive
     // a single character for method on non-standard ones.
@@ -375,9 +375,15 @@ fn parseMethod(cursor: *Cursor) !Method {
 
     // That 4 bytes we've consumed earlier might've a delimiter in them.
     cursor.rewind(4);
-    // Continue until first space appearance.
+    // Validate custom methods during the existing scan; standard methods
+    // above are known tokens and keep their fast path.
     const method_start = cursor.current();
-    while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {}
+    while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {
+        switch (cursor.char()) {
+            '0'...'9', 'A'...'Z', 'a'...'z', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+            else => return error.Invalid,
+        }
+    }
     if (cursor.reachedEnd()) {
         return error.Incomplete;
     }
@@ -902,6 +908,31 @@ test "header_parser: parse request methods" {
     }
 }
 
+test "header_parser: custom methods require HTTP token bytes" {
+    const token_bytes = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    var request = "POSTER / HTTP/1.1\r\nHost: example\r\n\r\n".*;
+    for (0.."POSTER".len) |pos| {
+        const original = request[pos];
+        for (0..256) |value| {
+            const byte: u8 = @intCast(value);
+            request[pos] = byte;
+            if (std.mem.indexOfScalar(u8, token_bytes, byte) != null) {
+                const method, const path, const version, var headers = try parseRequest(&request);
+                try testing.expectString(request[0.."POSTER".len], method.custom);
+                try testing.expectString("/", path);
+                try testing.expectEqual(.@"1.1", version);
+                const header = (try headers.next()).?;
+                try testing.expectString("Host", header.key);
+                try testing.expectString("example", header.value);
+                try testing.expectEqual(null, try headers.next());
+            } else {
+                try testing.expectError(error.Invalid, parseRequest(&request));
+            }
+        }
+        request[pos] = original;
+    }
+}
+
 test "header_parser: parse request invalid" {
     const invalid_cases = [_][]const u8{
         " / HTTP/1.1\r\n\r\n", // 0 length method
@@ -920,9 +951,14 @@ test "header_parser: parse request invalid" {
     // `DELETE` exercises the multi-byte peek continuation and the path is
     // longer than the minimum request length, proving neither scan can run
     // past the end of a truncated buffer.
-    const bytes = "DELETE /websocket/endpoint HTTP/1.1\r\n";
-    for (0..bytes.len) |len| {
-        try testing.expectError(error.Incomplete, parseRequest(bytes[0..len]));
+    const requests = [_][]const u8{
+        "DELETE /websocket/endpoint HTTP/1.1\r\n",
+        "POSTER /websocket/endpoint HTTP/1.1\r\n",
+    };
+    for (requests) |bytes| {
+        for (0..bytes.len) |len| {
+            try testing.expectError(error.Incomplete, parseRequest(bytes[0..len]));
+        }
     }
 }
 
