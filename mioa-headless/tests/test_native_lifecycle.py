@@ -634,6 +634,53 @@ class NativeTransportCloseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NativeResponseIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def exchange(self, response_id, *, valid):
+        client, peer = socket.socketpair()
+        client.setblocking(False)
+        peer.setblocking(False)
+        reader, writer = await asyncio.open_connection(sock=client)
+        peer_reader, peer_writer = await asyncio.open_connection(sock=peer)
+        cdp = _CDP(_WebSocket(reader, writer))
+        request = asyncio.create_task(cdp.send("Page.getFrameTree"))
+
+        async def respond(identity, result):
+            data = json.dumps({"id": identity, "result": result}).encode()
+            peer_writer.write(bytes((0x81, len(data))) + data)
+            await peer_writer.drain()
+
+        try:
+            header = await asyncio.wait_for(peer_reader.readexactly(2), 1)
+            length = header[1] & 127
+            await asyncio.wait_for(peer_reader.readexactly(4 + length), 1)
+            if valid:
+                # An unmatched response must not consume the current request.
+                await respond(99, {"frameTree": {"frame": {"id": "stale"}}})
+            await respond(response_id, {"frameTree": {"frame": {"id": "main"}}})
+            if valid:
+                self.assertEqual(await asyncio.wait_for(request, 1),
+                                 {"frameTree": {"frame": {"id": "main"}}})
+            else:
+                with self.assertRaises(NativeError) as rejected:
+                    await asyncio.wait_for(request, 1)
+                self.assertEqual(rejected.exception.code, "protocol_error")
+                with self.assertRaises(NativeError) as rejected:
+                    await cdp.send("Page.getFrameTree")
+                self.assertEqual(rejected.exception.code, "protocol_error")
+        finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+            await cdp.close()
+            peer_writer.close()
+            await peer_writer.wait_closed()
+
+    async def test_boolean_response_cannot_complete_integer_request(self):
+        await self.exchange(True, valid=False)
+
+    async def test_float_response_cannot_complete_integer_request(self):
+        await self.exchange(1.0, valid=False)
+
+    async def test_integer_response_survives_late_unmatched_response(self):
+        await self.exchange(1, valid=True)
     async def error_exchange(self, error, *, malformed):
         client, peer = socket.socketpair()
         client.setblocking(False)

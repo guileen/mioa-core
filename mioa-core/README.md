@@ -38,6 +38,10 @@ pending requests fail rather than retaining the channel. Session shutdown also
 drains log tasks when CDP close fails and propagates the close error.
 Transport closure does not prove child exit or storage durability.
 
+CDP response IDs must be strict integers before pending-request lookup.
+Boolean or floating-point IDs terminate the reader, fail pending requests and
+reject further commands; actions are not replayed. Late unmatched integer IDs
+remain ignored, so timed-out responses cannot complete another request.
 Matching requests retain pending ownership through response decoding and delivery.
 If decoding fails, connection-loss cleanup rejects the matching caller as well as
 other pending callers; none waits for its command timeout solely because its

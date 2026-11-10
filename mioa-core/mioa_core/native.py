@@ -206,6 +206,8 @@ class _CDP:
             while True:
                 message = json.loads(await self.socket.receive())
                 if "id" in message:
+                    if type(message["id"]) is not int:
+                        raise NativeError("protocol_error", "native response id must be an integer")
                     # Retain cleanup ownership until decoding and delivery finish.
                     pending = self.pending.get(message["id"])
                     if pending is None:
