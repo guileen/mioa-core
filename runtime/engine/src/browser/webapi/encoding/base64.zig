@@ -22,13 +22,13 @@
 //! just deals in bytes.
 
 const std = @import("std");
-const js = @import("../../js/js.zig");
+const OneByte = @import("../../js/String.zig").OneByte;
 
 const Allocator = std.mem.Allocator;
 
 pub const BinInput = union(enum) {
     // order matters
-    js_string: js.String.OneByte,
+    js_string: OneByte,
     raw: []const u8,
 
     fn bytes(self: BinInput) []const u8 {
