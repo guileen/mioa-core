@@ -18,6 +18,12 @@ or invented pass counts; valid assertion failures retain counts and diagnostics.
 The projection depends only on the standard library and `toon.py`, not the
 controller, standards ledger, OS providers or Desktop.
 
+`NavigationHistoryTests` drives the real Core page/CDP client over a socket pair.
+Back navigation rejects a history reply overtaken by a main-frame or same-document
+navigation, without dispatching the old history entry or replacing the new URL.
+Stable history and child-frame-only changes still permit Back. These are scripted
+peer regressions, not native-browser task or OS-isolation qualification.
+
 ## One entry, explicit layers
 
 From the Core checkout, using the Python environment in which Core/headless and

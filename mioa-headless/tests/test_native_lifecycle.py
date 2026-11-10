@@ -4,6 +4,7 @@ from contextlib import ExitStack
 import io
 import json
 import os
+import socket
 from pathlib import Path
 import struct
 import tempfile
@@ -11,7 +12,116 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from mioa_core.native import NativeContext, NativeError, NativePage, _CDP
 from mioa_headless.native_service import NativeProtocol
+
+
+class NavigationHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def history_exchange(self, event, *, stale):
+        class Wire:
+            async def send(self, payload, *, abort=None):
+                if abort is None or not abort():
+                    writer.write(payload + b"\n")
+                    await writer.drain()
+
+            async def receive(self):
+                payload = await reader.readline()
+                if not payload:
+                    raise EOFError("history peer closed")
+                return payload
+
+            async def close(self):
+                writer.close()
+                await writer.wait_closed()
+
+        client, peer = socket.socketpair()
+        reader, writer = await asyncio.open_connection(sock=client)
+        peer_reader, peer_writer = await asyncio.open_connection(sock=peer)
+        cdp = _CDP(Wire())
+        owner = SimpleNamespace(monotonic_time=asyncio.get_running_loop().time)
+        context = NativeContext(owner, cdp)
+        page = NativePage(context, "page", "session", "https://example.com/current")
+        page.frame_id = "main"
+        context._pages["page"] = page
+        operation = asyncio.create_task(page.go_back(wait_until="commit", timeout=1000))
+
+        async def emit(message):
+            peer_writer.write(json.dumps({"sessionId": "session", **message}).encode() + b"\n")
+            await peer_writer.drain()
+
+        async def request():
+            return json.loads(await asyncio.wait_for(peer_reader.readline(), 1))
+
+        try:
+            query = await request()
+            self.assertEqual(query["method"], "Page.getNavigationHistory")
+            if event is not None:
+                await emit(event)
+            await emit({"id": query["id"], "result": {
+                "entries": [{"id": 1}, {"id": 2}], "currentIndex": 1,
+            }})
+            if stale:
+                with self.assertRaises(NativeError) as rejected:
+                    await asyncio.wait_for(operation, 1)
+                self.assertEqual(rejected.exception.code, "stale_reference")
+                self.assertEqual(page.url, event["params"].get("url",
+                    event["params"].get("frame", {}).get("url")))
+            else:
+                navigation = await request()
+                self.assertEqual(navigation["method"], "Page.navigateToHistoryEntry")
+                self.assertEqual(navigation["params"], {"entryId": 1})
+                await emit({"method": "Page.frameNavigated", "params": {"frame": {
+                    "id": "main", "url": "https://example.com/previous",
+                }}})
+                await emit({"id": navigation["id"], "result": {}})
+                # Serve follow-up document reads over the same CDP channel.
+                while not operation.done():
+                    reading = asyncio.create_task(request())
+                    done, _ = await asyncio.wait((operation, reading), return_when=asyncio.FIRST_COMPLETED)
+                    if reading not in done:
+                        reading.cancel()
+                        await asyncio.gather(reading, return_exceptions=True)
+                        break
+                    command = await reading
+                    self.assertEqual(command["method"], "Runtime.evaluate")
+                    await emit({"id": command["id"], "result": {
+                        "result": {"type": "string", "value": page.url},
+                    }})
+                self.assertIsNone(await asyncio.wait_for(operation, 1))
+                self.assertEqual(page.url, "https://example.com/previous")
+            await cdp.close()
+            self.assertEqual(await asyncio.wait_for(peer_reader.read(), 1), b"")
+        finally:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            await cdp.close()
+            peer_writer.close()
+            await peer_writer.wait_closed()
+
+    async def test_back_does_not_dispatch_history_from_a_replaced_main_document(self):
+        for event in (
+            {"method": "Page.frameNavigated", "params": {"frame": {
+                "id": "main", "url": "https://example.com/new",
+            }}},
+            {"method": "Page.navigatedWithinDocument", "params": {
+                "frameId": "main", "url": "https://example.com/current#new",
+            }},
+        ):
+            with self.subTest(method=event["method"]):
+                await self.history_exchange(event, stale=True)
+
+    async def test_back_accepts_history_after_only_a_child_frame_changed(self):
+        for event in (
+            None,
+            {"method": "Page.frameNavigated", "params": {"frame": {
+                "id": "child", "parentId": "main", "url": "https://example.com/child",
+            }}},
+            {"method": "Page.navigatedWithinDocument", "params": {
+                "frameId": "child", "url": "https://example.com/child#new",
+            }},
+        ):
+            with self.subTest(event=event):
+                await self.history_exchange(event, stale=False)
 
 
 class NativeProcess:

@@ -416,6 +416,7 @@ class NativePage:
         self.context, self.page_id, self.target_id, self.session_id = context, target, target, session
         self.frame_id: str | None = None
         self.observation_id = 0
+        self._main_frame_commit = 0
         self._url, self._closed = url, False
         self._responses: dict[str, NativeResponse] = {}
         self._requests: dict[str, str | None] = {}
@@ -533,6 +534,7 @@ class NativePage:
             self.observation_id += 1
             self._discard_frames()
             if not frame.get("parentId"):
+                self._main_frame_commit += 1
                 self.frame_id = frame.get("id", self.frame_id)
                 self._url = frame.get("url", self._url)
                 self._execution_context = None
@@ -549,6 +551,7 @@ class NativePage:
             self._discard_frames()
         elif method == "Page.navigatedWithinDocument":
             if params.get("frameId") == self.frame_id:
+                self._main_frame_commit += 1
                 self._url = params.get("url", self._url)
             self.observation_id += 1
             self._discard_frames()
@@ -755,7 +758,10 @@ class NativePage:
     @_bounded
     async def go_back(self, *, wait_until: str = "load", timeout: float = DEFAULT_TIMEOUT) -> NativeResponse | None:
         deadline = _deadline(timeout)
+        history_commit = self._main_frame_commit
         history = await self._send("Page.getNavigationHistory", timeout=_remaining(deadline))
+        if self.is_closed() or history_commit != self._main_frame_commit:
+            raise NativeError("stale_reference", "target changed while reading navigation history")
         entries, index = history.get("entries"), history.get("currentIndex")
         if not isinstance(entries, list) or type(index) is not int:
             raise NativeError("protocol_error", "native navigation history is malformed")
