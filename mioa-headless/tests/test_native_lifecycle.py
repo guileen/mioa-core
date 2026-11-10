@@ -775,3 +775,86 @@ class NativeResponseIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_valid_error_does_not_fail_another_pending_command(self):
         await self.error_exchange({"code": -32601, "message": "unknown method"}, malformed=False)
+
+
+class NativeEventCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        client, peer = socket.socketpair()
+        client.setblocking(False)
+        peer.setblocking(False)
+        reader, writer = await asyncio.open_connection(sock=client)
+        self.peer_reader, self.peer_writer = await asyncio.open_connection(sock=peer)
+        self.cdp = _CDP(_WebSocket(reader, writer))
+        context = NativeContext(SimpleNamespace(platform="Darwin"), self.cdp)
+        self.page = NativePage(context, "page", "session", "https://example.com/old")
+        context._pages["page"] = self.page
+
+    async def asyncTearDown(self):
+        await self.cdp.close()
+        self.peer_writer.close()
+        await self.peer_writer.wait_closed()
+
+    async def request(self):
+        header = await asyncio.wait_for(self.peer_reader.readexactly(2), 1)
+        size = header[1] & 127
+        if size == 126:
+            size = int.from_bytes(await self.peer_reader.readexactly(2), "big")
+        elif size == 127:
+            size = int.from_bytes(await self.peer_reader.readexactly(8), "big")
+        mask = await self.peer_reader.readexactly(4)
+        data = await self.peer_reader.readexactly(size)
+        return json.loads(bytes(value ^ mask[index % 4] for index, value in enumerate(data)))
+
+    async def emit(self, **value):
+        data = json.dumps({"sessionId": "session", **value}).encode()
+        header = bytes((0x81, len(data))) if len(data) < 126 else b"\x81\x7e" + struct.pack("!H", len(data))
+        self.peer_writer.write(header + data)
+        await self.peer_writer.drain()
+
+    async def test_request_callback_failure_does_not_break_cdp_or_other_callbacks(self):
+        observed = []
+
+        def failed_callback(request):
+            raise RuntimeError("request callback failed")
+
+        self.page.context.on("request", failed_callback)
+        self.page.context.on("request", observed.append)
+        command = asyncio.create_task(self.cdp.send("Page.getFrameTree", session="session"))
+        request = await self.request()
+        await self.emit(method="Network.requestWillBeSent", params={
+            "requestId": "request-1",
+            "request": {"url": "https://example.com/", "headers": {}, "method": "GET"},
+        })
+        await self.emit(id=request["id"], result={"ok": True})
+        self.assertEqual(await asyncio.wait_for(command, 1), {"ok": True})
+        self.assertEqual([item.url for item in observed], ["https://example.com/"])
+        self.assertEqual(self.cdp.event_errors, ["request callback failed"])
+        self.assertFalse(self.cdp.reader.done())
+
+    async def test_request_callback_future_reports_its_failure(self):
+        future = asyncio.get_running_loop().create_future()
+        pending = asyncio.get_running_loop().create_future()
+        self.page.context.on("request", lambda request: future)
+        self.page.context.on("request", lambda request: pending)
+        command = asyncio.create_task(self.cdp.send("Page.getFrameTree", session="session"))
+        try:
+            request = await self.request()
+            await self.emit(method="Network.requestWillBeSent", params={
+                "requestId": "request-1",
+                "request": {"url": "https://example.com/", "headers": {}, "method": "GET"},
+            })
+            await self.emit(id=request["id"], result={"ok": True})
+            self.assertEqual(await asyncio.wait_for(command, 1), {"ok": True})
+            future.set_exception(RuntimeError("future listener failed"))
+            await asyncio.sleep(0)
+            self.assertEqual(self.cdp.event_errors, ["future listener failed"])
+            self.assertFalse(self.cdp.reader.done())
+            await self.cdp.close()
+            self.assertTrue(pending.cancelled())
+        finally:
+            if future.done() and not future.cancelled():
+                future.exception()
+            elif not future.done():
+                future.cancel()
+            if not pending.done():
+                pending.cancel()

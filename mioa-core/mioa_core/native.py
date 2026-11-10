@@ -184,22 +184,27 @@ class _CDP:
         self.sequence = 0
         self.pending: dict[int, tuple[asyncio.Future, str, str | None]] = {}
         self.listeners: list[Callable] = []
-        self.event_tasks: set[asyncio.Task] = set()
+        self.event_tasks: set[asyncio.Future] = set()
         self.event_errors: list[str] = []
         self.failure: BaseException | None = None
         self.reader = asyncio.create_task(self._read())
 
     def _task(self, value: Any) -> None:
         if inspect.isawaitable(value):
-            task = asyncio.create_task(value)
+            task = asyncio.ensure_future(value)
             self.event_tasks.add(task)
             task.add_done_callback(self._task_done)
 
-    def _task_done(self, task: asyncio.Task) -> None:
+    def _record_event_error(self, error: BaseException) -> None:
+        self.event_errors.append(str(error))
+        del self.event_errors[:-50]
+
+    def _task_done(self, task: asyncio.Future) -> None:
         self.event_tasks.discard(task)
-        if not task.cancelled() and task.exception():
-            self.event_errors.append(str(task.exception()))
-            del self.event_errors[:-50]
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                self._record_event_error(error)
 
     async def _read(self) -> None:
         try:
@@ -331,7 +336,10 @@ class NativeContext:
 
     def _emit(self, event: str, value: Any) -> None:
         for callback in tuple(self._callbacks.get(event, ())):
-            self.cdp._task(callback(value))
+            try:
+                self.cdp._task(callback(value))
+            except Exception as error:
+                self.cdp._record_event_error(error)
 
     async def initialize(self) -> None:
         # Native LP's pre-context STARTUP target is not a page. Create the real

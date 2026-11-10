@@ -50,3 +50,7 @@ If decoding fails, connection-loss cleanup rejects the matching caller as well a
 other pending callers; none waits for its command timeout solely because its
 response was removed early. A normal protocol error still rejects only its own
 command and does not terminate unrelated work.
+
+Context event callback exceptions are recorded in the bounded CDP event
+diagnostics; they do not stop other callbacks or terminate the transport.
+Returned awaitables, including Futures, are supervised and cancelled on shutdown.
