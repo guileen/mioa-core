@@ -234,6 +234,45 @@ class Output(io.StringIO):
         return [json.loads(line) for line in self.getvalue().splitlines()]
 
 
+class WebSocketCloseOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queued_command_cannot_follow_close_frame(self):
+        client, peer = socket.socketpair()
+        reader, writer = await asyncio.open_connection(sock=client)
+        peer_reader, peer_writer = await asyncio.open_connection(sock=peer)
+        channel = _WebSocket(reader, writer)
+        tasks = []
+        try:
+            await channel.lock.acquire()
+            closing = asyncio.create_task(channel.send(struct.pack("!H", 1000), 8))
+            tasks.append(closing)
+            # Both sends pass intake while open; Close reaches the lock first.
+            await asyncio.sleep(0)
+            sending = asyncio.create_task(channel.send(b"queued command"))
+            tasks.append(sending)
+            await asyncio.sleep(0)
+            channel.lock.release()
+            _, sent = await asyncio.wait_for(
+                asyncio.gather(closing, sending, return_exceptions=True), 2)
+            writer.close()
+            await writer.wait_closed()
+            wire = await asyncio.wait_for(peer_reader.read(), 1)
+            self.assertEqual(wire[:2], b"\x88\x82")
+            self.assertEqual(bytes(wire[6 + i] ^ wire[2 + i] for i in range(2)),
+                             struct.pack("!H", 1000))
+            self.assertEqual(wire[8:], b"", "command bytes followed the close frame")
+            self.assertIsInstance(sent, NativeError)
+            self.assertEqual(sent.code, "protocol_error")
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            writer.close()
+            peer_writer.close()
+            await writer.wait_closed()
+            await peer_writer.wait_closed()
+
+
 class NativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.stack = ExitStack()

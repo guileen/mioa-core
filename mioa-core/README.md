@@ -28,3 +28,6 @@ not for ordinary navigation or rendering.
 a native runtime and its font locations in one snapshotted revision. Environment
 id, seed and storage remain owned by the profile; `rollback=snapshot` restores
 the prior tree. Startup never silently accepts a different pinned binary/font.
+
+The send lock fences closure: publishing a Close frame seals the channel before
+the write; queued commands recheck that state under the same lock and cannot follow it.

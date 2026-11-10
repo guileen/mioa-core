@@ -122,6 +122,10 @@ class _WebSocket:
         header = bytes((0x80 | opcode, 0x80 | length)) if length < 126 else bytes((0x80 | opcode, 0x80 | (126 if length <= 65535 else 127))) + struct.pack("!H" if length <= 65535 else "!Q", length)
         masked = bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
         async with self.lock:
+            if self.closed:
+                raise NativeError("protocol_error", "native websocket closed")
+            if opcode == 8:
+                self.closed = True
             self.writer.write(header + mask + masked)
             await self.writer.drain()
 
