@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from mioa_core.native import NativeContext, NativeError, NativePage, _CDP, _WebSocket
+from mioa_core.native import NativeContext, NativeError, NativePage, NativeSession, _CDP, _WebSocket
 from mioa_headless.native_service import NativeProtocol
 
 
@@ -535,6 +535,34 @@ class NativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NativeTransportCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_closes_log_tasks_when_cdp_close_fails(self):
+        failure = RuntimeError("close write failed")
+        cdp_client, cdp_peer = socket.socketpair()
+        output_client, output_peer = socket.socketpair()
+        cdp_peer.setblocking(False)
+        reader, writer = await asyncio.open_connection(sock=cdp_client)
+        output, output_writer = await asyncio.open_connection(sock=output_client)
+        process = SimpleNamespace(returncode=0, stdout=output, stderr=None)
+        session = NativeSession(process, {"network": {}}, Path("unused"))
+        session.cdp = _CDP(_WebSocket(reader, writer))
+        try:
+            await asyncio.sleep(0)
+            with patch.object(writer, "write", side_effect=failure), \
+                    self.assertRaises(RuntimeError) as rejected:
+                await asyncio.wait_for(session.close(), 3)
+            self.assertIs(rejected.exception, failure)
+            self.assertTrue(all(task.done() for task in session._log_tasks))
+            self.assertEqual(await asyncio.wait_for(asyncio.get_running_loop().sock_recv(cdp_peer, 1), 1), b"")
+        finally:
+            for task in session._log_tasks:
+                task.cancel()
+            await asyncio.gather(*session._log_tasks, return_exceptions=True)
+            writer.close()
+            output_writer.close()
+            await asyncio.gather(writer.wait_closed(), output_writer.wait_closed(), return_exceptions=True)
+            cdp_peer.close()
+            output_peer.close()
+
     async def blocked_close(self, *, cancel):
         client, peer = socket.socketpair()
         client.setblocking(False)

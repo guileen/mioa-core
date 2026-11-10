@@ -1449,12 +1449,14 @@ class NativeSession:
                     await asyncio.wait_for(self.process.wait(), 3)
                     error = NativeError("timeout", "native shutdown required SIGKILL; durable flush is not verified")
         finally:
-            if self.cdp:
-                await self.cdp.close()
-            for task in self._log_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*self._log_tasks, return_exceptions=True)
+            try:
+                if self.cdp:
+                    await self.cdp.close()
+            finally:
+                for task in self._log_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*self._log_tasks, return_exceptions=True)
         if error:
             raise error
         if self.process.returncode not in (0, -signal.SIGTERM):

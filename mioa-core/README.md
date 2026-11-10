@@ -34,4 +34,6 @@ the write; queued commands recheck that state under the same lock and cannot fol
 
 WebSocket close-frame delivery is best effort within its existing timeout.
 Cancellation still closes the owned transport and drains CDP reader/event tasks;
-pending requests fail rather than retaining the channel.
+pending requests fail rather than retaining the channel. Session shutdown also
+drains log tasks when CDP close fails and propagates the close error.
+Transport closure does not prove child exit or storage durability.
