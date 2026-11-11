@@ -303,16 +303,9 @@ fn store_shadow(pw: u32, ph: u32, pixels: Vec<u8>, tiles: Vec<[u8; 32]>) {
     }
 }
 
-/// Tiles are full-width horizontal bands: a changed band is one contiguous
-/// write, so a small damage rect costs one or two bands instead of the frame.
-fn tile_geometry(_pw:u32,ph:u32)->(u32,u32){
-    (1,(ph+TILE_PX-1)/TILE_PX)
+fn tile_geometry(pw:u32,ph:u32)->(u32,u32){
+    ((pw+TILE_PX-1)/TILE_PX,(ph+TILE_PX-1)/TILE_PX)
 }
-
-/// Which bands each ring slot already holds, so a publish writes only the
-/// bands whose pixels actually differ.
-static SLOT_TILES: std::sync::Mutex<[Vec<[u8;32]>;3]> =
-    std::sync::Mutex::new([Vec::new(), Vec::new(), Vec::new()]);
 
 fn fingerprint_from_tiles(tiles:&[[u8;32]])->[u8;32]{
     use sha2::{Digest,Sha256};
@@ -321,48 +314,27 @@ fn fingerprint_from_tiles(tiles:&[[u8;32]])->[u8;32]{
     h.finalize().into()
 }
 
-/// Digest of one band of `src`, whose top-left is (ox,oy) in device px.
-fn hash_tile(src:&[u8],iw:u32,ox:u32,oy:u32,_tx:u32,ty:u32,pw:u32,ph:u32)->[u8;32]{
+/// Digest of one tile, read from `src` whose top-left is (ox,oy) in device px.
+fn hash_tile(src:&[u8],iw:u32,ox:u32,oy:u32,tx:u32,ty:u32,pw:u32,ph:u32)->[u8;32]{
     use sha2::{Digest,Sha256};
     let mut h=Sha256::new();
-    let y0=ty*TILE_PX; let y1=(y0+TILE_PX).min(ph);
-    if y0>=y1 { return h.finalize().into(); }
-    let row=iw as usize*4;
-    let start=(y0.saturating_sub(oy) as usize)*row;
-    let end=((y1-oy) as usize)*row;
-    if ox!=0 { return h.finalize().into(); }
-    if end<=src.len() && start<=end { h.update(&src[start..end]); }
-    let _=pw;
+    let x0=tx*TILE_PX; let y0=ty*TILE_PX;
+    let x1=(x0+TILE_PX).min(pw); let y1=(y0+TILE_PX).min(ph);
+    let (Some(rx),Some(_ry))=(x0.checked_sub(ox),y0.checked_sub(oy)) else { return h.finalize().into() };
+    for y in y0..y1 {
+        let row=((y-oy) as usize)*(iw as usize)*4;
+        let start=row+(rx as usize)*4;
+        let end=row+((x1-ox) as usize)*4;
+        if end <= src.len() && start <= end { h.update(&src[start..end]); }
+    }
     h.finalize().into()
 }
 
 fn tiles_of(src:&[u8],pw:u32,ph:u32)->Vec<[u8;32]>{
-    let (_,bh)=tile_geometry(pw,ph);
-    let mut tiles=Vec::with_capacity(bh as usize);
-    for ty in 0..bh { tiles.push(hash_tile(src,pw,0,0,0,ty,pw,ph)); }
+    let (tw,th)=tile_geometry(pw,ph);
+    let mut tiles=Vec::with_capacity((tw as usize)*(th as usize));
+    for ty in 0..th { for tx in 0..tw { tiles.push(hash_tile(src,pw,0,0,tx,ty,pw,ph)); } }
     tiles
-}
-
-/// Write the shadow into `slot`, skipping bands the slot already holds.
-fn publish_changed(file:&std::fs::File,slot:u32,capacity:u64,shadow:&FrameShadow)->bool {
-    use std::os::unix::fs::FileExt;
-    let mut guard = match SLOT_TILES.lock() { Ok(g)=>g, Err(_)=>return false };
-    let Some(known)=guard.get_mut(slot as usize) else { return false };
-    let stale = known.len()!=shadow.tiles.len();
-    let base=slot_base(slot,capacity);
-    let row=shadow.pw as u64*4;
-    for (index,digest) in shadow.tiles.iter().enumerate() {
-        if !stale && known.get(index)==Some(digest) { continue; }
-        let y0=index as u64*TILE_PX as u64;
-        let y1=((index as u32+1)*TILE_PX).min(shadow.ph) as u64;
-        let start=(y0*row) as usize;
-        let end=(y1*row) as usize;
-        if end>shadow.pixels.len() || start>end { return false; }
-        if file.write_all_at(&shadow.pixels[start..end],base+y0*row).is_err() { known.clear(); return false; }
-    }
-    if stale { known.clear(); }
-    known.clear(); known.extend_from_slice(&shadow.tiles);
-    true
 }
 
 /// Snap a CSS-px rect outward to the tile grid of the device-space viewport.
@@ -415,13 +387,18 @@ pub unsafe extern "C" fn lp_document_set_frame_unchanged(document:*mut Document,
 
 fn emit_reuse(file:&std::fs::File,slot:u32,capacity:u64,pw:u32,ph:u32,out:*mut RawFrame)->bool {
     use std::os::unix::fs::FileExt;
-    let fingerprint = {
+    let seq=frame_seq();
+    let (fingerprint, wrote) = {
         let guard = match SHADOW.lock() { Ok(g)=>g, Err(_)=>return false };
         let Some(shadow)=guard.as_ref() else { return false };
         if (shadow.pw,shadow.ph)!=(pw,ph) { return false; }
-        if !publish_changed(file,slot,capacity,shadow) { return false; }
-        fingerprint_from_tiles(&shadow.tiles)
+        let needs_write = !slot_holds(slot,seq);
+        if needs_write && file.write_all_at(&shadow.pixels,slot_base(slot,capacity)).is_err() {
+            return false;
+        }
+        (fingerprint_from_tiles(&shadow.tiles), needs_write)
     };
+    if wrote { mark_published(slot,seq); }
     let mut theme=[0u8;4];
     let _=file.read_exact_at(&mut theme,slot_base(slot,capacity));
     unsafe { *out=RawFrame{ width:pw,height:ph,stride:pw*4,
@@ -431,15 +408,15 @@ fn emit_reuse(file:&std::fs::File,slot:u32,capacity:u64,pw:u32,ph:u32,out:*mut R
 
 fn emit_full(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
              width:u32,height:u32,scale:f32,out:*mut RawFrame)->bool {
-        let Some(image)=paint_raw_frame(d,width,height,scale) else { return false };
+    use std::os::unix::fs::FileExt;
+    let Some(image)=paint_raw_frame(d,width,height,scale) else { return false };
     let bytes=image.data();
     if bytes.len() as u64>capacity || bytes.len()<4 { return false; }
+    if file.write_all_at(bytes,slot_base(slot,capacity)).is_err(){ return false; }
     let pw=image.width(); let ph=image.height();
     let tiles=tiles_of(bytes,pw,ph);
     let fingerprint=fingerprint_from_tiles(&tiles);
-    let shadow=FrameShadow{ pw, ph, pixels:bytes.to_vec(), tiles };
-    if !publish_changed(file,slot,capacity,&shadow) { return false; }
-    store_shadow(pw,ph,shadow.pixels,shadow.tiles);
+    store_shadow(pw,ph,bytes.to_vec(),tiles);
     let seq=frame_seq().wrapping_add(1);
     mark_published(slot,seq);
     unsafe { *out=RawFrame{ width:pw,height:ph,stride:pw*4,
@@ -470,15 +447,16 @@ fn emit_dirty(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
         if s_off+row_bytes>src.len() || d_off+row_bytes>shadow.pixels.len() { return false; }
         shadow.pixels[d_off..d_off+row_bytes].copy_from_slice(&src[s_off..s_off+row_bytes]);
     }
-    let (_,bands)=tile_geometry(pw,ph);
-    if shadow.tiles.len()!=bands as usize { return false; }
+    let (tw,th)=tile_geometry(pw,ph);
+    if shadow.tiles.len()!=(tw as usize)*(th as usize) { return false; }
     for ty in (oy/TILE_PX)..((oy2+TILE_PX-1)/TILE_PX) {
-        let idx=ty as usize;
-        if idx>=shadow.tiles.len() { continue; }
-        shadow.tiles[idx]=hash_tile(&shadow.pixels,pw,0,0,0,ty,pw,ph);
+        for tx in (ox/TILE_PX)..((ox2+TILE_PX-1)/TILE_PX) {
+            let idx=(ty*tw+tx) as usize;
+            if idx>=shadow.tiles.len() { continue; }
+            shadow.tiles[idx]=hash_tile(&shadow.pixels,pw,0,0,tx,ty,pw,ph);
+        }
     }
-    let shadow_ref: &FrameShadow = shadow;
-    if !publish_changed(file,slot,capacity,shadow_ref) { return false; }
+    if file.write_all_at(&shadow.pixels,slot_base(slot,capacity)).is_err(){ return false; }
     let seq=frame_seq().wrapping_add(1);
     mark_published(slot,seq);
     let fingerprint=fingerprint_from_tiles(&shadow.tiles);
