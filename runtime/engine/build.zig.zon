@@ -15,33 +15,33 @@
             .hash = "N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_",
         },
         .zlib = .{
-            .url = "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz",
-            .hash = "N-V-__8AAJ2cNgAgfBtAw33Bxfu1IWISDeKKSr3DAqoAysIJ",
+            // .url = "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz",  // offline build: same bytes from <out>/zig-pkg
+            .path = "../zig-pkg/N-V-__8AAJ2cNgAgfBtAw33Bxfu1IWISDeKKSr3DAqoAysIJ",
         },
         .zstd = .{
             .url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
             .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
         },
         .nghttp2 = .{
-            .url = "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.gz",
-            .hash = "N-V-__8AACay2gDbHrByjNGWvyH8G9Gp30uRgZqobYOF1nhb",
+            // .url = "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.gz",  // offline build: same bytes from <out>/zig-pkg
+            .path = "../zig-pkg/N-V-__8AACay2gDbHrByjNGWvyH8G9Gp30uRgZqobYOF1nhb",
         },
         .@"boringssl-zig" = .{
-            .url = "git+https://github.com/lightpanda-io/boringssl-zig.git#5b5ad66f65c5cc4323680ab71284403598251678",
-            .hash = "boringssl-0.1.0-VtJeWc1RAADbO4ypofgJivLdDc6yj5O2ifTBlY-ZDHcH",
+            // .url = "git+https://github.com/lightpanda-io/boringssl-zig.git#5b5ad66f65c5cc4323680ab71284403598251678",  // offline: same bytes from <out>/zig-pkg
+            .path = "../zig-pkg/boringssl-0.1.0-VtJeWc1RAADbO4ypofgJivLdDc6yj5O2ifTBlY-ZDHcH",
         },
         // .@"boringssl-zig" = .{ .path = "../boringssl-zig" },
         .curl = .{
-            .url = "https://github.com/curl/curl/releases/download/curl-8_23_0/curl-8.23.0.tar.gz",
-            .hash = "N-V-__8AAMjlVwH79yAHsK65VUcPuhOO6BWgpLDvvnlWPLly",
+            // .url = "https://github.com/curl/curl/releases/download/curl-8_23_0/curl-8.23.0.tar.gz",  // offline build: same bytes from <out>/zig-pkg
+            .path = "../zig-pkg/N-V-__8AAMjlVwH79yAHsK65VUcPuhOO6BWgpLDvvnlWPLly",
         },
         .sqlite3 = .{
             .url = "https://sqlite.org/2026/sqlite-amalgamation-3530200.zip",
             .hash = "N-V-__8AALc_rgC04POe18O0LKFRm4ouQpLtL3riscEmWp-Q",
         },
         .zenai = .{
-            .url = "git+https://github.com/lightpanda-io/zenai.git#8bfbb3e5788d278a63708db8ee5f58aa589f9fff",
-            .hash = "zenai-0.0.0-iOY_VHNwCAAZJVdc_8q-Vs7j5hexgpBh_8s6c6F1dlay",
+            // .url = "git+https://github.com/lightpanda-io/zenai.git#8bfbb3e5788d278a63708db8ee5f58aa589f9fff",  // offline build: same bytes from <out>/zig-pkg
+            .path = "../zig-pkg/zenai-0.0.0-iOY_VHNwCAAZJVdc_8q-Vs7j5hexgpBh_8s6c6F1dlay",
         },
         .isocline = .{
             .url = "git+https://github.com/arrufat/isocline#4a99434bee4a5ed04c1639514224d48cd55e1405",

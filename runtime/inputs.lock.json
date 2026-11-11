@@ -3,8 +3,8 @@
   "dependency_files": [
     {
       "path": "engine/build.zig.zon",
-      "sha256": "eb21008326eb20f4abe2cb55218ba086053555068c005a081f4bbe98e527ffbb",
-      "bytes": 2942
+      "sha256": "fa4d1e0c6675cdcb756606941988c1bf966c07c8cc8cf276a2a66e449c4de314",
+      "bytes": 3251
     },
     {
       "path": "engine/src/rust/Cargo.lock",
