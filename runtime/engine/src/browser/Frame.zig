@@ -153,6 +153,11 @@ _captured_fingerprint: ?[32]u8 = null,
 _captured_digest: ?[32]u8 = null,
 // Document-space rect the next capture must repaint; null means full frame.
 _paint_dirty: ?[4]f32 = null,
+// Elements whose hover state flipped. Kept as elements, not rects, so the rect
+// is resolved inside the capture that already rebuilt the projection instead of
+// paying an extra document() on the input path.
+_paint_elems: [4]?*@import("webapi/Element.zig") = .{ null, null, null, null },
+_paint_elems_len: u8 = 0,
 _render_resources: std.StringHashMapUnmanaged([]const u8) = .empty,
 _render_resource_version: std.atomic.Value(u64) = .init(0),
 _native_render_revision: ?u64 = null,

@@ -437,12 +437,12 @@ fn emit_dirty(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
     true
 }
 
-fn note_decision(tag:&str,slot:u32,rect:Option<(f32,f32,f32,f32)>){
+fn note_decision(tag:&str,slot:u32,rect:Option<(f32,f32,f32,f32)>,us:u128){
     use std::io::Write;
     let Some(path)=std::env::var("MIOA_ENGINE_TIMING").ok().filter(|p|!p.is_empty()) else { return };
     let line=match rect {
-        Some((x,y,w,h))=>format!("paint {tag} slot={slot} rect={x:.0},{y:.0},{w:.0},{h:.0}\n"),
-        None=>format!("paint {tag} slot={slot}\n"),
+        Some((x,y,w,h))=>format!("paint {tag} slot={slot} us={us} rect={x:.0},{y:.0},{w:.0},{h:.0}\n"),
+        None=>format!("paint {tag} slot={slot} us={us}\n"),
     };
     if let Ok(mut f)=std::fs::OpenOptions::new().create(true).append(true).open(path){
         let _=f.write_all(line.as_bytes());
@@ -458,8 +458,9 @@ fn emit_frame(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
     let rect=d.dirty.take();
     let has_shadow = shadow_matches(pw,ph);
     if !probe && integral && pw>0 && ph>0 && has_shadow && d.unchanged {
+        let started=std::time::Instant::now();
         if emit_reuse(file,slot,capacity,pw,ph,out) {
-            note_decision("reuse",slot,None);
+            note_decision("reuse",slot,None,started.elapsed().as_micros());
             return true;
         }
     }
@@ -475,18 +476,19 @@ fn emit_frame(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
                 let area=(ox2-ox) as u64*(oy2-oy) as u64;
                 let whole=(pw as u64)*(ph as u64);
                 if area*10 < whole*6 {
+                    let started=std::time::Instant::now();
                     if emit_dirty(d,file,slot,capacity,width,height,scale,ox,oy,ox2,oy2,pw,ph,out) {
-                        note_decision("dirty",slot,rect);
+                        note_decision("dirty",slot,rect,started.elapsed().as_micros());
                         if std::env::var_os("MIOA_PAINT_VERIFY").is_some() {
                             verify_full(d,width,height,scale,out);
                         }
                         return true;
                     }
-                    note_decision("full:dirty-failed",slot,rect);
-                } else { note_decision("full:big-rect",slot,rect); }
-            } else { note_decision("full:snap-none",slot,rect); }
+                    note_decision("full:dirty-failed",slot,rect,0);
+                } else { note_decision("full:big-rect",slot,rect,0); }
+            } else { note_decision("full:snap-none",slot,rect,0); }
         }
-    } else { note_decision(tag,slot,rect); }
+    } else { note_decision(tag,slot,rect,0); }
     emit_full(d,file,slot,capacity,width,height,scale,out)
 }
 

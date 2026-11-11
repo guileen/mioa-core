@@ -456,11 +456,29 @@ pub fn markElementDirty(frame: *Frame, element: ?*Element) void {
     const el = element orelse return;
     const owner = el.ownerFrame(frame) orelse return;
     if (owner != frame) return; // child documents repaint through their own capture
-    const bounds = rect(el, frame) catch return;
-    // Inflate: outlines, shadows and rounded-corner antialiasing paint outside
-    // the border box.
-    const pad: f64 = 8;
-    markDirtyRect(frame, @floatCast(bounds.x - pad), @floatCast(bounds.y - pad), @floatCast(bounds.width + pad * 2), @floatCast(bounds.height + pad * 2));
+    for (frame._paint_elems[0..frame._paint_elems_len]) |existing| {
+        if (existing == el) return;
+    }
+    if (frame._paint_elems_len >= frame._paint_elems.len) return;
+    frame._paint_elems[frame._paint_elems_len] = el;
+    frame._paint_elems_len += 1;
+}
+
+/// Turn the recorded elements into a damage rect. Runs after `document()` so the
+/// rects come from the projection the capture is about to paint.
+fn resolveDirtyElements(frame: *Frame) void {
+    if (frame._paint_elems_len == 0) return;
+    var index: u8 = 0;
+    while (index < frame._paint_elems_len) : (index += 1) {
+        const el = frame._paint_elems[index] orelse continue;
+        const bounds = rect(el, frame) catch continue;
+        // Inflate: outlines, shadows and rounded-corner antialiasing paint
+        // outside the border box.
+        const pad: f64 = 8;
+        markDirtyRect(frame, @floatCast(bounds.x - pad), @floatCast(bounds.y - pad), @floatCast(bounds.width + pad * 2), @floatCast(bounds.height + pad * 2));
+    }
+    frame._paint_elems_len = 0;
+    for (&frame._paint_elems) |*slot| slot.* = null;
 }
 
 pub fn rawFrame(frame: *Frame, path: []const u8, slot: u32) !RawFrame {
@@ -479,6 +497,7 @@ pub fn rawFrame(frame: *Frame, path: []const u8, slot: u32) !RawFrame {
     }
     // A capture whose projection digest equals the published one cannot change a
     // pixel; the renderer republishes its shadow instead of re-rasterising.
+    resolveDirtyElements(frame);
     const unchanged = if (frame._captured_digest) |digest| std.mem.eql(u8, &digest, &frame._layout_digest) else false;
     _ = lp_document_set_frame_unchanged(doc, unchanged);
     if (!lp_document_raw_frame(doc, path.ptr, path.len, slot, view.width, view.height, view.scale, &result)) return error.RawFrameFailed;
