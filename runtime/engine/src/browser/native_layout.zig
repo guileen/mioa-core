@@ -489,6 +489,9 @@ pub fn rawFrame(frame: *Frame, path: []const u8, slot: u32) !RawFrame {
     const t_clear = if (probe) perf.now() else 0;
     var result: RawFrame = .{};
     const doc = try document(frame);
+    // Resolve before publishing the damage: doing it afterwards handed the rect
+    // to the *next* capture, which then usually saw an unchanged projection.
+    resolveDirtyElements(frame);
     if (frame._paint_dirty) |d| {
         _ = lp_document_set_dirty_rect(doc, d[0], d[1], d[2], d[3]);
         frame._paint_dirty = null;
@@ -497,7 +500,6 @@ pub fn rawFrame(frame: *Frame, path: []const u8, slot: u32) !RawFrame {
     }
     // A capture whose projection digest equals the published one cannot change a
     // pixel; the renderer republishes its shadow instead of re-rasterising.
-    resolveDirtyElements(frame);
     const unchanged = if (frame._captured_digest) |digest| std.mem.eql(u8, &digest, &frame._layout_digest) else false;
     _ = lp_document_set_frame_unchanged(doc, unchanged);
     if (!lp_document_raw_frame(doc, path.ptr, path.len, slot, view.width, view.height, view.scale, &result)) return error.RawFrameFailed;
