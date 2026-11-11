@@ -274,6 +274,25 @@ pub unsafe extern "C" fn lp_document_raw_frame(
 struct FrameShadow { pw: u32, ph: u32, pixels: Vec<u8>, tiles: Vec<[u8; 32]> }
 static SHADOW: std::sync::Mutex<Option<FrameShadow>> = std::sync::Mutex::new(None);
 
+/// Which published frame each ring slot currently holds. A reuse into a slot
+/// that already carries this frame needs no write at all; once all three slots
+/// are current, redundant captures become free.
+static SLOT_FRAME: std::sync::Mutex<[u64; 3]> = std::sync::Mutex::new([u64::MAX; 3]);
+static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn frame_seq() -> u64 { FRAME_SEQ.load(std::sync::atomic::Ordering::Acquire) }
+
+fn slot_holds(slot: u32, seq: u64) -> bool {
+    SLOT_FRAME.lock().map(|guard| guard.get(slot as usize).copied() == Some(seq)).unwrap_or(false)
+}
+
+fn mark_published(slot: u32, seq: u64) {
+    if let Ok(mut guard) = SLOT_FRAME.lock() {
+        if let Some(entry) = guard.get_mut(slot as usize) { *entry = seq; }
+    }
+    FRAME_SEQ.store(seq, std::sync::atomic::Ordering::Release);
+}
+
 fn shadow_matches(pw: u32, ph: u32) -> bool {
     SHADOW.lock().map(|guard| guard.as_ref().is_some_and(|s| (s.pw, s.ph) == (pw, ph))).unwrap_or(false)
 }
@@ -368,11 +387,18 @@ pub unsafe extern "C" fn lp_document_set_frame_unchanged(document:*mut Document,
 
 fn emit_reuse(file:&std::fs::File,slot:u32,capacity:u64,pw:u32,ph:u32,out:*mut RawFrame)->bool {
     use std::os::unix::fs::FileExt;
-    let guard = match SHADOW.lock() { Ok(g)=>g, Err(_)=>return false };
-    let Some(shadow)=guard.as_ref() else { return false };
-    if (shadow.pw,shadow.ph)!=(pw,ph) { return false; }
-    if file.write_all_at(&shadow.pixels,slot_base(slot,capacity)).is_err(){ return false; }
-    let fingerprint=fingerprint_from_tiles(&shadow.tiles);
+    let seq=frame_seq();
+    let (fingerprint, wrote) = {
+        let guard = match SHADOW.lock() { Ok(g)=>g, Err(_)=>return false };
+        let Some(shadow)=guard.as_ref() else { return false };
+        if (shadow.pw,shadow.ph)!=(pw,ph) { return false; }
+        let needs_write = !slot_holds(slot,seq);
+        if needs_write && file.write_all_at(&shadow.pixels,slot_base(slot,capacity)).is_err() {
+            return false;
+        }
+        (fingerprint_from_tiles(&shadow.tiles), needs_write)
+    };
+    if wrote { mark_published(slot,seq); }
     let mut theme=[0u8;4];
     let _=file.read_exact_at(&mut theme,slot_base(slot,capacity));
     unsafe { *out=RawFrame{ width:pw,height:ph,stride:pw*4,
@@ -391,6 +417,8 @@ fn emit_full(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
     let tiles=tiles_of(bytes,pw,ph);
     let fingerprint=fingerprint_from_tiles(&tiles);
     store_shadow(pw,ph,bytes.to_vec(),tiles);
+    let seq=frame_seq().wrapping_add(1);
+    mark_published(slot,seq);
     unsafe { *out=RawFrame{ width:pw,height:ph,stride:pw*4,
         theme:u32::from_le_bytes(bytes[..4].try_into().unwrap()), fingerprint }; }
     true
@@ -429,6 +457,8 @@ fn emit_dirty(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
         }
     }
     if file.write_all_at(&shadow.pixels,slot_base(slot,capacity)).is_err(){ return false; }
+    let seq=frame_seq().wrapping_add(1);
+    mark_published(slot,seq);
     let fingerprint=fingerprint_from_tiles(&shadow.tiles);
     let mut theme=[0u8;4];
     let _=file.read_exact_at(&mut theme,slot_base(slot,capacity));
