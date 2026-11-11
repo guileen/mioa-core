@@ -99,6 +99,12 @@ pub fn updateHoverTarget(frame: *Frame, to: ?*Element, emitter: anytype) void {
         return;
     }
     page.input_hover_target = to;
+    // Only the two elements whose hover state flipped are guaranteed to change
+    // appearance; a rule that restyles an ancestor is not describable this way,
+    // so it must fall back to the full-frame path (see markDirtyRect callers).
+    const layout = @import("../native_layout.zig");
+    layout.markElementDirty(frame, from);
+    layout.markElementDirty(frame, to);
     const from_owner = if (from) |el| el.ownerFrame(frame) else null;
     const to_owner = if (to) |el| el.ownerFrame(frame) else null;
     if (from_owner == to_owner) {

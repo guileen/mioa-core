@@ -54,7 +54,7 @@ fn dispatchNativeAction(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
     const loader_id = frame._loader_id;
-    const fingerprint = try @import("../../../browser/native_layout.zig").frameFingerprint(frame);
+    const fingerprint = try @import("../../../browser/native_layout.zig").frameFingerprintCached(frame);
     const hex = std.fmt.bytesToHex(fingerprint, .lower);
     if (!std.mem.eql(u8, &hex, params.expectedRenderFingerprint)) return cmd.sendError(-32042, "stale native render fingerprint", .{});
     var discard: std.Io.Writer.Discarding = .init(&.{});

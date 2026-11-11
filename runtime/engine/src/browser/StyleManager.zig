@@ -19,6 +19,7 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
+const perf = @import("native_layout.zig").perf;
 const Frame = @import("Frame.zig");
 const Viewport = @import("Viewport.zig");
 
@@ -578,6 +579,9 @@ fn rebuildIfDirty(self: *StyleManager) !void {
     if (!self.dirty) {
         return;
     }
+    const probe = perf.enabled();
+    const t_rebuild = if (probe) perf.now() else 0;
+    defer if (probe) perf.log("style", "rebuild_us={d}", .{perf.now() - t_rebuild});
 
     // There are some allocations that only need to live for the duration of
     // this rebuild. Having two arena (build_arena and self.arena) isn't ideal

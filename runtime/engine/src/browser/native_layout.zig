@@ -8,6 +8,44 @@ const Allocator = std.mem.Allocator;
 
 pub const Document = opaque {};
 const Rect = extern struct { x: f64 = 0, y: f64 = 0, width: f64 = 0, height: f64 = 0 };
+/// Env-gated frame-path probes (`MIOA_ENGINE_TIMING=<path>`).
+///
+/// Inlined here on purpose: the desktop bootstrap rebuilds its MANIFEST from
+/// `git ls-files`, so a probe in an untracked file makes every staged bundle
+/// fail as `bootstrap_invalid_bundle` before a single frame is measured.
+///
+/// One `fopen`+`fwrite` per line, so concurrent writers interleave whole lines;
+/// inert unless the variable is set.
+pub const perf = struct {
+    var resolved = false;
+    var destination: ?[*:0]u8 = null;
+
+    pub fn path() ?[*:0]u8 {
+        if (!resolved) {
+            destination = std.c.getenv("MIOA_ENGINE_TIMING");
+            resolved = true;
+        }
+        return destination;
+    }
+
+    pub fn enabled() bool {
+        return path() != null;
+    }
+
+    pub fn now() u64 {
+        return @import("../datetime.zig").microTimestamp(.awake);
+    }
+
+    pub fn log(comptime tag: []const u8, comptime fmt: []const u8, args: anytype) void {
+        const file_path = path() orelse return;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, tag ++ " " ++ fmt ++ "\n", args) catch return;
+        const file = std.c.fopen(file_path, "a") orelse return;
+        defer _ = std.c.fclose(file);
+        _ = std.c.fwrite(line.ptr, 1, line.len, file);
+    }
+};
+
 const Projection = struct {
     key: usize,
     parent: ?usize,
@@ -27,6 +65,22 @@ const Projection = struct {
     selection_focus: ?usize = null,
     selection_node: ?usize = null,
 };
+
+/// Env-gated layout timing (`MIOA_ENGINE_TIMING=<path>`). One appended line per
+/// layout call splits a 30-95 ms frame into projection, JSON serialisation and
+/// the native renderer call, instead of inferring the split from aggregate CPU.
+/// Inert unless the variable is set.
+fn engineTime() u64 {
+    return @import("../datetime.zig").microTimestamp(.awake);
+}
+
+fn appendTiming(path: [*:0]const u8, line: []const u8) void {
+    // The path comes from getenv and is already NUL-terminated; 0.17 has no
+    // std.fs.cwd() and no std.fmt.bufPrintZ, so append through libc.
+    const file = std.c.fopen(path, "a") orelse return;
+    defer _ = std.c.fclose(file);
+    _ = std.c.fwrite(line.ptr, 1, line.len, file);
+}
 
 pub fn viewport(frame: *Frame) @import("Viewport.zig") {
     const result = frame.page.getViewport();
@@ -51,6 +105,9 @@ fn inputTarget(frame: *Frame, target: ?*Element) ?*Element {
 }
 
 pub fn document(frame: *Frame) !*Document {
+    // Zig 0.17 dropped std.posix.getenv; the libc binding is the stable one.
+    const timing_env: ?[*:0]u8 = std.c.getenv("MIOA_ENGINE_TIMING");
+    const t0: u64 = if (timing_env != null) engineTime() else 0;
     const lease = try frame._session.getArena(.large, "native-layout");
     defer lease.release();
     const arena = lease.allocator();
@@ -125,7 +182,9 @@ pub fn document(frame: *Frame) !*Document {
             if (el.hostedShadowRoot(frame)) |shadow| try stack.append(arena, shadow.asNode());
         }
     }
+    const t_proj: u64 = if (timing_env != null) engineTime() else 0;
     const json = try std.json.Stringify.valueAlloc(arena, projected.items, .{});
+    const t_json: u64 = if (timing_env != null) engineTime() else 0;
     const view = viewport(frame);
     const position = [4]f32{ @floatFromInt(view.width), @floatFromInt(view.height), @floatFromInt(frame.window.getScrollX()), @floatFromInt(frame.window.getScrollY()) };
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -138,12 +197,33 @@ pub fn document(frame: *Frame) !*Document {
     hasher.final(&digest);
     if (frame._layout_document != null and std.mem.eql(u8, &digest, &frame._layout_digest)) {
         updateFrameViewports(frame, frame._layout_document.?, projected.items);
+        if (timing_env) |path| {
+            var buf: [192]u8 = undefined;
+            const t_end = engineTime();
+            if (std.fmt.bufPrint(&buf, "layout cached=1 nodes={d} proj_us={d} json_us={d} native_us=0 total_us={d}\n", .{
+                projected.items.len,
+                t_proj - t0,
+                t_json - t_proj,
+                t_end - t0,
+            })) |line| appendTiming(path, line) else |_| {}
+        }
         return frame._layout_document.?;
     }
     const next = lp_document_new(json.ptr, json.len, frame.base().ptr, frame.base().len, position[0], position[1], position[2], position[3], frame, load, surface) orelse return error.LayoutFailed;
     if (frame._layout_document) |old| lp_document_free(old);
     frame._layout_document = next;
     frame._layout_digest = digest;
+    if (timing_env) |path| {
+        var buf: [208]u8 = undefined;
+        const t_end = engineTime();
+        if (std.fmt.bufPrint(&buf, "layout cached=0 nodes={d} proj_us={d} json_us={d} native_us={d} total_us={d}\n", .{
+            projected.items.len,
+            t_proj - t0,
+            t_json - t_proj,
+            t_end - t_json,
+            t_end - t0,
+        })) |line| appendTiming(path, line) else |_| {}
+    }
     updateFrameViewports(frame, next, projected.items);
     return next;
 }
@@ -352,12 +432,61 @@ fn writeBytes(context: *anyopaque, data: [*]const u8, len: usize) callconv(.c) b
 extern "c" fn lp_document_rgba(*Document, *anyopaque, *const fn (*anyopaque, [*]const u8, usize) callconv(.c) bool) bool;
 
 pub const RawFrame = extern struct { width: u32 = 0, height: u32 = 0, stride: u32 = 0, theme: u32 = 0, fingerprint: [32]u8 = undefined };
+
+extern "c" fn lp_document_set_dirty_rect(*Document, f32, f32, f32, f32) bool;
+
+/// Record a document-space rect that the next capture must repaint. Only the
+/// engine knows what it actually changed; a rect list that misses a change
+/// leaves stale pixels, so callers must describe *everything* they touched.
+pub fn markDirtyRect(frame: *Frame, x: f32, y: f32, w: f32, h: f32) void {
+    if (!std.math.isFinite(x) or !std.math.isFinite(y) or !(w > 0) or !(h > 0)) return;
+    if (frame._paint_dirty) |prev| {
+        const x0 = @min(prev[0], x);
+        const y0 = @min(prev[1], y);
+        const x1 = @max(prev[0] + prev[2], x + w);
+        const y1 = @max(prev[1] + prev[3], y + h);
+        frame._paint_dirty = .{ x0, y0, x1 - x0, y1 - y0 };
+    } else {
+        frame._paint_dirty = .{ x, y, w, h };
+    }
+}
+
+pub fn markElementDirty(frame: *Frame, element: ?*Element) void {
+    const el = element orelse return;
+    const owner = el.ownerFrame(frame) orelse return;
+    if (owner != frame) return; // child documents repaint through their own capture
+    const bounds = rect(el, frame) catch return;
+    // Inflate: outlines, shadows and rounded-corner antialiasing paint outside
+    // the border box.
+    const pad: f64 = 8;
+    markDirtyRect(frame, @floatCast(bounds.x - pad), @floatCast(bounds.y - pad), @floatCast(bounds.width + pad * 2), @floatCast(bounds.height + pad * 2));
+}
+
 pub fn rawFrame(frame: *Frame, path: []const u8, slot: u32) !RawFrame {
     const view = frame.page.getViewport();
+    const probe = perf.enabled();
+    const t_begin = if (probe) perf.now() else 0;
     clearPaint(frame);
+    const t_clear = if (probe) perf.now() else 0;
     var result: RawFrame = .{};
-    if (!lp_document_raw_frame(try document(frame), path.ptr, path.len, slot, view.width, view.height, view.scale, &result)) return error.RawFrameFailed;
+    const doc = try document(frame);
+    if (frame._paint_dirty) |d| {
+        _ = lp_document_set_dirty_rect(doc, d[0], d[1], d[2], d[3]);
+        frame._paint_dirty = null;
+    } else {
+        _ = lp_document_set_dirty_rect(doc, 0, 0, 0, 0); // drop any stale request
+    }
+    if (!lp_document_raw_frame(doc, path.ptr, path.len, slot, view.width, view.height, view.scale, &result)) return error.RawFrameFailed;
+    const t_paint = if (probe) perf.now() else 0;
     result.fingerprint = try scopedFingerprint(frame, result.fingerprint);
+    frame._captured_fingerprint = result.fingerprint;
+    frame._captured_digest = frame._layout_digest;
+    if (probe) {
+        const t_end = perf.now();
+        perf.log("frame", "clear_us={d} paint_us={d} fp_us={d} total_us={d} w={d} h={d}", .{
+            t_clear - t_begin, t_paint - t_clear, t_end - t_paint, t_end - t_begin, result.width, result.height,
+        });
+    }
     return result;
 }
 extern "c" fn lp_document_raw_frame(*Document, [*]const u8, usize, u32, u32, u32, f32, *RawFrame) bool;
@@ -373,21 +502,41 @@ pub fn frameFingerprint(frame: *Frame) ![32]u8 {
     if (!lp_document_frame_fingerprint(try document(frame), view.width, view.height, view.scale, &pixels)) return error.RawFrameFailed;
     return scopedFingerprint(frame, pixels);
 }
+/// Fingerprint of the frame the client has on screen, reused while the document
+/// digest still matches the capture.
+///
+/// `document()` here is ~0.1-1.2 ms and refreshes `_layout_digest`, so the reuse
+/// key can never claim a stale frame; a miss falls back to the authoritative
+/// repaint. This removes the full-viewport raster that every native input used
+/// to pay just to recompute the fingerprint it was handed.
+pub fn frameFingerprintCached(frame: *Frame) ![32]u8 {
+    _ = try document(frame);
+    if (frame._captured_fingerprint) |cached| {
+        if (frame._captured_digest) |digest| {
+            if (std.mem.eql(u8, &digest, &frame._layout_digest)) return cached;
+        }
+    }
+    return frameFingerprint(frame);
+}
+
 fn scopedFingerprint(frame: *Frame, pixels: [32]u8) ![32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(&pixels);
-    try hashDocumentTree(frame, &hasher);
+    try hashDocumentTree(frame, &hasher, true);
     var result: [32]u8 = undefined;
     hasher.final(&result);
     return result;
 }
-fn hashDocumentTree(frame: *Frame, hasher: *std.crypto.hash.sha2.Sha256) !void {
-    _ = try document(frame);
+fn hashDocumentTree(frame: *Frame, hasher: *std.crypto.hash.sha2.Sha256, refreshed: bool) !void {
+    // The root was projected by the caller (rawFrame / frameFingerprint), so a
+    // second full projection there is pure waste; child frames still need it or
+    // their `_layout_digest` would be stale.
+    if (!refreshed) _ = try document(frame);
     hasher.update(std.mem.asBytes(&frame._frame_id));
     hasher.update(std.mem.asBytes(&frame._loader_id));
     hasher.update(&frame._layout_digest);
     hasher.update(std.mem.asBytes(&frame.page.style_version));
-    for (frame.child_frames.items) |child| try hashDocumentTree(child, hasher);
+    for (frame.child_frames.items) |child| try hashDocumentTree(child, hasher, false);
 }
 extern "c" fn lp_document_frame_fingerprint(*Document, u32, u32, f32, *[32]u8) bool;
 

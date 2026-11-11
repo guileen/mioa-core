@@ -146,6 +146,13 @@ _style_manager: StyleManager,
 _script_manager: ScriptManager,
 _layout_document: ?*@import("native_layout.zig").Document = null,
 _layout_digest: [32]u8 = undefined,
+// The pixel fingerprint and layout digest of the last frame actually rastered.
+// Input validation reuses them while the document digest still matches, which
+// turns a ~30 ms full-viewport repaint into a ~0.1 ms digest compare.
+_captured_fingerprint: ?[32]u8 = null,
+_captured_digest: ?[32]u8 = null,
+// Document-space rect the next capture must repaint; null means full frame.
+_paint_dirty: ?[4]f32 = null,
 _render_resources: std.StringHashMapUnmanaged([]const u8) = .empty,
 _render_resource_version: std.atomic.Value(u64) = .init(0),
 _native_render_revision: ?u64 = null,

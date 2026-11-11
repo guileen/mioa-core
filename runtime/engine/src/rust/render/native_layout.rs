@@ -20,7 +20,12 @@ pub struct Document {
     ids: HashMap<usize, NodeId>, keys: HashMap<NodeId, usize>, scroll: ResolvedScrollState,
     context: *mut c_void, surface: Surface,
     painted: bool,
+    // CSS-px, document-space rect the next capture may repaint instead of the
+    // whole viewport. Only the caller knows what it changed.
+    dirty: Option<(f32, f32, f32, f32)>,
 }
+
+const TILE_PX: u32 = 128;
 #[repr(C)]
 pub struct Rect { x: f64, y: f64, width: f64, height: f64 }
 #[repr(C)]
@@ -94,7 +99,7 @@ pub unsafe extern "C" fn lp_document_new(
         });
         let prepared = obscura_render::prepare_dom_with_dynamic_fonts(&tree,(width,height),Some(base),&mut resources,&[])?;
         let scroll = prepared.resolve_scroll_state(&tree,(x,y),&requested);
-        Some(Box::into_raw(Box::new(Document { tree,prepared,resources,ids,keys,scroll,context,surface,painted:false })))
+        Some(Box::into_raw(Box::new(Document { tree,prepared,resources,ids,keys,scroll,context,surface,painted:false, dirty:None })))
     })).ok().flatten().unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
@@ -253,28 +258,236 @@ pub unsafe extern "C" fn lp_document_raw_frame(
         if file.read_exact_at(&mut header,0).is_err() || u32::from_le_bytes(header[0..4].try_into().unwrap()) != 0x4c504652
             || u16::from_le_bytes(header[4..6].try_into().unwrap()) != 2
             || u32::from_le_bytes(header[12..16].try_into().unwrap()) as u64 != capacity { return false; }
-        let Some(image) = paint_raw_frame(d,width,height,scale) else { return false };
-        let bytes = image.data();
-        if bytes.len() as u64 > capacity || bytes.len() < 4 { return false; }
-        if file.write_all_at(bytes,64 + slot as u64 * (64 + capacity) + 64).is_err() { return false; }
-        use sha2::{Digest,Sha256};
-        *out = RawFrame { width:image.width(),height:image.height(),stride:image.width()*4,
-                          theme:u32::from_le_bytes(bytes[..4].try_into().unwrap()),
-                          fingerprint:Sha256::digest(bytes).into() };
-        true
+        emit_frame(d,&file,slot,capacity,width,height,scale,out)
     })).unwrap_or(false)
+}
+
+
+/// The renderer re-parses the document on every capture (hover changes the
+/// projection digest) and the client rotates the frame ring, so patching a slot
+/// in place is unsafe on both counts. Instead the partial paint is composited
+/// into a process-level shadow of the *current* frame and the whole shadow is
+/// published: one 3.9-15.6 MB write instead of a 30 ms full raster.
+struct FrameShadow { pw: u32, ph: u32, pixels: Vec<u8>, tiles: Vec<[u8; 32]> }
+static SHADOW: std::sync::Mutex<Option<FrameShadow>> = std::sync::Mutex::new(None);
+
+fn shadow_matches(pw: u32, ph: u32) -> bool {
+    SHADOW.lock().map(|guard| guard.as_ref().is_some_and(|s| (s.pw, s.ph) == (pw, ph))).unwrap_or(false)
+}
+
+fn store_shadow(pw: u32, ph: u32, pixels: Vec<u8>, tiles: Vec<[u8; 32]>) {
+    if let Ok(mut guard) = SHADOW.lock() {
+        *guard = Some(FrameShadow { pw, ph, pixels, tiles });
+    }
+}
+
+fn tile_geometry(pw:u32,ph:u32)->(u32,u32){
+    ((pw+TILE_PX-1)/TILE_PX,(ph+TILE_PX-1)/TILE_PX)
+}
+
+fn fingerprint_from_tiles(tiles:&[[u8;32]])->[u8;32]{
+    use sha2::{Digest,Sha256};
+    let mut h=Sha256::new();
+    for t in tiles { h.update(t); }
+    h.finalize().into()
+}
+
+/// Digest of one tile, read from `src` whose top-left is (ox,oy) in device px.
+fn hash_tile(src:&[u8],iw:u32,ox:u32,oy:u32,tx:u32,ty:u32,pw:u32,ph:u32)->[u8;32]{
+    use sha2::{Digest,Sha256};
+    let mut h=Sha256::new();
+    let x0=tx*TILE_PX; let y0=ty*TILE_PX;
+    let x1=(x0+TILE_PX).min(pw); let y1=(y0+TILE_PX).min(ph);
+    let (Some(rx),Some(_ry))=(x0.checked_sub(ox),y0.checked_sub(oy)) else { return h.finalize().into() };
+    for y in y0..y1 {
+        let row=((y-oy) as usize)*(iw as usize)*4;
+        let start=row+(rx as usize)*4;
+        let end=row+((x1-ox) as usize)*4;
+        if end <= src.len() && start <= end { h.update(&src[start..end]); }
+    }
+    h.finalize().into()
+}
+
+fn tiles_of(src:&[u8],pw:u32,ph:u32)->Vec<[u8;32]>{
+    let (tw,th)=tile_geometry(pw,ph);
+    let mut tiles=Vec::with_capacity((tw as usize)*(th as usize));
+    for ty in 0..th { for tx in 0..tw { tiles.push(hash_tile(src,pw,0,0,tx,ty,pw,ph)); } }
+    tiles
+}
+
+/// Snap a CSS-px rect outward to the tile grid of the device-space viewport.
+fn snap_rect(x:f32,y:f32,w:f32,h:f32,scale:f32,pw:u32,ph:u32)->Option<(u32,u32,u32,u32)>{
+    let s=scale as f64;
+    let t=TILE_PX as i64;
+    let mut x0=((x as f64)*s).floor().max(0.0) as i64;
+    let mut y0=((y as f64)*s).floor().max(0.0) as i64;
+    let mut x1=(((x as f64)+(w as f64))*s).ceil() as i64;
+    let mut y1=(((y as f64)+(h as f64))*s).ceil() as i64;
+    x1=x1.min(pw as i64); y1=y1.min(ph as i64);
+    if x0>=x1 || y0>=y1 { return None; }
+    x0=(x0/t)*t; y0=(y0/t)*t;
+    x1=(((x1+t-1)/t)*t).min(pw as i64);
+    y1=(((y1+t-1)/t)*t).min(ph as i64);
+    if x0>=x1 || y0>=y1 { return None; }
+    Some((x0 as u32,y0 as u32,x1 as u32,y1 as u32))
+}
+
+fn slot_base(slot:u32,capacity:u64)->u64{ 64 + slot as u64 * (64 + capacity) + 64 }
+
+/// CSS-px, document-space rect for the next capture. A zero rect clears it.
+#[no_mangle]
+pub unsafe extern "C" fn lp_document_set_dirty_rect(
+    document:*mut Document,x:f32,y:f32,width:f32,height:f32,
+)->bool {
+    let Some(d)=document.as_mut() else { return false };
+    if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite())
+        || width <= 0.0 || height <= 0.0 { d.dirty=None; return false; }
+    d.dirty = Some(match d.dirty {
+        None => (x,y,width,height),
+        Some((ax,ay,aw,ah)) => {
+            let x0=ax.min(x); let y0=ay.min(y);
+            let x1=(ax+aw).max(x+width); let y1=(ay+ah).max(y+height);
+            (x0,y0,x1-x0,y1-y0)
+        }
+    });
+    true
+}
+
+fn emit_full(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
+             width:u32,height:u32,scale:f32,out:*mut RawFrame)->bool {
+    use std::os::unix::fs::FileExt;
+    let Some(image)=paint_raw_frame(d,width,height,scale) else { return false };
+    let bytes=image.data();
+    if bytes.len() as u64>capacity || bytes.len()<4 { return false; }
+    if file.write_all_at(bytes,slot_base(slot,capacity)).is_err(){ return false; }
+    let pw=image.width(); let ph=image.height();
+    let tiles=tiles_of(bytes,pw,ph);
+    let fingerprint=fingerprint_from_tiles(&tiles);
+    store_shadow(pw,ph,bytes.to_vec(),tiles);
+    unsafe { *out=RawFrame{ width:pw,height:ph,stride:pw*4,
+        theme:u32::from_le_bytes(bytes[..4].try_into().unwrap()), fingerprint }; }
+    true
+}
+
+fn emit_dirty(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
+              _width:u32,_height:u32,scale:f32,
+              ox:u32,oy:u32,ox2:u32,oy2:u32,pw:u32,ph:u32,out:*mut RawFrame)->bool {
+    use std::os::unix::fs::FileExt;
+    let s=scale as u32;
+    if s==0 { return false; }
+    let (dx,dy)=(ox/s,oy/s);
+    let (dw,dh)=((ox2-ox)/s,(oy2-oy)/s);
+    if dw==0 || dh==0 { return false; }
+    let Some(image)=paint_raw_frame_region(d,dx as f32,dy as f32,dw as f32,dh as f32,scale) else { return false };
+    let iw=image.width();
+    if iw < ox2-ox || image.height() < oy2-oy { return false; }
+    let src=image.data();
+    let row_bytes=((ox2-ox) as usize)*4;
+    let mut guard = match SHADOW.lock() { Ok(g)=>g, Err(_)=>return false };
+    let Some(shadow)=guard.as_mut() else { return false };
+    if (shadow.pw,shadow.ph)!=(pw,ph) || shadow.pixels.len()!=(pw as usize)*(ph as usize)*4 { return false; }
+    for row in 0..(oy2-oy) as usize {
+        let s_off=row*(iw as usize)*4;
+        let d_off=((oy as usize)+row)*(pw as usize)*4+(ox as usize)*4;
+        if s_off+row_bytes>src.len() || d_off+row_bytes>shadow.pixels.len() { return false; }
+        shadow.pixels[d_off..d_off+row_bytes].copy_from_slice(&src[s_off..s_off+row_bytes]);
+    }
+    let (tw,th)=tile_geometry(pw,ph);
+    if shadow.tiles.len()!=(tw as usize)*(th as usize) { return false; }
+    for ty in (oy/TILE_PX)..((oy2+TILE_PX-1)/TILE_PX) {
+        for tx in (ox/TILE_PX)..((ox2+TILE_PX-1)/TILE_PX) {
+            let idx=(ty*tw+tx) as usize;
+            if idx>=shadow.tiles.len() { continue; }
+            shadow.tiles[idx]=hash_tile(&shadow.pixels,pw,0,0,tx,ty,pw,ph);
+        }
+    }
+    if file.write_all_at(&shadow.pixels,slot_base(slot,capacity)).is_err(){ return false; }
+    let fingerprint=fingerprint_from_tiles(&shadow.tiles);
+    let mut theme=[0u8;4];
+    let _=file.read_exact_at(&mut theme,slot_base(slot,capacity));
+    unsafe { *out=RawFrame{ width:pw,height:ph,stride:pw*4,
+        theme:u32::from_le_bytes(theme), fingerprint }; }
+    true
+}
+
+fn note_decision(tag:&str,slot:u32,rect:Option<(f32,f32,f32,f32)>){
+    use std::io::Write;
+    let Some(path)=std::env::var("MIOA_ENGINE_TIMING").ok().filter(|p|!p.is_empty()) else { return };
+    let line=match rect {
+        Some((x,y,w,h))=>format!("paint {tag} slot={slot} rect={x:.0},{y:.0},{w:.0},{h:.0}\n"),
+        None=>format!("paint {tag} slot={slot}\n"),
+    };
+    if let Ok(mut f)=std::fs::OpenOptions::new().create(true).append(true).open(path){
+        let _=f.write_all(line.as_bytes());
+    }
+}
+
+fn emit_frame(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
+              width:u32,height:u32,scale:f32,out:*mut RawFrame)->bool {
+    let pw=(width as f64*scale as f64).ceil() as u32;
+    let ph=(height as f64*scale as f64).ceil() as u32;
+    let probe=std::env::var_os("MIOA_PAINT_PROBE").is_some();
+    let integral=scale.fract()==0.0 && scale>=1.0;
+    let rect=d.dirty.take();
+    let has_shadow = shadow_matches(pw,ph);
+    let tag = if probe { "full:probe" }
+        else if !integral { "full:scale" }
+        else if pw==0 || ph==0 { "full:size" }
+        else if !has_shadow { "full:no-shadow" }
+        else if rect.is_none() { "full:no-rect" }
+        else { "" };
+    if tag.is_empty() {
+        if let Some((x,y,w,h))=rect {
+            if let Some((ox,oy,ox2,oy2))=snap_rect(x,y,w,h,scale,pw,ph) {
+                let area=(ox2-ox) as u64*(oy2-oy) as u64;
+                let whole=(pw as u64)*(ph as u64);
+                if area*10 < whole*6 {
+                    if emit_dirty(d,file,slot,capacity,width,height,scale,ox,oy,ox2,oy2,pw,ph,out) {
+                        note_decision("dirty",slot,rect);
+                        if std::env::var_os("MIOA_PAINT_VERIFY").is_some() {
+                            verify_full(d,width,height,scale,out);
+                        }
+                        return true;
+                    }
+                    note_decision("full:dirty-failed",slot,rect);
+                } else { note_decision("full:big-rect",slot,rect); }
+            } else { note_decision("full:snap-none",slot,rect); }
+        }
+    } else { note_decision(tag,slot,rect); }
+    emit_full(d,file,slot,capacity,width,height,scale,out)
+}
+
+fn verify_full(d:&mut Document,width:u32,height:u32,scale:f32,out:*mut RawFrame) {
+    use std::io::Write;
+    let Some(path)=std::env::var("MIOA_PAINT_VERIFY").ok().filter(|p|!p.is_empty()) else { return };
+    let Some(image)=paint_raw_frame(d,width,height,scale) else { return };
+    let (pw,ph)=(image.width(),image.height());
+    let want=fingerprint_from_tiles(&tiles_of(image.data(),pw,ph));
+    let got=unsafe{(*out).fingerprint};
+    let line=if want==got { "ok\n" } else { "mismatched dirty frame\n" };
+    if let Ok(mut f)=std::fs::OpenOptions::new().create(true).append(true).open(path){
+        let _=f.write_all(line.as_bytes());
+    }
 }
 
 fn paint_raw_frame(d:&mut Document,width:u32,height:u32,scale:f32)->Option<tiny_skia::Pixmap> {
     if width==0 || height==0 || !scale.is_finite() || !(0.25..=8.).contains(&scale) {return None;}
+    // Measurement probe: clamp the painted area so fixed and per-pixel costs can
+    // be separated. Inert unless MIOA_PAINT_PROBE is set.
+    let (width, height) = match std::env::var("MIOA_PAINT_PROBE").ok().and_then(|v| v.parse::<u32>().ok()) {
+        Some(cap) if cap > 0 => (width.min(cap), height.min(cap)),
+        _ => (width, height),
+    };
+    paint_raw_frame_region(d,0.0,0.0,width as f32,height as f32,scale)
+}
+
+fn paint_raw_frame_region(d:&mut Document,dx:f32,dy:f32,width:f32,height:f32,scale:f32)->Option<tiny_skia::Pixmap> {
+    if width<=0.0 || height<=0.0 || !scale.is_finite() || !(0.25..=8.).contains(&scale) {return None;}
     let pw=(width as f64*scale as f64).ceil() as u64;
     let ph=(height as f64*scale as f64).ceil() as u64;
     if pw.checked_mul(ph)?.checked_mul(4)? > 3840*2160*4 {return None;}
-    // CaptureRegion is in document space; the live viewport starts at the
-    // resolved root scroll, not at the document origin. Container movement and
-    // fixed/sticky positioning remain owned by the shared scroll snapshot.
     let root=d.scroll.root_offset();
-    let region=obscura_render::CaptureRegion::new(root.0,root.1,width as f32,height as f32,scale);
+    let region=obscura_render::CaptureRegion::new(root.0+dx,root.1+dy,width,height,scale);
     let surfaces=Surfaces{keys:&d.keys,context:d.context,surface:d.surface};
     let image=obscura_render::paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
         &d.tree,&mut d.prepared,&mut d.resources,&d.scroll,region,[255,255,255,255],&surfaces,
@@ -288,11 +501,11 @@ pub unsafe extern "C" fn lp_document_frame_fingerprint(
     document:*mut Document,width:u32,height:u32,scale:f32,out:*mut u8,
 )->bool {
     catch_unwind(AssertUnwindSafe(|| {
-        use sha2::{Digest,Sha256};
         let Some(d)=document.as_mut()else{return false};
         if out.is_null(){return false;}
         let Some(image)=paint_raw_frame(d,width,height,scale)else{return false};
-        let digest=Sha256::digest(image.data());
+        let (pw,ph)=(image.width(),image.height());
+        let digest=fingerprint_from_tiles(&tiles_of(image.data(),pw,ph));
         std::ptr::copy_nonoverlapping(digest.as_ptr(),out,32);
         true
     })).unwrap_or(false)
