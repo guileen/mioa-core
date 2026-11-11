@@ -23,6 +23,9 @@ pub struct Document {
     // CSS-px, document-space rect the next capture may repaint instead of the
     // whole viewport. Only the caller knows what it changed.
     dirty: Option<(f32, f32, f32, f32)>,
+    // The caller proved the projected frame is byte-identical to the last one,
+    // so the shadow can be republished without touching the rasteriser.
+    unchanged: bool,
 }
 
 const TILE_PX: u32 = 128;
@@ -99,7 +102,7 @@ pub unsafe extern "C" fn lp_document_new(
         });
         let prepared = obscura_render::prepare_dom_with_dynamic_fonts(&tree,(width,height),Some(base),&mut resources,&[])?;
         let scroll = prepared.resolve_scroll_state(&tree,(x,y),&requested);
-        Some(Box::into_raw(Box::new(Document { tree,prepared,resources,ids,keys,scroll,context,surface,painted:false, dirty:None })))
+        Some(Box::into_raw(Box::new(Document { tree,prepared,resources,ids,keys,scroll,context,surface,painted:false, dirty:None, unchanged:false })))
     })).ok().flatten().unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
@@ -353,6 +356,30 @@ pub unsafe extern "C" fn lp_document_set_dirty_rect(
     true
 }
 
+/// Declare that the projected frame equals the last published one. The renderer
+/// then republishes the shadow instead of re-rasterising: the frame ring rotates,
+/// so the slot still needs the bytes even when the content did not change.
+#[no_mangle]
+pub unsafe extern "C" fn lp_document_set_frame_unchanged(document:*mut Document, unchanged: bool) -> bool {
+    let Some(d)=document.as_mut() else { return false };
+    d.unchanged = unchanged;
+    true
+}
+
+fn emit_reuse(file:&std::fs::File,slot:u32,capacity:u64,pw:u32,ph:u32,out:*mut RawFrame)->bool {
+    use std::os::unix::fs::FileExt;
+    let guard = match SHADOW.lock() { Ok(g)=>g, Err(_)=>return false };
+    let Some(shadow)=guard.as_ref() else { return false };
+    if (shadow.pw,shadow.ph)!=(pw,ph) { return false; }
+    if file.write_all_at(&shadow.pixels,slot_base(slot,capacity)).is_err(){ return false; }
+    let fingerprint=fingerprint_from_tiles(&shadow.tiles);
+    let mut theme=[0u8;4];
+    let _=file.read_exact_at(&mut theme,slot_base(slot,capacity));
+    unsafe { *out=RawFrame{ width:pw,height:ph,stride:pw*4,
+        theme:u32::from_le_bytes(theme), fingerprint }; }
+    true
+}
+
 fn emit_full(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
              width:u32,height:u32,scale:f32,out:*mut RawFrame)->bool {
     use std::os::unix::fs::FileExt;
@@ -430,6 +457,12 @@ fn emit_frame(d:&mut Document,file:&std::fs::File,slot:u32,capacity:u64,
     let integral=scale.fract()==0.0 && scale>=1.0;
     let rect=d.dirty.take();
     let has_shadow = shadow_matches(pw,ph);
+    if !probe && integral && pw>0 && ph>0 && has_shadow && d.unchanged {
+        if emit_reuse(file,slot,capacity,pw,ph,out) {
+            note_decision("reuse",slot,None);
+            return true;
+        }
+    }
     let tag = if probe { "full:probe" }
         else if !integral { "full:scale" }
         else if pw==0 || ph==0 { "full:size" }

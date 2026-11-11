@@ -434,6 +434,7 @@ extern "c" fn lp_document_rgba(*Document, *anyopaque, *const fn (*anyopaque, [*]
 pub const RawFrame = extern struct { width: u32 = 0, height: u32 = 0, stride: u32 = 0, theme: u32 = 0, fingerprint: [32]u8 = undefined };
 
 extern "c" fn lp_document_set_dirty_rect(*Document, f32, f32, f32, f32) bool;
+extern "c" fn lp_document_set_frame_unchanged(*Document, bool) bool;
 
 /// Record a document-space rect that the next capture must repaint. Only the
 /// engine knows what it actually changed; a rect list that misses a change
@@ -476,6 +477,10 @@ pub fn rawFrame(frame: *Frame, path: []const u8, slot: u32) !RawFrame {
     } else {
         _ = lp_document_set_dirty_rect(doc, 0, 0, 0, 0); // drop any stale request
     }
+    // A capture whose projection digest equals the published one cannot change a
+    // pixel; the renderer republishes its shadow instead of re-rasterising.
+    const unchanged = if (frame._captured_digest) |digest| std.mem.eql(u8, &digest, &frame._layout_digest) else false;
+    _ = lp_document_set_frame_unchanged(doc, unchanged);
     if (!lp_document_raw_frame(doc, path.ptr, path.len, slot, view.width, view.height, view.scale, &result)) return error.RawFrameFailed;
     const t_paint = if (probe) perf.now() else 0;
     result.fingerprint = try scopedFingerprint(frame, result.fingerprint);
