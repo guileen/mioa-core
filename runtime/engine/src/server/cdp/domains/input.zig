@@ -59,7 +59,12 @@ fn dispatchNativeAction(cmd: *CDP.Command) !void {
     const t_action = if (probe) perf.now() else 0;
     defer if (probe) perf.log("input", "kind=native events={d} us={d}", .{ params.events.len, perf.now() - t_action });
     const t_fp = if (probe) perf.now() else 0;
-    const fingerprint = try @import("../../../browser/native_layout.zig").frameFingerprintCached(frame);
+    // The caller references the frame it was last handed, so validate against
+    // the *published* fingerprint. Recomputing the live one rejects the first
+    // input after any DOM change that has not been captured yet - which hover
+    // does on every transition.
+    const native_layout = @import("../../../browser/native_layout.zig");
+    const fingerprint = if (frame._captured_fingerprint) |published| published else try native_layout.frameFingerprintCached(frame);
     if (probe) perf.log("input", "kind=fingerprint us={d}", .{perf.now() - t_fp});
     const hex = std.fmt.bytesToHex(fingerprint, .lower);
     if (!std.mem.eql(u8, &hex, params.expectedRenderFingerprint)) return cmd.sendError(-32042, "stale native render fingerprint", .{});
