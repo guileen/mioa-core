@@ -1,0 +1,142 @@
+{
+  "schema": 1,
+  "scope": "80 html5lib entity tokenizer expectations projected into DOM text/attribute observations, five explicit WHATWG named/numeric supplements and finite Canvas RGBA export; not tokenizer error-event or WPT conformance",
+  "corpus": {
+    "id": "html5lib-tests/tokenizer/entities.test",
+    "revision": "c5495c539ca8a79c3c5107f5f14010bcff9a35d5",
+    "url": "https://raw.githubusercontent.com/html5lib/html5lib-tests/c5495c539ca8a79c3c5107f5f14010bcff9a35d5/tokenizer/entities.test",
+    "sha256": "fe17483810a00247579f5f129ca9c007fbab6755ba839523e29aa9f8875f4085",
+    "license": "MIT",
+    "license_file": "LICENSE.html5lib-tests",
+    "license_sha256": "ff512aac9ef231d504be5afaf4429005024e4b2aaf257be39524f37b8402aaf2"
+  },
+  "selection": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70,
+    71,
+    72,
+    73,
+    74,
+    75,
+    76,
+    77,
+    78,
+    79
+  ],
+  "whatwg_supplement": [
+    {"id": "whatwg-two-codepoint-text", "context": "dom-text", "input": "&NotEqualTilde;", "expected": "\u2242\u0338"},
+    {"id": "whatwg-astral-text", "context": "dom-text", "input": "&Afr;", "expected": "\ud835\udd04"},
+    {"id": "whatwg-two-codepoint-attribute", "context": "dom-attribute", "input": "<h a='&NotEqualTilde;'>", "expected": "\u2242\u0338"},
+    {"id": "whatwg-invalid-numeric", "context": "dom-text", "input": "&#0;&#xD800;&#x110000;", "expected": "\ufffd\ufffd\ufffd"},
+    {"id": "whatwg-nonrecursive-reference", "context": "dom-text", "input": "&amp;lt;", "expected": "&lt;"}
+  ],
+  "oracle": {
+    "entities": "https://html.spec.whatwg.org/multipage/parsing.html#character-reference-state",
+    "attributes": "https://html.spec.whatwg.org/multipage/parsing.html#named-character-reference-state",
+    "canvas": "https://html.spec.whatwg.org/multipage/canvas.html#pixel-manipulation"
+  },
+  "normalization": [
+    "Attribute order is not observed; selected cases have one attribute.",
+    "Character-token segmentation is projected to DOM textContent.",
+    "Compare exact Unicode strings and exact RGBA bytes, never trim whitespace or normalize Unicode.",
+    "PNG compression/chunk bytes are not compared; independent decoded pixels are exact."
+  ],
+  "gaps": [
+    "Browser DOM does not expose tokenizer parse-error events: corpus errors metadata retained, not asserted.",
+    "Primitive entity lookup is a separate native contract and does not establish tokenizer behavior.",
+    "WPT requires an official checkout/runner and a supported Mioa product integration; no built-in Mioa WPT product adapter is provided."
+  ],
+  "dependencies": {
+    "playwright": "1.56.0",
+    "chromium": {
+      "revision": "1194",
+      "version": "141.0.7390.37"
+    },
+    "firefox": {
+      "revision": "1495",
+      "version": "142.0.1"
+    }
+  },
+  "optional_p1_fuzz_tools": {
+    "status": "NOT_RUN",
+    "tools": [
+      "Domato",
+      "Fuzzilli",
+      "AFL++"
+    ],
+    "reason": "Optional campaigns are not prerequisites or claimed executions; dedicated structured primitive campaigns run through the separate quality fuzz entry."
+  },
+  "wpt": {
+    "status": "NOT_RUN",
+    "reason": "No WPT runner requested by default; official tooling delegation is explicit. Exit zero alone never proves test outcomes."
+  }
+}

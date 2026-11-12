@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "scope": "Required harness identities for the isolated Entities/PNG closure; not product wording or general conformance.",
+  "required_native_test_count": 13,
+  "required_native_tests": [
+    {"id": "native.import-quality", "name": "native_quality_tests.test_0"},
+    {"id": "png.public-complete-publication", "name": "native_quality_tests.test.quality: public PNG callback publishes one complete image or nothing"},
+    {"id": "png.straight-alpha-geometry-checksums", "name": "browser.png.test.PNG preserves straight alpha, row boundaries, dimensions and checksums"},
+    {"id": "png.multi-window-compression", "name": "browser.png.test.PNG compression remains effective across multiple history windows"},
+    {"id": "png.invalid-input-before-allocation", "name": "browser.png.test.PNG rejects empty, oversized and mismatched RGBA inputs before allocating"},
+    {"id": "png.allocation-failure-cleanup", "name": "browser.png.test.PNG propagates every allocation failure without leaking"},
+    {"id": "png.callback-rejection-errors", "name": "browser.png.test.PNG callback ABI propagates rejection and encoding errors"},
+    {"id": "native.import-maintained", "name": "native_tests.test_0"},
+    {"id": "entities.prefix-exact-dead-output", "name": "browser.entities.test.entities: prefixes, exact matches, and dead ends preserve output"},
+    {"id": "entities.shorter-exact-ambiguity", "name": "browser.entities.test.entities: longest ambiguity retains the shorter exact name"},
+    {"id": "entities.case-legacy", "name": "browser.entities.test.entities: case and legacy semicolon aliases"},
+    {"id": "entities.multi-scalar-astral-longest", "name": "browser.entities.test.entities: two scalars, astral characters, and longest name"},
+    {"id": "entities.invalid-input-output", "name": "browser.entities.test.entities: invalid UTF-8 and non-ASCII never match or modify output"}
+  ],
+  "entity_table_entries": 2231,
+  "mutation_modules": {
+    "entities.zig": {"test_helper_boundary": "\nconst testing = std.testing;\n"},
+    "png.zig": {"test_helper_boundary": "\n// This parser deliberately checks framing/CRC separately from encoder helpers;\n"}
+  }
+}

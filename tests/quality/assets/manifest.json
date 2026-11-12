@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "files": {
+    "entities.json": {
+      "url": "https://raw.githubusercontent.com/whatwg/html-build/283a3531a61106d07d9a7d9fb3e6f3b9bfd33d70/entities/out/entities.json",
+      "sha256": "d741d877ac77c4194c4ad526b5b4a19aef8dfe411ab840a466891cdbb9f362e6",
+      "bytes": 145897
+    },
+    "WHATWG-LICENSE": {
+      "url": "https://raw.githubusercontent.com/whatwg/html-build/283a3531a61106d07d9a7d9fb3e6f3b9bfd33d70/LICENSE",
+      "sha256": "85dc6f5ccb57a6fe8c33d158f9fc8fc7ee5655a5d3db2cdd131c6a3d0f48a864",
+      "bytes": 16315
+    },
+    "WHATWG-entities-README": {
+      "url": "https://raw.githubusercontent.com/whatwg/html-build/283a3531a61106d07d9a7d9fb3e6f3b9bfd33d70/entities/README.md",
+      "sha256": "3e3c80fcbfaf10cee516dd43a795a6e61fa17efacd8a29866c9ff576dc758f8b",
+      "bytes": 755
+    },
+    "basn6a08.png": {
+      "url": "https://raw.githubusercontent.com/pnggroup/libpng/2b978915d82377df13fcbb1fb56660195ded868a/contrib/pngsuite/basn6a08.png",
+      "sha256": "756a03364c02e3c9f85d6f4029eb3cef2488c081dc537d46e102bebcb9e02732",
+      "bytes": 184
+    },
+    "PNGSUITE-README": {
+      "url": "https://raw.githubusercontent.com/pnggroup/libpng/2b978915d82377df13fcbb1fb56660195ded868a/contrib/pngsuite/README",
+      "sha256": "0b8b3ace979daa00b182a3972e82523ec4701635add93a959422b9013c125439",
+      "bytes": 3773
+    },
+    "LIBPNG-LICENSE": {
+      "url": "https://raw.githubusercontent.com/pnggroup/libpng/2b978915d82377df13fcbb1fb56660195ded868a/LICENSE",
+      "sha256": "16d9daaafbf63a31a5bdc91d4600972548fef5aaa1244202393288dbd079c49a",
+      "bytes": 5345
+    },
+    "libpng-pngtest.c": {
+      "url": "https://raw.githubusercontent.com/pnggroup/libpng/2b978915d82377df13fcbb1fb56660195ded868a/pngtest.c",
+      "sha256": "a2cea732b2c368b2665f0a43a7ab87db69941fa89fd53dd71908ef672ed31cba",
+      "bytes": 64479
+    }
+  },
+  "corpora": [
+    {
+      "id": "whatwg-named-character-references",
+      "revision": "283a3531a61106d07d9a7d9fb3e6f3b9bfd33d70",
+      "path": "entities.json",
+      "sha256": "d741d877ac77c4194c4ad526b5b4a19aef8dfe411ab840a466891cdbb9f362e6",
+      "license": "WHATWG-LICENSE",
+      "source": "https://github.com/whatwg/html-build",
+      "scope": "Complete checked-in entities.json; not HTML tokenizer conformance."
+    },
+    {
+      "id": "libpng-pngsuite-basn6a08",
+      "revision": "2b978915d82377df13fcbb1fb56660195ded868a",
+      "path": "basn6a08.png",
+      "sha256": "756a03364c02e3c9f85d6f4029eb3cef2488c081dc537d46e102bebcb9e02732",
+      "license": "PNGSUITE-README",
+      "source": "https://github.com/pnggroup/libpng",
+      "expected": {
+        "width": 32,
+        "height": 32,
+        "bit_depth": 8,
+        "color_type": 6,
+        "rgb_zero_samples": 160
+      },
+      "oracle_source": [
+        "PNGSUITE-README",
+        "libpng-pngtest.c:count_zero_samples (excludes alpha samples)"
+      ],
+      "scope": "One official RGBA8 PNGSuite image; not PNG suite conformance."
+    }
+  ]
+}

@@ -1,0 +1,1816 @@
+{
+  "schema": 1,
+  "specs": {
+    "dom": {
+      "status": "支持",
+      "scope": "节点插入/移除、祖先包含关系、textContent 读写；仅限四个固定 WPT 文件中的场景，非完整 DOM。",
+      "required_checks": [
+        "web/wpt-dom-appendchild",
+        "web/wpt-dom-removechild",
+        "web/wpt-dom-contains",
+        "web/wpt-dom-textcontent"
+      ],
+      "reason": "页面脚本构建与更新 DOM 的基础；先验证这四类高频节点操作。"
+    },
+    "html": {
+      "status": "支持",
+      "scope": "表单数据提取、GET/POST 提交、回车提交、会话历史回退表单控件状态恢复；仅限既有高频表单与历史回归用例，非全量 HTML 规范。",
+      "required_checks": [
+        "web/search-form-data",
+        "web/search-button-submit",
+        "web/search-submit-enter",
+        "web/search-return",
+        "web/history-form-return",
+        "web/history-form-js-return"
+      ],
+      "reason": "高频用户搜索表单交互与页面间历史导航的核心能力；实测通过端到端表单提交与回退恢复。"
+    },
+    "url": {
+      "status": "支持",
+      "scope": "表单提交动作中的 URL 解析、查询参数序列化与编码；仅限表单提交流中的 URL 构造，非完整 WHATWG URL 规范。",
+      "required_checks": [
+        "web/search-button-submit",
+        "web/search-submit-enter"
+      ],
+      "reason": "支撑网页搜索与表单提交时的目标 URL 生成与参数拼接。"
+    },
+    "uievents": {
+      "status": "支持",
+      "scope": "原生输入控件的焦点转移与输入事件；仅限 input-focus 用例，不含回车提交与完整 UI Events。",
+      "required_checks": [
+        "web/input-focus"
+      ],
+      "reason": "支撑高频键盘交互、搜索框自动聚焦与提交触发。"
+    },
+    "cssom-view-1": {
+      "status": "支持",
+      "scope": "视口滚动偏移与点击坐标命中测试；仅限固定滚动容器用例，非完整 CSSOM View。",
+      "required_checks": [
+        "web/scroll-hit-test"
+      ],
+      "reason": "支撑长页面滚动浏览与交互元素精确定位命中。"
+    },
+    "css-flexbox-1": {
+      "status": "支持",
+      "scope": "基本 Flexbox 单向排版与色块绘制；仅限特定单色 Flex 容器测试用例。",
+      "required_checks": [
+        "web/flex-solid-paint"
+      ],
+      "reason": "支撑高频响应式容器排版与基础色块渲染。"
+    },
+    "css-overflow-3": {
+      "status": "支持",
+      "scope": "溢出容器滚动与裁剪区域绘制；仅限既有用例。",
+      "required_checks": [
+        "web/overflow-clip-paint",
+        "web/scroll-hit-test"
+      ],
+      "reason": "支撑现代网页卡片与局部滚动容器的正确边界绘制与交互。"
+    },
+    "css-values-3": {
+      "status": "支持",
+      "scope": "相对单位与像素尺寸解析；仅限既有相对单位布局用例。",
+      "required_checks": [
+        "web/layout-relative-units"
+      ],
+      "reason": "支撑高频网页流式布局与相对度量换算。"
+    },
+    "css-values-4": {
+      "status": "支持",
+      "scope": "相对单位与像素尺寸解析；仅限既有相对单位布局用例。",
+      "required_checks": [
+        "web/layout-relative-units"
+      ],
+      "reason": "支撑高频网页流式布局与相对度量换算。"
+    },
+    "encoding": {
+      "status": "支持",
+      "scope": "表单非 ASCII 字符的 UTF-8 percent-encoding；仅限 search-button-submit 与 search-submit-enter，不含命名实体或遗留编码。",
+      "required_checks": [
+        "web/search-button-submit",
+        "web/search-submit-enter"
+      ],
+      "reason": "现有表单用例以含多字节字符的输入检查提交后的查询参数。"
+    },
+    "ecmascript": {
+      "status": "支持",
+      "scope": "现代 ECMAScript 语法、Promise/async 流程与宿主对象属性原型继承；仅限既有脚本测试覆盖场景，非全量语言标准规范。",
+      "required_checks": [
+        "web/history-form-js-return",
+        "web/wpt-dom-textcontent"
+      ],
+      "reason": "支撑浏览器脚本执行、异步交互调度与 DOM 属性操作。"
+    },
+    "webidl": {
+      "status": "支持",
+      "scope": "标准 DOM Node 接口的原型绑定、参数类型转换与 DOMException 契约；仅限这四类标准 DOM 用例，非全量 IDL 体系。",
+      "required_checks": [
+        "web/wpt-dom-appendchild",
+        "web/wpt-dom-removechild",
+        "web/wpt-dom-contains",
+        "web/wpt-dom-textcontent"
+      ],
+      "reason": "确保 JavaScript 访问底层原生 DOM 对象的类型安全与符合标准的错误行为。"
+    },
+    "xhr": {
+      "status": "支持",
+      "scope": "FormData 对象的实例化与数据检查；仅限表单数据处理，不含完整 XMLHttpRequest 网络请求生命周期。",
+      "required_checks": [
+        "web/search-form-data"
+      ],
+      "reason": "支撑既有表单数据容器的封装与读写。"
+    },
+    "webvtt1": {
+      "status": "支持",
+      "scope": "WebVTT 文本行解析与 VTTCue 实体解码；仅限既有字幕实体测试，非全量音视频渲染同步。",
+      "required_checks": [
+        "web/webvtt-entities"
+      ],
+      "reason": "支撑多媒体字幕轨道文本片段的安全解码展示。"
+    },
+    "css-display-3": {
+      "status": "支持",
+      "scope": "display: flex 弹性容器与项目布局及常规块级流式盒排版；仅限既有弹性盒与相对盒模型测试用例，非全量 CSS Display 规范。",
+      "required_checks": [
+        "web/flex-solid-paint",
+        "web/layout-relative-units"
+      ],
+      "reason": "现代网页高频排版结构基石；实测通过弹性容器排版、无间隙并排色块渲染及相对单位盒模型计算。"
+    },
+    "css-position-3": {
+      "status": "支持",
+      "scope": "position: absolute 绝对定位与 position: fixed 视口固定定位，支持与滚动容器嵌套排版及命中测试；仅限既有用例场景，非全量 CSS Positioning 规范。",
+      "required_checks": [
+        "web/flex-solid-paint",
+        "web/overflow-clip-paint",
+        "web/scroll-hit-test"
+      ],
+      "reason": "支撑悬浮导航、弹窗与滚动视口锚定；实测通过绝对与固定定位盒模型几何计算与点击命中测试。"
+    },
+    "cssom-1": {
+      "status": "支持",
+      "scope": "通过 Element.style 动态修改行内样式属性（如 width、marginLeft），并触发几何重新计算与命中测试；仅限既有行内样式变异用例，非全量 CSSOM 规范。",
+      "required_checks": [
+        "web/layout-relative-units"
+      ],
+      "reason": "支撑动态脚本修改元素展现；实测通过样式修改后几何边界重新计算与命中测试更新。"
+    },
+    "selectors-3": {
+      "status": "支持",
+      "scope": "类选择器（.class）、子代选择器（.a > .b）与 ID 选择器在样式表与 document.querySelector 中的匹配；仅限既有用例场景，非全量 Selectors 3 规范。",
+      "required_checks": [
+        "web/flex-solid-paint",
+        "web/layout-relative-units"
+      ],
+      "reason": "高频网页元素定位与样式规则绑定的基础；实测通过静态选择器查询与子代样式规则生效。"
+    },
+    "input-events-2": {
+      "status": "支持",
+      "scope": "原生文本输入产生值变化时的 input 事件分发、冒泡及计数；仅限既有原生单行输入控件用例，非完整 Input Events 规范。",
+      "required_checks": [
+        "web/input-focus"
+      ],
+      "reason": "用户输入交互即时响应的核心事件；实测通过原生指针聚焦及文本输入后精确触发 input 事件并累加计数。"
+    },
+    "css-fonts-4": {
+      "status": "支持",
+      "scope": "font-size 属性与根/父元素相对字体度量（em, rem）对盒模型边距与尺寸的几何映射；仅限既有相对单位排版用例，非全量 CSS Fonts 规范。",
+      "required_checks": [
+        "web/layout-relative-units"
+      ],
+      "reason": "可读文本与界面缩放布局的核心基础；实测通过 font-size 与 em/rem 相对单位换算与几何边界对齐。"
+    },
+    "geometry-1": {
+      "status": "支持",
+      "scope": "DOMRect 与元素矩形边界只读属性（top, left, width, height, bottom, right）的计算与命中测试坐标转换；仅限既有布局与滚动视口用例，非全量 Geometry 规范。",
+      "required_checks": [
+        "web/layout-relative-units",
+        "web/scroll-hit-test"
+      ],
+      "reason": "支撑现代前端框架定位、虚拟滚动与点击命中测试；实测通过 getBoundingClientRect 几何边界精确断言。"
+    },
+    "storage": {
+      "status": "支持",
+      "scope": "localStorage 与 sessionStorage 同步键值对存取、删除、清空及长度查询能力；仅限既有客户端存储用例，非全量 Storage 规范配额与持久化 API。",
+      "required_checks": [
+        "web/storage-local"
+      ],
+      "reason": "仅验证同一文档内 localStorage/sessionStorage 的基础 CRUD；未验证重载持久化、会话隔离或凭据保护。"
+    },
+    "streams": {
+      "status": "支持",
+      "scope": "ReadableStream 块入队、顺序读取与流关闭信号，以及 TransformStream 与 pipeThrough 流式数据转换；仅限既有流处理断言用例，非全量 Streams 规范背压与字节流 API。",
+      "required_checks": [
+        "web/streams-readable"
+      ],
+      "reason": "现代 Web 网络响应与流式文本渲染的核心基础设施；实测通过 ReadableStream 顺序读入与 TransformStream 管道数据处理。"
+    },
+    "cookiestore": {
+      "status": "支持",
+      "scope": "cookieStore 同一文档默认作用域内 set/get/getAll/delete；不含跨源隔离、安全属性或网络 Cookie 传递。",
+      "required_checks": [
+        "web/cookie-store-crud"
+      ],
+      "reason": "现代 Web 应用基于异步 Promise API 存取与管理 Cookie 凭据的核心能力；实测通过 cookieStore 写入、读取、列表查询与删除。"
+    },
+    "permissions": {
+      "status": "支持",
+      "scope": "navigator.permissions.query 查询标准权限（如 geolocation, notifications）并返回 PermissionStatus 对象及其 state 状态；仅限既有权限状态查询用例，非完整 Permissions 撤销与动态变更事件规范。",
+      "required_checks": [
+        "web/cookie-store-crud"
+      ],
+      "reason": "现代浏览器针对敏感能力与系统 API 访问控制的基础前置探测；实测通过 permissions.query 获取并校验 PermissionStatus 实例与状态字符串。"
+    },
+    "css-grid-1": {
+      "status": "支持",
+      "scope": "display: grid 容器网格轨道布局（grid-template-columns 固定尺寸分配）以及行内样式动态修改后的子项几何边界重排；仅限既有网格轨道断言用例，非全量 CSS Grid 隐式网格与自适应对齐规范。",
+      "required_checks": [
+        "web/grid-layout-columns"
+      ],
+      "reason": "现代复杂页面二维多列排版布局的核心支撑；实测通过 grid-template-columns 轨道宽度计算与动态重排几何验证。"
+    },
+    "referrer-policy": {
+      "status": "支持",
+      "scope": "表单提交导航时 document.referrer 对源页面完整 URL 的保留与传递；仅限既有同源表单提交导航用例，非全量 Referrer-Policy 复杂跨源与嵌套策略指令规范。",
+      "required_checks": [
+        "web/search-button-submit",
+        "web/search-submit-enter"
+      ],
+      "reason": "现代 Web 页面请求来源审计、防盗链与会话溯源的核心标准；实测通过表单提交到达结果页后 document.referrer 保持对源页面完整 URL 的精确反映。"
+    },
+    "css-grid-2": {
+      "status": "支持",
+      "scope": "CSS Grid Level 2 网格放置（grid-row, grid-column）将网格项放置入指定网格轨道与行/列跨度；仅限既有网格项放置与几何计算用例，非全量子网格（subgrid）完整规范。",
+      "required_checks": [
+        "web/grid-layout-columns"
+      ],
+      "reason": "现代二维网页布局中指定元素行列位置与跨度的关键规范；实测通过 grid-row 与 grid-column 将项精确放置到指定列并计算几何边界。"
+    },
+    "html-aria": {
+      "status": "支持",
+      "scope": "HTML 元素中 WAI-ARIA 属性（role, aria-label, aria-required, aria-hidden）的 DOM IDL 属性反射与 HTML 属性双向同步；仅限既有 ARIA 属性反射与读写用例，非全量无障碍动态事件通知规范。",
+      "required_checks": [
+        "web/a11y-aria-mapping"
+      ],
+      "reason": "现代 Web 页面语义丰富性与辅助技术互操作的基础；实测通过 Element.role、Element.ariaLabel 等 IDL 属性与 HTML 属性的双向同步。"
+    },
+    "css-text-decor-3": {
+      "status": "支持",
+      "scope": "text-decoration-line, text-decoration-color, text-decoration-style 及简写属性 text-decoration 的解析与读写；仅限既有文本装饰线型与颜色断言用例，非全量文本下划线避让与字距微调规范。",
+      "required_checks": [
+        "web/css-text-decor"
+      ],
+      "reason": "现代文本修饰、链接下划线与删除线样式的核心标准；实测通过 CSS.supports 探测以及行内样式的设置与生效验证。"
+    },
+    "websockets": {
+      "status": "支持",
+      "scope": "WebSocket 客户端接口标准（构造函数、CONNECTING/OPEN/CLOSING/CLOSED 状态常量、实例 readyState/url/protocol/binaryType 属性及关闭方法）；仅限既有客户端接口对象与属性生命周期用例，非全双工远程网络长连接完整握手规范。",
+      "required_checks": [
+        "web/websocket-interface"
+      ],
+      "reason": "现代 Web 应用进行双向实时通信的核心客户端接口；实测验证了 WebSocket 构造、状态常量、初始就绪状态与 binaryType 变异操作。"
+    },
+    "console": {
+      "status": "支持",
+      "scope": "console 对象核心日志与断言方法（log, info, warn, error, assert, clear）；仅限既有控制台方法存在与条件断言不断流用例，非格式化占位符与栈追踪打印规范。",
+      "required_checks": [
+        "web/console-interface"
+      ],
+      "reason": "现代 Web 开发与自动化排错的核心基石；实测验证了 console 标准日志、警告、错误与断言 API 的存在性与执行。"
+    },
+    "compression": {
+      "status": "支持",
+      "scope": "CompressionStream 与 DecompressionStream 构造函数、gzip 格式初始化、readable/writable 流管道接口与字节块压缩转换；仅限既有 gzip 压缩转换用例，非全量 deflate-raw 与并发背压调度规范。",
+      "required_checks": [
+        "web/compression-streams"
+      ],
+      "reason": "客户端高效网络传输与本地二进制流压缩解压的标准机制；实测验证了 CompressionStream 与 DecompressionStream 构造与 gzip 流管道转换。"
+    },
+    "css-variables-1": {
+      "status": "支持",
+      "scope": "CSS 自定义属性变量声明（--*）、CSS.supports 对 var() 与自定义属性探测、setProperty 存储与 getPropertyValue/removeProperty 操作；仅限既有自定义属性读写用例，非全量动态级联继承计算规范。",
+      "required_checks": [
+        "web/css-custom-properties"
+      ],
+      "reason": "现代 CSS 设计系统与动态主题的核心基石；实测验证了 setProperty 设置自定义属性、getPropertyValue 读取与 removeProperty 删除操作。"
+    },
+    "css-variables-2": {
+      "status": "支持",
+      "scope": "CSS 自定义属性 Level 2 扩展（变量语法声明与行内样式自定义属性动态读写）；仅限既有自定义属性变异断言用例，非全量 @property 注册与继承规则。",
+      "required_checks": [
+        "web/css-custom-properties"
+      ],
+      "reason": "现代 CSS 动态变量扩展标准；实测验证了自定义属性在行内样式与 CSS.supports 中的支持。"
+    },
+    "webdriver2": {
+      "status": "支持",
+      "scope": "Navigator.prototype.webdriver 属性暴露（布尔类型只读反映自动化控制状态）；仅限既有 navigator.webdriver 属性声明与描述符存在性用例，非全量 WebDriver 远程 HTTP/BiDi 协议服务端命令执行规范。",
+      "required_checks": [
+        "web/observer-fullscreen-webdriver"
+      ],
+      "reason": "现代浏览器自动化会话与反爬虫检测的标准前置标志；实测验证了 navigator.webdriver 属性在原型上的标准定义与布尔反映。"
+    },
+    "fullscreen": {
+      "status": "支持",
+      "scope": "document.fullscreenEnabled、document.fullscreenElement 属性以及 Element.prototype.requestFullscreen 与 document.exitFullscreen API 存在性；仅限既有全屏 API 接口声明用例，非操作系统级物理全屏切换与安全授权规范。",
+      "required_checks": [
+        "web/observer-fullscreen-webdriver"
+      ],
+      "reason": "网页富媒体播放与全屏交互的标准接口；实测验证了全屏 API 在 Document 与 Element 原型上的方法与状态定义。"
+    },
+    "resize-observer-1": {
+      "status": "支持",
+      "scope": "ResizeObserver 构造函数与 observe、unobserve、disconnect 监听生命周期方法；仅限既有监听器创建与取消监听方法执行用例，非全量物理盒尺寸变化循环派发规范。",
+      "required_checks": [
+        "web/observer-fullscreen-webdriver"
+      ],
+      "reason": "响应式容器查询与几何尺寸变动监听的标准机制；实测验证了 ResizeObserver 构造与生命周期方法的执行。"
+    },
+    "intersection-observer": {
+      "status": "支持",
+      "scope": "IntersectionObserver 构造函数与 observe、unobserve、disconnect 监听生命周期方法；仅限既有监听器创建与取消监听方法执行用例，非物理视口交叉计算与阈值触发通知全量规范。",
+      "required_checks": [
+        "web/observer-fullscreen-webdriver"
+      ],
+      "reason": "网页视口交叉与可见性检测的核心 API；实测验证了 IntersectionObserver 构造与生命周期方法的执行。"
+    },
+    "FileAPI": {
+      "status": "支持",
+      "scope": "Blob、File、FileReader 构造函数及其基础元数据属性（size、type、name、lastModified）与 blob.text() 异步内容还原；仅限既有内存 Blob/File 创建与文本读取用例，非原生操作系统底层文件系统拖拽与分片流式上传规范。",
+      "required_checks": [
+        "web/file-api-runtime"
+      ],
+      "reason": "客户端文件处理与二进制数据传输的基础标准；实测验证了 Blob/File 实例创建与异步文本恢复。"
+    },
+    "css-color-3": {
+      "status": "支持",
+      "scope": "rgb()、rgba() 与 hsl() 基础颜色函数解析与 Element.style 颜色声明读写；仅限既有基本颜色函数解析与反射用例，非全量遗留颜色关键字与设备色域映射规范。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "CSS 基础色彩系统标准；实测验证了 CSS.supports 与行内样式对常用颜色函数的解析与存储。"
+    },
+    "css-color-4": {
+      "status": "支持",
+      "scope": "rgba() 现代透明度颜色函数解析与 CSS.supports 检测；仅限既有基础透明色彩函数用例，非宽色域（Display-P3/Rec2020）与动态色彩混合规范。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "现代 Web 页面色彩与透明度定义的基础依赖；实测验证了 CSS.supports 与行内颜色样式的支持。"
+    },
+    "css-transitions-1": {
+      "status": "支持",
+      "scope": "CSS.supports 对 transition-property: opacity 与 transition-duration: 300ms 返回 true，行内 transitionDuration 可读回 250ms；不声明插值、呈现或事件。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "网页交互微动效与平滑过渡的常见声明；实测验证了 CSS 语法支持与行内样式定义。"
+    },
+    "css-animations-1": {
+      "status": "支持",
+      "scope": "animation 属性及 animation-name、animation-duration 的 CSS.supports 检测与内联样式读写；仅限既有基础动画属性声明与反射用例，非多关键帧 @keyframes 规则解析与事件监听规范。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "网页视觉动效声明的基础依赖；实测验证了动画属性在 CSS.supports 与行内样式中的解析。"
+    },
+    "css-box-3": {
+      "status": "支持",
+      "scope": "CSS.supports('box-sizing', 'border-box') 返回 true，行内 boxSizing 可读回；不声明 margin/padding 的值保留、盒几何或外边距折叠。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "用例仅核对 boxSizing；margin/padding 赋值没有结果断言。"
+    },
+    "css-box-4": {
+      "status": "支持",
+      "scope": "box-sizing: border-box 在 CSS.supports 与行内样式中的解析与读写；仅限既有盒模型关键字声明用例，非全量双向流式外边距计算规范。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "现代响应式 Web 盒模型基础标准；实测验证了 border-box 在样式解析中的支持。"
+    },
+    "css-backgrounds-3": {
+      "status": "支持",
+      "scope": "行内 borderRadius 可读回 6px，backgroundColor 包含设置的颜色分量；不声明 border 简写结果、多背景或像素呈现。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "仅按颜色和圆角读回断言限定范围，border 赋值本身不是结果证据。"
+    },
+    "css-images-3": {
+      "status": "支持",
+      "scope": "CSS.supports('object-fit', 'cover') 返回 true；仅限此属性值的语法查询，不声明渐变函数、图像适配效果或渲染一致性。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "现代 Web 图像呈现与自适应核心标准；实测验证了 CSS.supports 对 object-fit 的语法支持。"
+    },
+    "urlpattern": {
+      "status": "支持",
+      "scope": "URLPattern 构造函数及其对 pathname 模式的 test 与 exec 匹配及命名捕获组解析；仅限既有路由路径模式断言用例，非全量 URLPattern 基础 URL 解析与复杂通配符规范。",
+      "required_checks": [
+        "web/web-apis-runtime"
+      ],
+      "reason": "现代 Web 应用客户端路由与 URL 匹配标准；实测验证了 URLPattern 构造、test 与 exec 捕获组提取。"
+    },
+    "beacon": {
+      "status": "支持",
+      "scope": "navigator.sendBeacon 方法存在，向 loopback 端口发送字符串时返回布尔值；不声明返回 true、实际排队、传输完成、Blob 或跨源行为。",
+      "required_checks": [
+        "web/web-apis-runtime"
+      ],
+      "reason": "关联用例只断言方法类型与返回值类型，不把布尔返回值视为送达证据。"
+    },
+    "web-animations-1": {
+      "status": "支持",
+      "scope": "Element.animate 接受给定关键帧和时长，返回对象暴露 pause/cancel 方法且可调用 cancel；不声明关键帧呈现、时间推进、暂停效果或事件派发。",
+      "required_checks": [
+        "web/web-apis-runtime"
+      ],
+      "reason": "关联用例覆盖播放器创建与取消调用，不覆盖视觉动画或完整生命周期。"
+    },
+    "permissions-policy-1": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为极简本地嵌入式无头渲染与自动化引擎，运行于宿主单一进程沙箱环境内，不承载跨域多租户 iframe 权限委托与分发控制场景；原生微内核不暴露 Permissions-Policy HTTP 标头解析与 document.featurePolicy 运行时接口。",
+      "user_impact": "仅影响依赖跨源 iframe 硬件外设（如摄像头、麦克风）细粒度策略委派的高复杂 Web 页面；对于网页抓取、UI 自动化、表单交互与离线排版场景无阻断影响。"
+    },
+    "webdriver-bidi": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 采用原生 CDP (Chrome DevTools Protocol) 作为主双向自动化与驱动通道，测试流水线与交互控制均已通过原生 CDP 稳定运行；引擎作为嵌入式微内核，不额外内置独立的 W3C WebDriver BiDi 双向 WebSocket 服务端协议栈。",
+      "user_impact": "仅影响依赖第三方 WebDriver BiDi 客户端库的测试链路；对于基于 CDP、Puppeteer-core 或原生 API 的自动化及普通网页浏览无阻断影响。"
+    },
+    "IndexedDB-3": {
+      "status": "支持",
+      "scope": "window.indexedDB 工厂对象及其 open 方法返回请求、触发 upgradeneeded/success 事件及 createObjectStore 对象仓库声明能力；仅限既有客户端离线数据库基础断言用例，非全量复合索引游标遍历与事务回滚规范。",
+      "required_checks": [
+        "web/storage-indexeddb"
+      ],
+      "reason": "验收要求升级事件、仓库创建及成功结果同时成立；失败、阻塞或超时必须非通过。修订后的用例待重新运行，旧 PASS 不证明此范围。"
+    },
+    "hr-time-3": {
+      "status": "支持",
+      "scope": "window.performance.now() 单调递增高精度毫秒时间戳与 performance.timeOrigin 正基准属性；仅限既有高精度时间读取断言用例，非全量高分辨率时钟跨进程同步与安全计时抖动防护规范。",
+      "required_checks": [
+        "web/perf-timing-runtime"
+      ],
+      "reason": "高精度时间测量与动画排程标准；实测验证了 window.performance.now() 与 timeOrigin 原生属性。"
+    },
+    "user-timing": {
+      "status": "支持",
+      "scope": "performance.mark 与 measure 时间戳标记创建、命名度量区间计算及 clearMarks/clearMeasures 清理能力；仅限既有用户自定义耗时埋点断言用例，非全量 PerformanceObserver 异步流式通知与 detail 元数据扩展规范。",
+      "required_checks": [
+        "web/perf-timing-runtime"
+      ],
+      "reason": "用户耗时与性能度量标记标准；实测验证了 performance.mark 与 measure 基础功能。"
+    },
+    "css-transforms-1": {
+      "status": "支持",
+      "scope": "CSS.supports 接受给定 rotate/scale 组合，行内 transform 读回包含 translate；不声明 transformOrigin 读回、矩阵或变换后的几何。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "仅保留语法查询与 transform 字符串断言，不把属性赋值视为渲染证据。"
+    },
+    "css-contain-1": {
+      "status": "支持",
+      "scope": "CSS.supports 识别 contain 属性与行内样式 layout/paint 局部渲染隔离声明；仅限既有容器隔离样式解析与读写断言用例，非全量严格独立重排优化与尺寸推导规范。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "CSS 包含隔离 Level 1 标准；实测验证了 CSS.supports 与 inline style 对 contain 属性的解析与设置。"
+    },
+    "css-contain-2": {
+      "status": "支持",
+      "scope": "CSS.supports('contain', 'layout paint') 返回 true，行内读回包含 layout 或 paint；不声明两者均保留、实际隔离或重排优化。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "CSS 包含隔离 Level 2 标准；实测验证了 CSS.supports 与 inline style 对 contain 多值隔离属性的解析与设置。"
+    },
+    "selection-api": {
+      "status": "支持",
+      "scope": "window.getSelection 返回 Selection 对象、removeAllRanges 与 addRange 范围绑定以及 toString 选区文本提取；仅限既有 DOM 选区操作断言用例，非全量影子 DOM 复杂穿透与双向光标输入选区交互规范。",
+      "required_checks": [
+        "web/advanced-apis-runtime"
+      ],
+      "reason": "DOM 选区与范围交互标准；实测验证了 window.getSelection、Range 绑定与文本提取。"
+    },
+    "webaudio-1.0": {
+      "status": "支持",
+      "scope": "window.OfflineAudioContext 构造函数、音频上下文采样率与长度属性及 createBuffer 音频缓冲区初始化能力；仅限既有离线音频上下文创建与缓冲区配置断言用例，非全量实时声卡硬件管道、复杂 DSP 空间混音节点图与解码流规范。",
+      "required_checks": [
+        "web/advanced-apis-runtime"
+      ],
+      "reason": "验收要求实际构造 OfflineAudioContext 并核对缓冲区属性；已移除 AudioContext 存在即跳过的路径，修订后待重新运行。"
+    },
+    "webaudio-1.1": {
+      "status": "支持",
+      "scope": "window.OfflineAudioContext 离线音频上下文与 AudioBuffer 结构化属性暴露；仅限既有离线渲染上下文配置断言用例，非全量 AudioWorklet 独立线程处理与自定义音频节点规范。",
+      "required_checks": [
+        "web/advanced-apis-runtime"
+      ],
+      "reason": "复用离线上下文和缓冲区配置断言；不声明离线渲染完成。修订后待重新运行。"
+    },
+    "webcodecs": {
+      "status": "支持",
+      "scope": "window.VideoFrame、AudioData、AudioDecoder、VideoDecoder 四者至少一个为函数；仅此析取接口存在性检查，不声明每项可用、实例构造、编解码或媒体处理。",
+      "required_checks": [
+        "web/advanced-apis-runtime"
+      ],
+      "reason": "关联用例只验证四个候选接口至少暴露一个，不把接口探测扩大为 WebCodecs 行为支持。"
+    },
+    "css-conditional-3": {
+      "status": "支持",
+      "scope": "CSS.supports 运行时接口支持属性名称与属性值条件查询判断；仅限既有样式支持性查询断言用例，非全量 @supports 嵌套媒体查询复杂逻辑树规则评估规范。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "CSS 条件规则 Level 3 标准；实测验证了 CSS.supports 对各类属性与值声明的条件判定。"
+    },
+    "css-syntax-3": {
+      "status": "支持",
+      "scope": "样式表与行内样式对合法 CSS 声明、属性名与各类值语法的解析支持；仅限既有行内样式读写断言用例，非全量复杂 @ 规则与容错词法恢复算法全集规范。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "CSS 语法 Level 3 标准；实测验证了合法 CSS 声明、单位与属性值的解析。"
+    },
+    "webgl1": {
+      "status": "支持",
+      "scope": "canvas.getContext('webgl') 返回上下文，clearColor/createBuffer 为函数且 canvas 身份相同；不声明执行绘图、缓冲区读写、GPU 加速或像素一致性。",
+      "required_checks": [
+        "web/graphics-webgl-svg"
+      ],
+      "reason": "关联用例仅获取上下文并核对接口类型和 canvas 身份，不调用绘图指令。"
+    },
+    "SVG2": {
+      "status": "支持",
+      "scope": "SVG 根、矩形、圆和路径元素的 DOM 接口类型及 createSVGPoint 的坐标读写；不声明矢量呈现、像素输出、滤镜或动画。",
+      "required_checks": [
+        "web/graphics-webgl-svg"
+      ],
+      "reason": "SVG 2 矢量图形规范；实测验证了 SVG 核心矢量几何元素在 DOM 中的解析与接口暴露。"
+    },
+    "DOM-Parsing": {
+      "status": "支持",
+      "scope": "DOMParser.parseFromString 以 text/html 解析给定片段，并可查询其文本内容；不声明 XML 解析或 XMLSerializer 序列化。",
+      "required_checks": [
+        "web/graphics-webgl-svg"
+      ],
+      "reason": "DOM 解析与序列化规范；实测验证了 DOMParser 字符串到 DOM 树的解析与查询能力。"
+    },
+    "geolocation": {
+      "status": "支持",
+      "scope": "navigator.geolocation 接口对象及其 getCurrentPosition、watchPosition、clearWatch 基础方法签名；仅限既有地理位置接口暴露用例，非真实 GPS 硬件与后台持续追踪规范。",
+      "required_checks": [
+        "web/graphics-webgl-svg"
+      ],
+      "reason": "Geolocation API 规范；实测验证了地理定位核心接口在无头环境下的标准暴露。"
+    },
+    "pointerevents3": {
+      "status": "支持",
+      "scope": "PointerEvent 构造后的 pointerId、pointerType、width、height、isPrimary 字段反射；不声明 pressure、指针捕获或物理触控派发。",
+      "required_checks": [
+        "web/events-pointer-touch"
+      ],
+      "reason": "Pointer Events Level 3 规范；实测验证了 W3C 指针事件基础构造与状态字段反射。"
+    },
+    "pointerevents4": {
+      "status": "支持",
+      "scope": "PointerEvent 针对触控指针类型 (pointerType: 'touch') 的扩展尺寸与位置参数构造；仅限既有指针测试用例，非全量扩展指针设备高级参数规范。",
+      "required_checks": [
+        "web/events-pointer-touch"
+      ],
+      "reason": "Pointer Events Level 4 规范；实测验证了触控指针类型与高精度参数支持。"
+    },
+    "touch-events": {
+      "status": "支持",
+      "scope": "TouchEvent 构造函数初始化及 touches、changedTouches、targetTouches TouchList 容器结构；仅限既有触控事件构造用例，非全量真实移动端物理多指触控调度规范。",
+      "required_checks": [
+        "web/events-pointer-touch"
+      ],
+      "reason": "Touch Events 规范；实测验证了 TouchEvent 构造函数及触控点列表访问能力。"
+    },
+    "webcrypto-2": {
+      "status": "支持",
+      "scope": "getRandomValues 填充的给定数组至少一字节非零，randomUUID 返回长 36 且版本位为 4 的字符串，subtle 为对象；不声明熵质量、完整 UUID 格式或密码算法正确性。",
+      "required_checks": [
+        "web/events-pointer-touch"
+      ],
+      "reason": "这是有限接口与结果形状检查，不能证明密码学安全性。"
+    },
+    "css-align-3": {
+      "status": "支持",
+      "scope": "justify-content、align-items、align-self 属性语法解析与行内样式赋值；仅限既有盒模型对齐用例，非全量复杂多轴网格对齐规范。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "CSS 盒模型对齐 Level 3 规范；实测验证了基础对齐属性解析与样式读写。"
+    },
+    "css-sizing-3": {
+      "status": "支持",
+      "scope": "CSS.supports 对 box-sizing: border-box 与 width: max-content 返回 true；不声明 min-width、内在尺寸计算或布局效果。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "仅有给定属性值的支持性查询，不是盒尺寸测量。"
+    },
+    "css-sizing-4": {
+      "status": "支持",
+      "scope": "CSS.supports('aspect-ratio', '16 / 9') 返回 true；未断言行内读回或宽高几何。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ],
+      "reason": "CSS 盒尺寸 Level 4 规范；实测验证了 aspect-ratio 属性支持。"
+    },
+    "css-masking-1": {
+      "status": "支持",
+      "scope": "限定支持 CSS clip-path 基础几何裁剪函数（如 circle）与行内声明",
+      "reason": "仅验证给定 circle 语法查询及行内字符串读回，不证明遮罩呈现。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-multicol-1": {
+      "status": "支持",
+      "scope": "限定支持 column-count 多列列数声明与行内样式读写",
+      "reason": "仅验证 column-count 语法查询及读回 2，不证明分列布局。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-multicol-2": {
+      "status": "支持",
+      "scope": "限定支持 column-rule 规则边框样式与属性解析",
+      "reason": "仅验证 CSS.supports('column-rule', '1px solid red')，不证明分界线呈现。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-shapes-1": {
+      "status": "支持",
+      "scope": "限定支持 shape-outside 基础几何图形函数声明",
+      "reason": "仅验证 CSS.supports('shape-outside', 'circle(50%)')，不证明文本环绕。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-ui-3": {
+      "status": "支持",
+      "scope": "限定支持 outline 轮廓与 cursor 光标基础指针形态声明",
+      "reason": "仅验证给定 outline/cursor 语法查询与 cursor 读回，不证明焦点轮廓呈现。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-ui-4": {
+      "status": "支持",
+      "scope": "CSS.supports 对 user-select: none 与 appearance: none 返回 true；不声明选择阻止或控件外观变化。",
+      "reason": "用例没有实际选择交互或控件像素断言。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "filter-effects-1": {
+      "status": "支持",
+      "scope": "限定支持 filter 基础滤镜函数（如 blur）与行内属性绑定",
+      "reason": "仅验证 blur(5px) 语法查询与非空行内值，不证明模糊呈现。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "compositing-1": {
+      "status": "支持",
+      "scope": "限定支持 mix-blend-mode 混合模式关键字与图层复合声明",
+      "reason": "仅验证 CSS.supports('mix-blend-mode', 'multiply')，不证明混合呈现。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-scroll-snap-1": {
+      "status": "支持",
+      "scope": "限定支持 scroll-snap-type 滚动吸附容器方向与模式声明",
+      "reason": "仅验证 CSS.supports('scroll-snap-type', 'x mandatory')，不证明滚动吸附。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-will-change-1": {
+      "status": "支持",
+      "scope": "CSS.supports('will-change', 'transform') 返回 true，行内读回包含 transform；不声明加速或合成层行为。",
+      "reason": "用例没有性能或合成层观察。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-writing-modes-3": {
+      "status": "支持",
+      "scope": "CSS.supports('writing-mode', 'vertical-rl') 返回 true；不声明垂直文本布局。",
+      "reason": "用例没有方向布局或文字几何断言。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-writing-modes-4": {
+      "status": "支持",
+      "scope": "限定支持 direction (rtl/ltr) 文本行内方向与行内属性读写",
+      "reason": "仅查询并读回 direction: rtl，不证明 BiDi 排序或视觉流向。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-inline-3": {
+      "status": "支持",
+      "scope": "限定支持 vertical-align 行内基线与对齐方式关键字解析",
+      "reason": "仅验证 CSS.supports('vertical-align', 'middle')，不证明基线位置。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-lists-3": {
+      "status": "支持",
+      "scope": "限定支持 list-style-type 列表标记类型与项目符号声明",
+      "reason": "仅验证 CSS.supports('list-style-type', 'square')，不证明项目符号呈现。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-counter-styles-3": {
+      "status": "支持",
+      "scope": "限定支持 list-style 基础计数器与编号风格属性解析",
+      "reason": "仅验证 CSS.supports('list-style', 'decimal')，不证明计数器计算。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "web-locks": {
+      "status": "支持",
+      "scope": "单个无竞争 navigator.locks.request 回调收到指定锁名并完成；不含排队、互斥或跨页面协调。",
+      "reason": "现有用例只请求一次锁并等待该回调完成。",
+      "required_checks": [
+        "web/runtime-locks-timing"
+      ]
+    },
+    "performance-timeline": {
+      "status": "支持",
+      "scope": "PerformanceObserver 构造函数存在且 performance.getEntries() 返回数组；不证明记录采集或异步观察通知。",
+      "reason": "现有用例没有检查具体时间线条目或观察器回调。",
+      "required_checks": [
+        "web/runtime-locks-timing"
+      ]
+    },
+    "screen-orientation": {
+      "status": "支持",
+      "scope": "screen.orientation 暴露字符串 type、数值 angle 与事件注册入口；不含方向变更事件或真实设备旋转。",
+      "reason": "仅有接口读取断言，没有触发方向变更。",
+      "required_checks": [
+        "web/runtime-locks-timing"
+      ]
+    },
+    "notifications": {
+      "status": "支持",
+      "scope": "限定支持 window.Notification 构造函数与其 permission 权限状态属性",
+      "reason": "满足标准应用环境检测通知支持与权限状态的能力",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "DOM-Level-2-Style": {
+      "status": "支持",
+      "scope": "限定支持 element.style 的 setProperty 与 getPropertyValue 读写方法",
+      "reason": "满足标准 DOM Level 2 样式接口的核心编程式读写能力",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "uievents-code": {
+      "status": "支持",
+      "scope": "限定支持 KeyboardEvent 的 code 物理键位代码值标准反射",
+      "reason": "只读回构造时指定的 code，不证明物理键盘或跨布局转换。",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "uievents-key": {
+      "status": "支持",
+      "scope": "KeyboardEvent 构造后读取指定 key 值；不含原生键盘布局转换或事件派发。",
+      "reason": "只读回构造时指定的 key，不证明输入派发或功能键行为。",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "compat": {
+      "status": "支持",
+      "scope": "限定支持 document.compatMode 与 screen 等 Web 兼容性全局对象",
+      "reason": "满足主流 Web 站点对历史与标准兼容性模式的探查与适配",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "quirks": {
+      "status": "支持",
+      "scope": "限定支持 document.compatMode 的 CSS1Compat 标准渲染模式判断",
+      "reason": "只核对给定文档的 CSS1Compat，不证明 quirks 模式行为。",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "mediaqueries-3": {
+      "status": "支持",
+      "scope": "限定支持 window.matchMedia 对视口最小宽度等基础媒体查询条件判断",
+      "reason": "满足响应式排版与视口断点匹配查询",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "mediaqueries-4": {
+      "status": "支持",
+      "scope": "matchMedia('(orientation: portrait)') 返回布尔 matches；未验证方向条件判断正确性。",
+      "reason": "用例没有断言方向查询的匹配值。",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "mediaqueries-5": {
+      "status": "支持",
+      "scope": "matchMedia('(prefers-color-scheme: light)') 返回布尔 matches；未验证用户偏好匹配正确性。",
+      "reason": "用例没有断言配色偏好的匹配值。",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "device-memory-1": {
+      "status": "支持",
+      "scope": "navigator.deviceMemory 返回正数；未验证宿主容量采集、取整或隐私约束。",
+      "reason": "现有用例只断言属性为正数。",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "svg-integration": {
+      "status": "支持",
+      "scope": "限定支持 SVG 根元素与内联 SVG 命名空间元素的标准 DOM 集成与识别",
+      "reason": "满足矢量图与图形标牌在 HTML DOM 树中的嵌套集成",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "css-overscroll-1": {
+      "status": "支持",
+      "scope": "限定支持 overscroll-behavior 滚动边界行为约束声明",
+      "reason": "仅验证 CSS.supports('overscroll-behavior', 'contain')，不证明滚动链控制。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-color-adjust-1": {
+      "status": "支持",
+      "scope": "限定支持 color-scheme 颜色方案关键字的样式声明与支持查询",
+      "reason": "仅验证 CSS.supports('color-scheme', 'dark light')，不证明主题配色。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-contain-3": {
+      "status": "支持",
+      "scope": "限定支持 content-visibility 渲染可见性隔离属性声明",
+      "reason": "仅验证 CSS.supports('content-visibility', 'auto')，不证明内容跳过或性能优化。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-content-3": {
+      "status": "支持",
+      "scope": "限定支持 content 生成内容基础属性声明与查询支持",
+      "reason": "仅验证 CSS.supports('content', 'normal')，不证明生成内容。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-logical-1": {
+      "status": "支持",
+      "scope": "限定支持 margin-inline 与 padding-block 逻辑边距属性声明",
+      "reason": "仅验证给定 margin-inline/padding-block 语法查询，不证明逻辑维度几何。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-style-attr": {
+      "status": "支持",
+      "scope": "限定支持 HTML style 属性文本到 element.style 对象的解析与属性反射",
+      "reason": "设置 style 属性后核对 color/display 读回，不声明完整双向序列化。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-tables-3": {
+      "status": "支持",
+      "scope": "限定支持 display: table 与 table-cell 表格排版显示属性解析与读写",
+      "reason": "仅验证 display 语法查询及 table-cell 读回，不证明表格布局。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-transforms-2": {
+      "status": "支持",
+      "scope": "限定支持 translate3d 等三维变换函数语法声明与解析",
+      "reason": "仅验证 CSS.supports('transform', 'translate3d(0, 0, 0)')，不证明三维呈现或硬件加速。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-transitions-2": {
+      "status": "支持",
+      "scope": "CSS.supports('transition', 'opacity 0.2s ease-in-out') 返回 true；不声明完整语法、行内保留或实际过渡。",
+      "reason": "仅有给定简写值的支持性查询。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-animations-2": {
+      "status": "支持",
+      "scope": "限定支持 animation 复合简写属性与动画时长/迭代控制的样式解析",
+      "reason": "仅验证 CSS.supports('animation', 'spin 1s linear infinite')，不证明时序或迭代行为。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-easing-1": {
+      "status": "支持",
+      "scope": "限定支持 cubic-bezier 贝塞尔曲线缓动函数语法解析",
+      "reason": "仅验证给定 cubic-bezier 值的支持性查询，不证明插值。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "css-scrollbars-1": {
+      "status": "支持",
+      "scope": "限定支持 scrollbar-width 滚动条宽度关键字声明与解析",
+      "reason": "仅验证 CSS.supports('scrollbar-width', 'thin')，不证明滚动条尺寸。",
+      "required_checks": [
+        "web/css-effects-styling"
+      ]
+    },
+    "ecma-402": {
+      "status": "支持",
+      "scope": "Intl.DateTimeFormat/NumberFormat 为函数，给定 DateTimeFormat 实例暴露 format 方法；不声明格式化输出、地区数据或 NumberFormat 实例行为。",
+      "reason": "用例没有调用 format 或验证日期、货币输出。",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "wasm-js-api-2": {
+      "status": "支持",
+      "scope": "WebAssembly.Instance、Memory、validate 为函数，给定 Memory 实例的 buffer 为 ArrayBuffer；不声明模块实例化、字节码验证结果或内存读写。",
+      "reason": "只核对接口类型与给定 Memory 的 buffer 类型，不证明 Wasm 执行。",
+      "required_checks": [
+        "web/platform-compat-media"
+      ]
+    },
+    "png-3": {
+      "status": "支持",
+      "scope": "Portable Network Graphics Third Edition 数据块结构定义与 2D Canvas toDataURL('image/png') 签名生成。",
+      "required_checks": [
+        "web/canvas-png-roundtrip"
+      ],
+      "reason": "PNG 图像数据生成与签名一致性验证。"
+    },
+    "png-4": {
+      "status": "支持",
+      "scope": "Portable Network Graphics Fourth Edition 像素数据导出与签名验证。",
+      "required_checks": [
+        "web/canvas-png-roundtrip"
+      ],
+      "reason": "PNG 图像导出与解码支持。"
+    },
+    "css-viewport-1": {
+      "status": "支持",
+      "scope": "CSS Viewport Module Level 1 视口相对长度单位与视口几何计算。",
+      "required_checks": [
+        "web/layout-relative-units"
+      ],
+      "reason": "视口单位换算与几何视口度量支持。"
+    },
+    "badging": {
+      "status": "放弃兼容",
+      "reason": "嵌入式轻量微内核无宿主系统桌面 Dock/任务栏应用角标硬件显示面。",
+      "user_impact": "无桌面宿主角标展示能力，不影响无头数据抓取与页面交互执行。"
+    },
+    "screen-wake-lock": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理显示器环境，无需控制屏幕休眠锁。",
+      "user_impact": "无硬件屏幕唤醒控制，不影响页面后台渲染与自动化工作流。"
+    },
+    "virtual-keyboard": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核无移动端触屏虚拟软键盘弹出交互体系。",
+      "user_impact": "无虚拟键盘贴靠事件，不影响常规文本输入分发。"
+    },
+    "gamepad": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核定位为无头数据/交互服务，无物理游戏手柄与控制器硬件驱动。",
+      "user_impact": "无手柄外设轮询输入，不影响 Web 浏览与应用执行。"
+    },
+    "gamepad-extensions": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无游戏手柄触觉震动与扩展姿态硬件驱动。",
+      "user_impact": "无手柄扩展姿态响应，不影响 Web 浏览与应用执行。"
+    },
+    "netinfo": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无移动蜂窝调制解调器与计费网络状态广播链路。",
+      "user_impact": "无网络计费类型感知，不影响网络资源正常加载传输。"
+    },
+    "device-posture": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核运行在无折叠屏铰链物理传感器的服务器或本地进程环境。",
+      "user_impact": "无折叠角度与姿态响应，不影响正常视口响应式排版。"
+    },
+    "credential-management-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核无生物识别安全硬件与系统级凭据管理器集成。",
+      "user_impact": "无系统原生生物凭据弹窗，应用可通过标准 Cookie 与 Token 完成身份认证。"
+    },
+    "pointerlock-2": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核无物理鼠标指针独占锁定与无限位移事件链路。",
+      "user_impact": "无 FPS 游戏指针独占锁定，不影响常规鼠标点击与输入。"
+    },
+    "generic-sensor": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无宿主系统通用物理硬件传感器框架。",
+      "user_impact": "无对应物理传感数据输入，不影响页面 DOM 排版、脚本执行与数据自动化抓取。"
+    },
+    "accelerometer": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核运行在无物理加速度计芯片的服务器环境。",
+      "user_impact": "无对应物理传感数据输入，不影响页面 DOM 排版、脚本执行与数据自动化抓取。"
+    },
+    "gyroscope": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核运行在无三轴角速度陀螺仪硬件的环境。",
+      "user_impact": "无对应物理传感数据输入，不影响页面 DOM 排版、脚本执行与数据自动化抓取。"
+    },
+    "magnetometer": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核运行在无地磁传感器指南针硬件的服务器环境。",
+      "user_impact": "无对应物理传感数据输入，不影响页面 DOM 排版、脚本执行与数据自动化抓取。"
+    },
+    "ambient-light": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理环境光强感应硬件。",
+      "user_impact": "无对应物理传感数据输入，不影响页面 DOM 排版、脚本执行与数据自动化抓取。"
+    },
+    "proximity": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无红外距离物理感应硬件。",
+      "user_impact": "无对应物理传感数据输入，不影响页面 DOM 排版、脚本执行与数据自动化抓取。"
+    },
+    "geolocation-sensor": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无板载 GPS/北斗卫星定位基带芯片。",
+      "user_impact": "无对应物理传感数据输入，不影响页面 DOM 排版、脚本执行与数据自动化抓取。"
+    },
+    "geolocation-element": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核无地理位置授权交互 UI 控件。",
+      "user_impact": "无对应物理传感数据输入，不影响页面 DOM 排版、脚本执行与数据自动化抓取。"
+    },
+    "bluetooth": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核无宿主物理蓝牙射频控制器与低功耗蓝牙协议栈。",
+      "user_impact": "无物理外设直接通信链路，页面可通过标准网络 HTTP/WebSocket 协议完成设备间数据交换。"
+    },
+    "bluetooth-scanning": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无蓝牙广播信标扫描硬件管道。",
+      "user_impact": "无物理外设直接通信链路，页面可通过标准网络 HTTP/WebSocket 协议完成设备间数据交换。"
+    },
+    "usb": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核为纯数据服务进程，无物理 USB 主机控制器热插拔权限。",
+      "user_impact": "无物理外设直接通信链路，页面可通过标准网络 HTTP/WebSocket 协议完成设备间数据交换。"
+    },
+    "serial": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核无物理 RS-232/UART 串行端口通信硬件。",
+      "user_impact": "无物理外设直接通信链路，页面可通过标准网络 HTTP/WebSocket 协议完成设备间数据交换。"
+    },
+    "hid": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无操作系统级人机交互输入设备 (HID) 物理总线驱动。",
+      "user_impact": "无物理外设直接通信链路，页面可通过标准网络 HTTP/WebSocket 协议完成设备间数据交换。"
+    },
+    "web-nfc": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无 NFC 近场射频读写天线与硬件控制器。",
+      "user_impact": "无物理外设直接通信链路，页面可通过标准网络 HTTP/WebSocket 协议完成设备间数据交换。"
+    },
+    "webmidi": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理 MIDI 乐器数字接口与合成器硬件端口。",
+      "user_impact": "无物理外设直接通信链路，页面可通过标准网络 HTTP/WebSocket 协议完成设备间数据交换。"
+    },
+    "webxr": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核运行在无物理 VR 头显或 AR 眼镜光学显示器的环境。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-ar-module-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理透视摄像头与空间锚定硬件。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-depth-sensing-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理 LiDAR/深度 ToF 传感器硬件。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-dom-overlays-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无 XR 沉浸式立体视野下的 DOM 空间覆层渲染面。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-gamepads-module-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无空间六自由度 (6DoF) XR 手柄追踪硬件。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-hand-input-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理立体手势视觉识别与骨骼追踪摄像头。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-hit-test-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理真实空间几何平面碰撞检测硬件。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-lighting-estimation-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无真实环境光照探测传感器。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-plane-detection": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理三维空间平面检测引擎与空间扫描仪。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "webxr-webgpu-binding": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无 XR 沉浸式设备专用 WebGPU 渲染管线。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "anchors": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理世界空间坐标锚点持久化追踪系统。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "body-tracking": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无全身体态立体动作捕捉摄像头。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "raw-camera-access": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核为无头守护进程，无物理视频摄像头硬件输入流。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "real-world-meshing": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理真实环境三维网格扫描硬件。",
+      "user_impact": "无沉浸式三维硬件呈现，不影响常规二维 Web 页面排版、渲染与自动化数据处理。"
+    },
+    "battery-status": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核运行在持续供电服务器或容器环境，无物理化学电池。",
+      "user_impact": "无对应物理硬件状态查询或物理投屏输出，常规浏览与富文本交互完全不受影响。"
+    },
+    "vibration": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核无物理线性偏心马达或触觉震动硬件。",
+      "user_impact": "无对应物理硬件状态查询或物理投屏输出，常规浏览与富文本交互完全不受影响。"
+    },
+    "presentation-api": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核无物理外接显示屏无线投屏投射硬件。",
+      "user_impact": "无对应物理硬件状态查询或物理投屏输出，常规浏览与富文本交互完全不受影响。"
+    },
+    "remote-playback": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头微内核无 AirPlay/DLNA 外接远端多媒体播放器链路。",
+      "user_impact": "无对应物理硬件状态查询或物理投屏输出，常规浏览与富文本交互完全不受影响。"
+    },
+    "screen-capture": {
+      "status": "放弃兼容",
+      "reason": "嵌入式微内核运行在无物理桌面环境，无需操作系统级物理桌面捕获。",
+      "user_impact": "无对应物理硬件状态查询或物理投屏输出，常规浏览与富文本交互完全不受影响。"
+    },
+    "webgpu": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WGSL": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "webxrlayers-1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "ANGLE_instanced_arrays": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_blend_minmax": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_clip_control": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_color_buffer_float": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_color_buffer_half_float": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_conservative_depth": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_depth_clamp": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_disjoint_timer_query_webgl2": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_disjoint_timer_query": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_float_blend": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_frag_depth": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_polygon_offset_clamp": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_render_snorm": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_shader_texture_lod": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_sRGB": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_texture_compression_bptc": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_texture_compression_rgtc": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_texture_filter_anisotropic": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_texture_mirror_clamp_to_edge": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "EXT_texture_norm16": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "KHR_parallel_shader_compile": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "NV_shader_noperspective_interpolation": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_draw_buffers_indexed": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_element_index_uint": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_fbo_render_mipmap": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_sample_variables": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_shader_multisample_interpolation": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_standard_derivatives": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_texture_float_linear": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_texture_float": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_texture_half_float_linear": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_texture_half_float": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OES_vertex_array_object": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "OVR_multiview2": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_blend_equation_advanced_coherent": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_blend_func_extended": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_clip_cull_distance": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_color_buffer_float": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_compressed_texture_astc": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_compressed_texture_etc": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_compressed_texture_etc1": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_compressed_texture_pvrtc": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_compressed_texture_s3tc_srgb": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_compressed_texture_s3tc": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_debug_shaders": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_depth_texture": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_draw_buffers": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_draw_instanced_base_vertex_base_instance": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_lose_context": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_multi_draw_instanced_base_vertex_base_instance": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_multi_draw": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_polygon_mode": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_provoking_vertex": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_render_shared_exponent": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_shader_pixel_local_storage": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "WEBGL_stencil_texturing": {
+      "status": "放弃兼容",
+      "reason": "嵌入式无头渲染微内核运行在无物理 GPU 加速硬件的无头服务器与容器环境中。",
+      "user_impact": "无 GPU 硬件级三维光栅化加速扩展，不影响 HTML5 2D Canvas 画布与常规 DOM/CSS 页面排版渲染。"
+    },
+    "fido-client-to-authenticator-protocol-v2.1": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "fido-client-to-authenticator-protocol-v2.2": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "fido-client-to-authenticator-protocol-v2.3": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "webauthn-3": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "webauthn-4": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "web-smart-card": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "payment-request": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "payment-method-id": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "payment-method-manifest": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "web-based-payment-handler": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "digital-goods": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "paymentlink": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "keyboard-lock": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "keyboard-map": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "contact-picker": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "handwriting-recognition": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "ink-enhancement": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "eyedropper-api": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "orientation-sensor": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "orientation-event": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "device-attributes": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "managed-configuration": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "window-management": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "window-controls-overlay": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "web-share": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "web-share-target": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "web-app-launch": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "get-installed-related-apps": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "captured-mouse-events": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "element-capture": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-automation": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-extensions": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-handle-actions": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-surface-control": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-fromelement": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-region": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-streams": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-transform": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "mediacapture-viewport": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "image-capture": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "html-media-capture": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "encrypted-media-2": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "direct-sockets": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "webtransport": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "file-system-access": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "fs": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "entries-api": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "private-aggregation-api": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "topics": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "private-click-measurement": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "attribution-reporting-api": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "attribution": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "trust-token-api": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "storage-access": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "storage-access-headers": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "saa-non-cookie-storage": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "requestStorageAccessFor": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "model-element": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "ESSL": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "av1-hdr10plus": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "av1-mpeg2-ts": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    },
+    "av1-rtp-spec": {
+      "status": "放弃兼容",
+      "reason": "mioa-core 为轻量级嵌入式无头微内核与本地渲染引擎，运行于无物理硬件设备（无摄像头/麦克风/蓝牙/智能卡/生物指纹识别仪/硬件移动传感器）、无物理显示器管理及无第三方广告追踪归因沙箱的容器环境；微内核明确收敛系统边界，放弃对该类硬件驱动接口与追踪聚合机制的原生实现。",
+      "user_impact": "仅影响重度依赖物理外设、硬件生物认证、原生应用市场或跨源广告归因追踪的专有 Web 场景；对核心网页内容抓取、表单交互自动化、数据流式抽取与端侧排版渲染场景完全无阻断影响。"
+    }
+  }
+}

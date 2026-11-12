@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "scope": "project-authored bounded PNG ancillary chunk alphabet inputs",
+  "cases": [
+    [],
+    [
+      {"kind": "76704167", "payload": "70616464696e67"},
+      {"kind": "74305874", "payload": "726564756365"},
+      {"kind": "76704167", "payload": "7461696c"}
+    ],
+    [{"kind": "76707f67", "payload": "01"}],
+    [{"kind": "767041ff", "payload": "0203"}]
+  ]
+}
