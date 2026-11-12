@@ -23,6 +23,8 @@
 //! clear the entire arena when exiting the program.
 const std = @import("std");
 const lp = @import("lightpanda");
+const ThreadApi = @import("thread_api");
+const ProcessApi = @import("process_api");
 
 const log = lp.log;
 const assert = std.debug.assert;
@@ -33,7 +35,6 @@ const SigHandler = @This();
 arena: Allocator,
 
 sigset: std.posix.sigset_t = undefined,
-handle_thread: ?std.Thread = null,
 
 attempt: u32 = 0,
 mutex: std.Io.Mutex = .init,
@@ -58,8 +59,14 @@ pub fn install(self: *SigHandler) !void {
     std.posix.sigaddset(&self.sigset, std.posix.SIG.ALRM);
     std.posix.sigprocmask(std.posix.SIG.BLOCK, &self.sigset, null);
 
-    self.handle_thread = try std.Thread.spawn(.{ .allocator = self.arena }, SigHandler.sighandle, .{self});
-    self.handle_thread.?.detach();
+    var handle: ?*anyopaque = null;
+    const status = ThreadApi.mioa_thread_start_v1(sighandleEntry, self, &handle);
+    switch (status) {
+        ThreadApi.MIOA_THREAD_OK => ThreadApi.mioa_thread_detach_v1(&handle),
+        ThreadApi.MIOA_THREAD_NO_MEMORY => return error.OutOfMemory,
+        ThreadApi.MIOA_THREAD_START_FAILED => return error.ThreadStartFailed,
+        else => unreachable,
+    }
 }
 
 const itimerval = extern struct {
@@ -119,6 +126,10 @@ pub fn on(self: *SigHandler, func: anytype, args: std.meta.ArgsTuple(@TypeOf(fun
     }
 }
 
+fn sighandleEntry(context: ?*anyopaque) callconv(.c) void {
+    const self: *SigHandler = @ptrCast(@alignCast(context.?));
+    SigHandler.sighandle(self);
+}
 fn sighandle(self: *SigHandler) noreturn {
     while (true) {
         var sig: c_int = 0;
@@ -126,7 +137,7 @@ fn sighandle(self: *SigHandler) noreturn {
         const rc = std.c.sigwait(&self.sigset, &sig);
         if (rc != 0) {
             log.err(.app, "Unable to process signal {}", .{rc});
-            std.process.exit(1);
+            ProcessApi.mioa_process_exit_v1(1);
         }
 
         switch (@as(std.posix.SIG, @fromBackingInt(@intCast(sig)))) {
@@ -134,7 +145,7 @@ fn sighandle(self: *SigHandler) noreturn {
                 self.mutex.lockUncancelable(lp.io);
                 if (self.attempt > 1 and !self.no_hard_exit) {
                     self.mutex.unlock(lp.io);
-                    std.process.exit(1);
+                    ProcessApi.mioa_process_exit_v1(1);
                 }
                 // While `no_hard_exit` is set, cap the counter so a later
                 // flip back to false (e.g. agent-suspend/resume) doesn't

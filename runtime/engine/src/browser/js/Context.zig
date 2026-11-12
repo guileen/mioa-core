@@ -175,6 +175,58 @@ pub fn fromIsolate(isolate: js.Isolate) ?struct { *Context, *const v8.Context } 
     return .{ ctx, v8_incumbent };
 }
 
+// Complete live profile callbacks before engine detachment can release
+// context-owned resources. Detachment may itself enqueue cleanup, so repeat
+// the nonblocking failure barrier before resetting the scheduler.
+pub fn detachProfile(self: *Context) void {
+    const manager = &self.page.session.idb;
+    finishProfileDetach(manager);
+    manager.detachContext(self);
+    finishProfileDetach(manager);
+}
+
+fn finishProfileDetach(manager: *@import("../webapi/storage/idb/Manager.zig")) void {
+    if (manager.profile_async) |client| {
+        if (client.hasCallbacks()) manager.failAll(error.ProfileServiceLost);
+    }
+}
+
+test "profile detach completes outstanding callbacks before returning" {
+    const ProfileAsync = @import("../webapi/storage/ProfileAsync.zig");
+    const Manager = @import("../webapi/storage/idb/Manager.zig");
+    var sockets: [2]std.posix.socket_t = undefined;
+    if (std.c.socketpair(std.posix.AF.LOCAL, std.posix.SOCK.STREAM, 0, &sockets) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(sockets[1]);
+    var client = ProfileAsync.Client.init(sockets[0], std.testing.allocator);
+    defer client.deinit();
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    manager.profile_async = &client;
+
+    const State = struct {
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn complete(ctx: *anyopaque, result: ProfileAsync.Result) void {
+            const state: *@This() = @ptrCast(@alignCast(ctx));
+            state.calls += 1;
+            switch (result) {
+                .failure => |err| state.failure = err,
+                .reply => |reply| reply.deinit(),
+            }
+        }
+    };
+    var state: State = .{};
+    finishProfileDetach(&manager);
+    try std.testing.expect(!client.failed);
+    _ = try client.submit("test", struct {}{}, &state, State.complete);
+    finishProfileDetach(&manager);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectEqual(error.ProfileServiceLost, state.failure.?);
+    try std.testing.expect(client.failed);
+    finishProfileDetach(&manager);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+}
+
 pub fn deinit(self: *Context) void {
     if (comptime lp.IS_DEBUG and lp.IS_TEST == false) {
         var it = self.unknown_properties.iterator();
@@ -196,9 +248,7 @@ pub fn deinit(self: *Context) void {
     env.tearing_down = true;
     defer env.tearing_down = was_tearing_down;
 
-    // Unlink any IndexedDB gate participants first: the session-scoped engine
-    // must never wake a waiter into this scheduler once it's torn down.
-    self.page.session.idb.detachContext(self);
+    self.detachProfile();
 
     var hs: js.HandleScope = undefined;
     const entered = self.enter(&hs);

@@ -22,13 +22,13 @@
 //! just deals in bytes.
 
 const std = @import("std");
-const js = @import("../../js/js.zig");
+const OneByte = @import("../../js/String.zig").OneByte;
 
 const Allocator = std.mem.Allocator;
 
 pub const BinInput = union(enum) {
     // order matters
-    js_string: js.String.OneByte,
+    js_string: OneByte,
     raw: []const u8,
 
     fn bytes(self: BinInput) []const u8 {
@@ -52,7 +52,8 @@ pub fn encode(alloc: Allocator, in: BinInput) ![]const u8 {
 /// std's decoders reject non-canonical trailing bits (e.g. "ab") and only trim
 /// padding from the ends, neither of which match forgiving-base64 — so decode by
 /// hand in one pass: skip ASCII whitespace anywhere, accept up to two trailing
-/// "=", tolerate trailing bits.
+/// "=", tolerate trailing bits. Allocate from the unpadded input's sextet count:
+/// exact for canonical input, an upper bound when whitespace is present.
 pub fn decode(alloc: Allocator, in: BinInput) ![]const u8 {
     const input = in.bytes();
 
@@ -71,7 +72,7 @@ pub fn decode(alloc: Allocator, in: BinInput) ![]const u8 {
         }
     }
 
-    const out = try alloc.alloc(u8, end / 4 * 3 + 2);
+    const out = try alloc.alloc(u8, end / 4 * 3 + end % 4 * 3 / 4);
     errdefer alloc.free(out);
 
     var oi: usize = 0;
@@ -187,5 +188,21 @@ test "base64: decode matches std on canonical input" {
         const out = try testDecode(encoded);
         defer std.testing.allocator.free(out);
         try std.testing.expectEqualSlices(u8, raw[0..len], out);
+    }
+}
+
+test "base64: canonical decode fits the exact output capacity" {
+    var raw: [300]u8 = undefined;
+    for (&raw, 0..) |*byte, index| byte.* = @truncate(index);
+    var encoded_buffer: [400]u8 = undefined;
+    var decoded_buffer: [300]u8 = undefined;
+    for (0..raw.len + 1) |len| {
+        const encoded = std.base64.standard.Encoder.encode(&encoded_buffer, raw[0..len]);
+        for ([_][]const u8{ encoded, std.mem.trimEnd(u8, encoded, "=") }) |input| {
+            var fixed = std.heap.FixedBufferAllocator.init(decoded_buffer[0..len]);
+            const decoded = try decode(fixed.allocator(), .{ .raw = input });
+            defer fixed.allocator().free(decoded);
+            try std.testing.expectEqualSlices(u8, raw[0..len], decoded);
+        }
     }
 }

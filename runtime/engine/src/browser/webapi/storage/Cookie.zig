@@ -26,6 +26,7 @@ const public_suffix_list = @import("../../../data/public_suffix_list.zig").looku
 const repeat = @import("../../../string.zig").repeat;
 const Sqlite = @import("../../../storage/sqlite/Sqlite.zig");
 const Persistence = @import("Persistence.zig");
+const ProfileIpc = @import("ProfileIpc.zig");
 
 const log = lp.log;
 const Allocator = std.mem.Allocator;
@@ -33,9 +34,35 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const Cookie = @This();
 
-const max_cookie_size = 4 * 1024;
+pub const max_cookie_size = 4 * 1024;
 const max_cookie_header_size = 8 * 1024;
 const max_jar_size = 1024;
+
+// Reserve the complete event envelope (including the service's type/sequence)
+// before accepting fields. Python's ASCII JSON encoding can expand Unicode,
+// even though the native owner's UTF-8 frame is smaller.
+pub fn changeEventFits(name: []const u8, value: []const u8, domain: []const u8, path: []const u8) bool {
+    var remaining: usize = @import("ProfileIpc.zig").max_message - 512;
+    for ([_][]const u8{ name, value, domain, path }) |field| {
+        for (field) |byte| {
+            const cost: usize = if (byte < 0x20)
+                6
+            else if (byte == '"' or byte == '\\')
+                2
+            else if (byte < 0x80)
+                1
+            else if (byte < 0xc0)
+                0
+            else if (byte < 0xf0)
+                6
+            else
+                12;
+            if (cost > remaining) return false;
+            remaining -= cost;
+        }
+    }
+    return true;
+}
 
 arena: ArenaAllocator,
 name: []const u8,
@@ -178,7 +205,7 @@ pub fn parse(allocator: Allocator, url: [:0]const u8, str: []const u8) !Cookie {
         }
     }
 
-    if (cookie_value.len > max_cookie_size) {
+    if (cookie_name.len + cookie_value.len > max_cookie_size) {
         return error.CookieSizeExceeded;
     }
 
@@ -189,6 +216,7 @@ pub fn parse(allocator: Allocator, url: [:0]const u8, str: []const u8) !Cookie {
     const owned_value = try aa.dupe(u8, cookie_value);
     const owned_path = try parsePath(aa, url, path);
     const owned_domain = try parseDomain(aa, url, domain);
+    if (!changeEventFits(owned_name, owned_value, owned_domain, owned_path)) return error.CookieSizeExceeded;
 
     var normalized_expires: ?f64 = null;
     if (max_age) |ma| {
@@ -281,6 +309,7 @@ pub fn fromFields(allocator: Allocator, url: ?[:0]const u8, fields: Fields) erro
     };
     // Without a url there's nothing to encode: only the dupe can fail.
     const path = parsePath(a, null, fields.path) catch return error.OutOfMemory;
+    if (!changeEventFits(name, value, domain, path)) return error.InvalidCookie;
 
     if (prefixOf(fields.name)) |prefix| {
         if (!prefix.allows(fields.secure, fields.http_only, fields.domain != null, path)) {
@@ -648,6 +677,8 @@ pub const Jar = struct {
     notification: ?*Notification = null,
     // Session-owned connection; no mutable process-wide profile path.
     conn: ?Sqlite.Conn = null,
+    // Set only for a Session backed by the exclusive Profile service.
+    profile_client: ?*ProfileIpc.Client = null,
 
     pub fn init(allocator: Allocator, notification: ?*Notification) Jar {
         return .{
@@ -666,8 +697,14 @@ pub const Jar = struct {
     }
 
     pub fn clearRetainingCapacity(self: *Jar) !void {
+        if (self.profile_client) |client| {
+            const reply = try client.request(self.allocator, "cookies.clear", struct {}{});
+            defer reply.deinit();
+            return;
+        }
         if (self.conn) |conn| try conn.exec("delete from cookies", .{});
-        for (self.cookies.items) |c| {
+        for (self.cookies.items) |*c| {
+            self.dispatchChange(.deleted, c);
             c.deinit();
         }
         self.cookies.clearRetainingCapacity();
@@ -754,6 +791,7 @@ pub const Jar = struct {
     }
 
     pub fn removeAt(self: *Jar, index: usize) !void {
+        if (self.profile_client != null) return error.ProfileCookieOperationUnsupported;
         const cookie = &self.cookies.items[index];
         if (self.conn) |conn| try conn.exec("delete from cookies where domain=?1 and path=?2 and name=?3", .{ cookie.domain, cookie.path, cookie.name });
         self.dispatchChange(.deleted, cookie);
@@ -773,13 +811,16 @@ pub const Jar = struct {
         // `add` takes ownership of `cookie` unconditionally on entry.
         var stored = false;
         defer if (!stored) cookie.deinit();
+        // Jar.add owns the cookie on entry, even when a shared operation is refused.
+        if (self.profile_client != null) return error.ProfileCookieOperationUnsupported;
 
         if (self.cookies.items.len >= max_jar_size) {
             return error.CookieJarQuotaExceeded;
         }
-        if (cookie.value.len > max_cookie_size) {
+        if (cookie.name.len + cookie.value.len > max_cookie_size) {
             return error.CookieSizeExceeded;
         }
+        if (!changeEventFits(cookie.name, cookie.value, cookie.domain, cookie.path)) return error.CookieSizeExceeded;
 
         const is_expired = isCookieExpired(&cookie, request_time);
 
@@ -798,6 +839,12 @@ pub const Jar = struct {
             if (is_expired) {
                 try self.removeAt(i);
             } else {
+                if (std.mem.eql(u8, cookie.value, c.value) and cookie.expires == c.expires and
+                    cookie.secure == c.secure and cookie.http_only == c.http_only and
+                    cookie.same_site == c.same_site and cookie.same_site_default == c.same_site_default)
+                {
+                    return;
+                }
                 // RFC 6265bis 5.7 step 23: the replacement keeps the
                 // creation time of the cookie it replaces.
                 cookie.creation_time = c.creation_time;
@@ -845,6 +892,7 @@ pub const Jar = struct {
     }
 
     pub fn removeExpired(self: *Jar, request_time: ?u64) !void {
+        if (self.profile_client != null) return error.ProfileCookieOperationUnsupported;
         if (self.cookies.items.len == 0) return;
         const time = request_time orelse lp.datetime.timestamp(.real);
         var i: usize = self.cookies.items.len;
@@ -867,6 +915,26 @@ pub const Jar = struct {
         origin_url: SiteForCookies,
     };
     pub fn forRequest(self: *Jar, target_url: [:0]const u8, writer: anytype, opts: LookupOpts) !void {
+        if (self.profile_client) |client| {
+            const origin_url: ?[]const u8 = switch (opts.origin_url) {
+                .none => null,
+                .url => |url| url,
+            };
+            const reply = try client.request(self.allocator, "cookies.header", .{
+                .url = target_url,
+                .origin_url = origin_url,
+                .is_http = opts.is_http,
+                .kind = opts.kind,
+            });
+            defer reply.deinit();
+            const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+            if (result != .string) return error.ProfileProtocolError;
+            if (result.string.len != 0) {
+                if (opts.prefix) |prefix| try writer.writeAll(prefix);
+                try writer.writeAll(result.string);
+            }
+            return;
+        }
         const target = PreparedUri.init(target_url);
         const same_site = areSameSite(opts.origin_url, target.host);
         const now = opts.request_time orelse lp.datetime.timestamp(.real);
@@ -906,6 +974,16 @@ pub const Jar = struct {
     }
 
     pub fn populateFromResponse(self: *Jar, url: [:0]const u8, set_cookie: []const u8) !void {
+        if (self.profile_client) |client| {
+            const reply = try client.request(self.allocator, "cookies.set", .{
+                .url = url,
+                .header = set_cookie,
+                .is_http = true,
+                .origin_url = @as(?[]const u8, null),
+            });
+            defer reply.deinit();
+            return;
+        }
         const c = Cookie.parse(self.allocator, url, set_cookie) catch |err| {
             log.debug(.frame, "cookie parse failed", .{ .raw = set_cookie, .err = err });
             return;
@@ -1808,6 +1886,17 @@ test "Cookie: parse domain" {
 test "Cookie: parse limit" {
     try expectError(error.CookieHeaderSizeExceeded, "http://lightpanda.io/", repeat("v", 8192) ++ ";domain=lightpanda.io");
     try expectError(error.CookieSizeExceeded, "http://lightpanda.io/", repeat("v", 4096) ++ "v;domain=lightpanda.io");
+    try expectError(error.CookieSizeExceeded, "http://lightpanda.io/", repeat("n", 4096) ++ "=v");
+    try expectError(error.CookieSizeExceeded, "http://lightpanda.io/", repeat("é", 2048) ++ "=v");
+    for ([_][]const u8{
+        repeat("n", 4095) ++ "=v",
+        repeat("é", 2047) ++ "u=v",
+        "n=" ++ repeat("v", 4095),
+    }) |header| {
+        const cookie = try Cookie.parse(testing.allocator, "http://lightpanda.io/", header);
+        defer cookie.deinit();
+        try testing.expectEqual(@as(usize, 4096), cookie.name.len + cookie.value.len);
+    }
 }
 
 const ExpectedCookie = struct {
@@ -1935,4 +2024,22 @@ test "cookie mutations commit before acknowledgement and preserve scope on resto
     try testing.expectEqual(@as(i64, 1), (try restored.conn.?.scalar(i64, "select count(*) from cookies", .{})).?);
     try jar.clearRetainingCapacity();
     try testing.expectEqual(@as(i64, 0), (try restored.conn.?.scalar(i64, "select count(*) from cookies", .{})).?);
+}
+
+test "Jar rejects an unrepresentable event before cookie mutation" {
+    var jar = Jar.init(testing.allocator, null);
+    defer jar.deinit();
+    var path: [@import("ProfileIpc.zig").max_message]u8 = @splat('p');
+    path[0] = '/';
+    try testing.expectError(error.CookieSizeExceeded, jar.add(.{
+        .arena = ArenaAllocator.init(testing.allocator),
+        .name = "oversized-attribute",
+        .value = "v",
+        .domain = "example.test",
+        .path = &path,
+        .expires = null,
+    }, lp.datetime.timestamp(.real), true));
+    try testing.expectEqual(@as(usize, 0), jar.cookies.items.len);
+    try jar.populateFromResponse("https://example.test/", "after-rejection=ok; Path=/");
+    try testing.expectEqual(@as(usize, 1), jar.cookies.items.len);
 }

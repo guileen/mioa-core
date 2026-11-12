@@ -164,6 +164,8 @@ const CallOpts = struct {
     rethrow: bool = false,
 };
 fn _tryCallWithThis(self: *const Function, comptime T: type, this: anytype, args: anytype, caught: *js.TryCatch.Caught, comptime opts: CallOpts) !T {
+    try @import("../TaskGate.zig").enter();
+    defer @import("../TaskGate.zig").exit();
     const local = self.local;
 
     if (comptime lp.IS_DEBUG == false) {

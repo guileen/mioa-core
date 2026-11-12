@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+const ThreadApi = @import("thread_api");
 
 const Env = @import("browser/js/Env.zig");
 
@@ -37,7 +38,7 @@ const Watchdog = @This();
 // null == disabled: no thread, register/unregister no-op.
 timeout_ms: ?u32,
 shutdown: bool = false,
-thread: ?std.Thread = null,
+thread: ?*anyopaque = null,
 mutex: std.Io.Mutex = .init,
 cond: std.Io.Condition = .init,
 entries: std.DoublyLinkedList = .{},
@@ -59,14 +60,14 @@ pub fn init(timeout_ms: ?u32) Watchdog {
 }
 
 pub fn deinit(self: *Watchdog) void {
-    const thread = self.thread orelse return;
+    if (self.thread == null) return;
     {
         self.mutex.lockUncancelable(lp.io);
         defer self.mutex.unlock(lp.io);
         self.shutdown = true;
         self.cond.signal(lp.io);
     }
-    thread.join();
+    ThreadApi.mioa_thread_join_v1(&self.thread);
 }
 
 // Call once the Watchdog is at its final address (init returns by value).
@@ -74,7 +75,18 @@ pub fn start(self: *Watchdog) !void {
     if (self.timeout_ms == null) {
         return;
     }
-    self.thread = try std.Thread.spawn(.{}, run, .{self});
+    const status = ThreadApi.mioa_thread_start_v1(runEntry, self, &self.thread);
+    switch (status) {
+        ThreadApi.MIOA_THREAD_OK => {},
+        ThreadApi.MIOA_THREAD_NO_MEMORY => return error.OutOfMemory,
+        ThreadApi.MIOA_THREAD_START_FAILED => return error.ThreadStartFailed,
+        else => unreachable,
+    }
+}
+
+fn runEntry(context: ?*anyopaque) callconv(.c) void {
+    const self: *Watchdog = @ptrCast(@alignCast(context.?));
+    run(self);
 }
 
 pub fn register(self: *Watchdog, entry: *Entry) void {
@@ -273,4 +285,11 @@ test "Watchdog: no native report once the script report has been logged" {
 
     watchdog.scan(now + 9_000);
     try testing.expectEqual(false, entry.native_reported);
+}
+test "Watchdog: worker handle is joined and consumed on deinit" {
+    var watchdog = Watchdog.init(30_000);
+    try watchdog.start();
+    try std.testing.expect(watchdog.thread != null);
+    watchdog.deinit();
+    try std.testing.expect(watchdog.thread == null);
 }

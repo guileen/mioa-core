@@ -23,6 +23,16 @@ const crypto = @import("libcrypto.zig");
 
 const c = @import("curl");
 
+extern "c" fn lp_runtime_malloc(usize) ?*anyopaque;
+extern "c" fn lp_runtime_c_free(?*anyopaque) void;
+extern "c" fn lp_runtime_realloc(?*anyopaque, usize) ?*anyopaque;
+extern "c" fn lp_runtime_calloc(usize, usize) ?*anyopaque;
+extern "c" fn lp_runtime_strdup([*:0]const u8) ?[*:0]u8;
+
+fn runtimeStrdup(text: [*c]const u8) callconv(.c) [*c]u8 {
+    return @ptrCast(lp_runtime_strdup(@ptrCast(text orelse return null)));
+}
+
 pub const Curl = c.CURL;
 pub const CurlM = c.CURLM;
 pub const CurlCode = c.CURLcode;
@@ -548,6 +558,18 @@ const CurlMsg = struct {
 
 pub fn curl_global_init(flags: CurlGlobalFlags, comptime curl_allocator: ?CurlAllocator) Error!void {
     const alloc = curl_allocator orelse {
+        // curl_global_init_mem installs all callbacks before initializing TLS,
+        // the resolver or other curl globals. Standalone callers stay default.
+        if (lp.RuntimeMemory.isManaged()) {
+            return errorCheck(c.curl_global_init_mem(
+                flags.to_c(),
+                lp_runtime_malloc,
+                lp_runtime_c_free,
+                lp_runtime_realloc,
+                runtimeStrdup,
+                lp_runtime_calloc,
+            ));
+        }
         return errorCheck(c.curl_global_init(flags.to_c()));
     };
 

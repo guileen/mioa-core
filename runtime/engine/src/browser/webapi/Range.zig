@@ -25,12 +25,17 @@ const Node = @import("Node.zig");
 const DOMRect = @import("DOMRect.zig");
 const DocumentFragment = @import("DocumentFragment.zig");
 const AbstractRange = @import("AbstractRange.zig");
+const Selection = @import("Selection.zig");
 
 const Range = @This();
 
 pub const Proto = AbstractRange;
 
 _proto: *AbstractRange,
+// A range can remain installed in one selection after moving into another
+// document, where another selection can also adopt it. Intrusive links avoid
+// allocating storage for those selection owners.
+_selections: ?*Selection = null,
 
 pub fn init(frame: *Frame) !*Range {
     return initIn(frame.document.asNode(), frame);
@@ -75,6 +80,7 @@ pub fn setStart(self: *Range, node: *Node, offset: u32) !void {
         self._proto._end_container = self._proto._start_container;
         self._proto._end_offset = self._proto._start_offset;
     }
+    self.selectionChanged();
 }
 
 pub fn setEnd(self: *Range, node: *Node, offset: u32) !void {
@@ -96,6 +102,15 @@ pub fn setEnd(self: *Range, node: *Node, offset: u32) !void {
     if (start_root != end_root or self._proto.isStartAfterEnd()) {
         self._proto._start_container = self._proto._end_container;
         self._proto._start_offset = self._proto._end_offset;
+    }
+    self.selectionChanged();
+}
+
+fn selectionChanged(self: *Range) void {
+    var selection = self._selections;
+    while (selection) |current| : (selection = current._range_next) {
+        const document: *@import("Document.zig") = @fieldParentPtr("_selection", current);
+        if (document._frame) |owner| owner.page.visualChanged();
     }
 }
 
@@ -145,6 +160,7 @@ pub fn collapse(self: *Range, to_start: ?bool) void {
         self._proto._start_container = self._proto._end_container;
         self._proto._start_offset = self._proto._end_offset;
     }
+    self.selectionChanged();
 }
 
 pub fn detach(_: *Range) void {

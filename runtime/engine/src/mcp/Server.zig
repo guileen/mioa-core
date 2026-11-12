@@ -113,6 +113,27 @@ pub fn idle(self: *Self) u31 {
     return entry.session.idleSlice();
 }
 
+pub fn profileEventFd(self: *Self) ?std.posix.fd_t {
+    return @import("../browser/Runner.zig").profileEventFd(self.active_session.session.browser);
+}
+
+pub fn profileAsyncPollFd(self: *Self) ?std.posix.pollfd {
+    return @import("../browser/Runner.zig").profileAsyncPollFd(self.active_session.session.browser);
+}
+
+pub fn profileAsyncTimeout(self: *Self) ?u32 {
+    const client = if (self.active_session.session.profile_async_client) |*c| c else return null;
+    return client.timeoutMillis();
+}
+
+pub fn waitProfileEvents(self: *Self, timeout_ms: u32) void {
+    const entry = self.active_session;
+    entry.enterIsolate();
+    defer entry.exitIsolate();
+    var runner = entry.session.runner(.{});
+    _ = runner.tickNetwork(timeout_ms) catch {};
+}
+
 pub fn sendError(self: *Self, id: std.json.Value, code: protocol.ErrorCode, message: []const u8) !void {
     return self.transport.sendError(id, code, message);
 }

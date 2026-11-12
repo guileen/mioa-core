@@ -340,7 +340,7 @@ const CloneError = error{
     MethodNotFound,
     DeadFunctionHandle,
     InvalidArgument,
-};
+} || @import("../../browser/TaskGate.zig").Error;
 
 fn cloneErrorMessage(err: anyerror) []const u8 {
     return switch (err) {

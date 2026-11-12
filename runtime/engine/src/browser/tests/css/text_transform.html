@@ -37,6 +37,18 @@
 <div id=mixed>a <b class=upper>bold</b> <i class=cap>two words</i> z</div>
 <div id=nested class=cap><span>one</span><span class=lower>TWO</span> three</div>
 
+<div class=upper id=slot-host><span id=slotted-transform>Mixed</span></div>
+
+<script id=shadow_inheritance>
+  const host = $('#slot-host');
+  host.attachShadow({ mode: 'open' }).innerHTML =
+    '<style>slot { text-transform: lowercase; }</style><slot></slot>';
+  const slotted = $('#slotted-transform');
+  testing.expectEqual('lowercase', getComputedStyle(slotted).getPropertyValue('text-transform'));
+  testing.expectEqual('mixed', slotted.innerText);
+</script>
+
+
 <script id=computed>
   const tt = (id) => getComputedStyle($('#' + id)).textTransform;
   testing.expectEqual('uppercase', tt('inline'));

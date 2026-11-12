@@ -60,8 +60,12 @@ fn getDisabled(self: *const CSSStyleSheet) bool {
     return self._disabled;
 }
 
-fn setDisabled(self: *CSSStyleSheet, disabled: bool) void {
+fn setDisabled(self: *CSSStyleSheet, disabled: bool, frame: *Frame) void {
+    if (self._disabled == disabled) return;
     self._disabled = disabled;
+    if (self.ownerStyleManager(frame)) |style_manager| {
+        style_manager.sheetModified();
+    }
 }
 
 fn getCssRules(self: *CSSStyleSheet, frame: *Frame) !*CSSRuleList {
@@ -95,6 +99,7 @@ pub fn insertRule(self: *CSSStyleSheet, rule: []const u8, maybe_index: ?u32, fra
     const inserted: *CSSRule = switch (parsed_rule) {
         .style => |s| blk: {
             const style_rule = try CSSStyleRule.init(frame);
+            style_rule._owner_element = self._owner_node;
             try style_rule.setSelectorText(s.selector, frame);
 
             const style_props = try style_rule.getStyle(frame);
@@ -176,10 +181,11 @@ pub fn replace(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!j
 pub fn replaceSync(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
     const rules = try self.getCssRules(frame);
     rules.clear();
-    try self.parseInto(text, frame);
-    if (self.ownerStyleManager(frame)) |style_manager| {
+    // Clearing is already a mutation, even if parsing a replacement fails.
+    defer if (self.ownerStyleManager(frame)) |style_manager| {
         style_manager.sheetModified();
-    }
+    };
+    try self.parseInto(text, frame);
 }
 
 fn parseInto(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
@@ -190,6 +196,7 @@ fn parseInto(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!voi
         const inserted: *CSSRule = switch (parsed_rule) {
             .style => |s| blk: {
                 const style_rule = try CSSStyleRule.init(frame);
+                style_rule._owner_element = self._owner_node;
                 try style_rule.setSelectorText(s.selector, frame);
 
                 const style_props = try style_rule.getStyle(frame);
@@ -238,4 +245,45 @@ test "WebApi: layer @-rule cascade" {
 
 test "WebApi: layer order cascade" {
     try testing.htmlRunner("css/layer_order_cascade.html", .{});
+}
+
+test "CSSStyleSheet: disabled invalidates the owning frame" {
+    const owner = try testing.createFrame();
+    const caller = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const element = try owner.document.createElement("style", null, owner);
+    const sheet = try CSSStyleSheet.initWithOwner(element, owner);
+    const owner_before = owner.page.visual_generation.load(.acquire);
+    const caller_before = caller.page.visual_generation.load(.acquire);
+    sheet.setDisabled(true, caller);
+    try testing.expect(owner.page.visual_generation.load(.acquire) > owner_before);
+    try testing.expectEqual(caller_before, caller.page.visual_generation.load(.acquire));
+    try testing.expect(owner._style_manager.dirty);
+    const disabled = owner.page.visual_generation.load(.acquire);
+    sheet.setDisabled(true, caller);
+    try testing.expectEqual(disabled, owner.page.visual_generation.load(.acquire));
+    sheet.setDisabled(false, caller);
+    try testing.expect(owner.page.visual_generation.load(.acquire) > disabled);
+}
+
+test "CSSStyleSheet: opaque rule mutations invalidate the owning frame" {
+    const owner = try testing.createFrame();
+    const caller = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const element = try owner.document.createElement("style", null, owner);
+    const sheet = try CSSStyleSheet.initWithOwner(element, owner);
+    var before = owner.page.visual_generation.load(.acquire);
+    const caller_before = caller.page.visual_generation.load(.acquire);
+    try sheet.replaceSync("@media screen { div { color: red; } }", caller);
+    try testing.expect(owner.page.visual_generation.load(.acquire) > before);
+    before = owner.page.visual_generation.load(.acquire);
+    _ = try sheet.insertRule("@supports (display: grid) { div { display: grid; } }", null, caller);
+    try testing.expect(owner.page.visual_generation.load(.acquire) > before);
+    before = owner.page.visual_generation.load(.acquire);
+    try sheet.deleteRule(0, caller);
+    try testing.expect(owner.page.visual_generation.load(.acquire) > before);
+    before = owner.page.visual_generation.load(.acquire);
+    try sheet.replaceSync("", caller);
+    try testing.expect(owner.page.visual_generation.load(.acquire) > before);
+    try testing.expectEqual(caller_before, caller.page.visual_generation.load(.acquire));
 }

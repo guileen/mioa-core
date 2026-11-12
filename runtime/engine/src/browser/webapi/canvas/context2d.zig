@@ -22,6 +22,7 @@ const std = @import("std");
 
 const js = @import("../../js/js.zig");
 const color = @import("../../color.zig");
+const png_encoder = @import("../../png.zig");
 const TextMetrics = @import("TextMetrics.zig");
 const CanvasGradient = @import("CanvasGradient.zig");
 const CanvasPattern = @import("CanvasPattern.zig");
@@ -200,7 +201,8 @@ fn sink(context: *anyopaque, bytes: [*]const u8, len: usize) callconv(.c) bool {
 /// A lifecycle reference must cover each operation. The mutex protects backing,
 /// dimensions, origin state and observer lifetime; only the refcount is atomic.
 /// Locked helpers never reacquire the mutex. Readback returns dimensions and
-/// bytes from one capture, and observer invalidation uses an atomic Frame epoch.
+/// bytes from one capture. Observed mutations begin a Page writer before backing
+/// work; queued GL work retains one writer until capture/teardown synchronizes it.
 pub const Surface = struct {
     const GL = @import("WebGLRenderingContext.zig");
     const Backing = union(enum) { empty, raster: *Backend, gl: *GL.Backend };
@@ -208,19 +210,78 @@ pub const Surface = struct {
     pub const PaintState = struct { alpha: f64, composite: []const u8, smooth: bool };
     mutex: std.Io.Mutex = .init,
     refs: std.atomic.Value(usize) = .init(1),
+    allocator: std.mem.Allocator = std.heap.page_allocator,
     _backing: Backing = .empty,
     fonts: []const u8,
     _width: u32,
     _height: u32,
     _origin_clean: bool = true,
     _observer: ?*@import("../../Frame.zig") = null,
+    _pending_gl_write: ?@import("../../Page.zig").CanvasWrite = null,
+    // Only construct/end this envelope while the surface lock pins its observer.
+    const Write = struct {
+        surface: *Surface,
+        token: ?@import("../../Page.zig").CanvasWrite,
+
+        fn end(self: Write) void {
+            if (self.token) |token| {
+                // Submission is not GPU completion. Acquire one retained writer
+                // before releasing the immediate writer, without a stable gap.
+                if (self.surface._backing == .gl and self.surface._pending_gl_write == null) {
+                    self.surface._pending_gl_write = token.page.beginCanvasWrite();
+                }
+                token.end();
+            }
+        }
+    };
+    fn beginWriteLocked(self: *Surface) Write {
+        return .{ .surface = self, .token = if (self._observer) |frame| frame.page.beginCanvasWrite() else null };
+    }
+    fn settleObservedWritesLocked(self: *Surface) !void {
+        const token = self._pending_gl_write orelse return;
+        self._pending_gl_write = null;
+        defer token.end();
+        if (self._backing != .gl or !GL.lp_gl_finish(self._backing.gl)) {
+            token.page.invalidateCanvasWrites();
+            return error.InvalidStateError;
+        }
+    }
+    /// Capture calls this once before sampling the exact model guard. Later
+    /// submissions acquire a new pending writer and invalidate qualification.
+    pub fn settleObservedWrites(self: *Surface) !void {
+        self.lock();
+        defer self.unlock();
+        try self.settleObservedWritesLocked();
+    }
+    pub const GlAccess = struct {
+        surface: *Surface,
+        backend: *GL.Backend,
+        write: ?Write,
+
+        pub fn end(self: GlAccess) void {
+            if (self.write) |write| {
+                self.surface.dirtyLocked();
+                write.end();
+            }
+            self.surface.unlock();
+        }
+    };
+    pub fn beginGlAccess(self: *Surface, mutating: bool) !GlAccess {
+        self.lock();
+        if (self._backing != .gl) {
+            self.unlock();
+            return error.InvalidStateError;
+        }
+        return .{ .surface = self, .backend = self._backing.gl, .write = if (mutating) self.beginWriteLocked() else null };
+    }
     pub fn init(width: u32, height: u32, exec: *const Execution) !*Surface {
         if (width > 16384 or height > 16384 or @as(u64, width) * height * 4 > 268435456) return error.InvalidStateError;
-        const fonts = try std.json.Stringify.valueAlloc(std.heap.page_allocator, exec.session.browser.app.config.renderFonts(), .{});
-        errdefer std.heap.page_allocator.free(fonts);
-        const value = try std.heap.page_allocator.create(Surface);
-        value.* = .{ .fonts = fonts, ._width = width, ._height = height };
-        errdefer std.heap.page_allocator.destroy(value);
+        const allocator = try @import("../storage/RuntimeMemory.zig").allocator(std.heap.page_allocator);
+        const fonts = try std.json.Stringify.valueAlloc(allocator, exec.session.browser.app.config.renderFonts(), .{});
+        errdefer allocator.free(fonts);
+        const value = try allocator.create(Surface);
+        value.* = .{ .allocator = allocator, .fonts = fonts, ._width = width, ._height = height };
+        errdefer allocator.destroy(value);
         try value.track(exec);
         return value;
     }
@@ -247,14 +308,16 @@ pub const Surface = struct {
     pub fn release(self: *Surface) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         self.lock();
+        self.settleObservedWritesLocked() catch {};
         switch (self._backing) {
             .raster => |backend| lp_canvas_free(backend),
             .gl => |backend| GL.release(backend),
             .empty => {},
         }
         self.unlock();
-        std.heap.page_allocator.free(self.fonts);
-        std.heap.page_allocator.destroy(self);
+        const allocator = self.allocator;
+        allocator.free(self.fonts);
+        allocator.destroy(self);
     }
     pub fn size(self: *Surface) Size {
         self.lock();
@@ -269,12 +332,17 @@ pub const Surface = struct {
     pub fn observe(self: *Surface, frame: ?*@import("../../Frame.zig")) void {
         self.lock();
         defer self.unlock();
+        if (self._observer == frame) return;
+        self.settleObservedWritesLocked() catch {};
         self._observer = frame;
     }
     pub fn detachObserver(self: *Surface, frame: *@import("../../Frame.zig")) void {
         self.lock();
         defer self.unlock();
-        if (self._observer == frame) self._observer = null;
+        if (self._observer == frame) {
+            self.settleObservedWritesLocked() catch {};
+            self._observer = null;
+        }
     }
     fn rasterLocked(self: *Surface) !*Backend {
         switch (self._backing) {
@@ -290,16 +358,25 @@ pub const Surface = struct {
     pub fn initializeRaster(self: *Surface) !void {
         self.lock();
         defer self.unlock();
+        const write = self.beginWriteLocked();
+        defer write.end();
         _ = try self.rasterLocked();
     }
-    pub fn attachGl(self: *Surface, backend: *GL.Backend) !void {
+    pub fn initializeGl(self: *Surface) !?*GL.Backend {
         self.lock();
         defer self.unlock();
         if (self._backing != .empty) return error.InvalidStateError;
+        const write = self.beginWriteLocked();
+        defer write.end();
+        const backend = GL.lp_gl_new(self._width, self._height) orelse return null;
         self._backing = .{ .gl = backend };
+        return backend;
     }
     fn dirtyLocked(self: *Surface) void {
-        if (self._observer) |frame| _ = frame._render_resource_version.fetchAdd(1, .release);
+        if (self._observer) |frame| {
+            _ = frame._render_resource_version.fetchAdd(1, .release);
+            frame.page.visualChanged();
+        }
     }
     pub fn dirty(self: *Surface) void {
         self.lock();
@@ -310,6 +387,8 @@ pub const Surface = struct {
         if (width > 16384 or height > 16384 or @as(u64, width) * height * 4 > 268435456) return error.InvalidStateError;
         self.lock();
         defer self.unlock();
+        const write = self.beginWriteLocked();
+        defer write.end();
         const ok = switch (self._backing) {
             .raster => |backend| lp_canvas_resize(backend, width, height),
             .gl => |backend| GL.lp_gl_resize(backend, width, height),
@@ -340,6 +419,8 @@ pub const Surface = struct {
         return self.snapshotLocked(arena);
     }
     fn clearBitmapLocked(self: *Surface, arena: std.mem.Allocator) !void {
+        const write = self.beginWriteLocked();
+        defer write.end();
         switch (self._backing) {
             .empty => {},
             .raster => |backend| {
@@ -369,10 +450,10 @@ pub const Surface = struct {
             if (!lp_canvas_png(self._backing.raster, writer, sink)) return error.InvalidStateError;
             return true;
         }
-        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const image = try self.snapshotLocked(scratch.allocator());
-        if (!lp_rgba_png(image.bytes.ptr, image.width, image.height, writer, sink)) return error.InvalidStateError;
+        if (!png_encoder.write(image.bytes.ptr, image.width, image.height, writer, sink)) return error.InvalidStateError;
         return true;
     }
     pub fn request(self: *Surface, value: anytype, arena: std.mem.Allocator, origin_clean: bool) ![]const u8 {
@@ -380,6 +461,8 @@ pub const Surface = struct {
         var out: std.Io.Writer.Allocating = .init(arena);
         self.lock();
         defer self.unlock();
+        const write = self.beginWriteLocked();
+        defer write.end();
         const backend = try self.rasterLocked();
         if (!origin_clean) self._origin_clean = false;
         defer self.dirtyLocked();
@@ -391,6 +474,8 @@ pub const Surface = struct {
         var out: std.Io.Writer.Allocating = .init(arena);
         self.lock();
         defer self.unlock();
+        const write = self.beginWriteLocked();
+        defer write.end();
         const backend = try self.rasterLocked();
         if (!lp_canvas_command(backend, command.ptr, command.len, &out.writer, sink)) return error.NotSupportedError;
         if (!image.origin_clean) self._origin_clean = false;
@@ -400,6 +485,8 @@ pub const Surface = struct {
     pub fn putPixels(self: *Surface, bytes: []const u8, image_width: u32, x: i32, y: i32, dirty_rect: [4]u32) !void {
         self.lock();
         defer self.unlock();
+        const write = self.beginWriteLocked();
+        defer write.end();
         const backend = try self.rasterLocked();
         defer self.dirtyLocked();
         const x0 = dirty_rect[0];
@@ -984,7 +1071,6 @@ extern "c" fn lp_canvas_png(*Backend, *anyopaque, *const fn (*anyopaque, [*]cons
 extern "c" fn lp_canvas_put(*Backend, [*]const u8, u32, u32, i32, i32) bool;
 extern "c" fn lp_canvas_draw_pixels(*Backend, [*]const u8, u32, u32, *const [8]f64) bool;
 extern "c" fn lp_canvas_draw_encoded(*Backend, [*]const u8, usize, *const [8]f64) bool;
-extern "c" fn lp_rgba_png([*]const u8, u32, u32, *anyopaque, *const fn (*anyopaque, [*]const u8, usize) callconv(.c) bool) bool;
 
 test "Surface snapshots stay coherent during resize and cross-thread retain" {
     const fonts = try std.heap.page_allocator.dupe(u8, "[]");
@@ -1029,4 +1115,69 @@ test "Surface snapshots stay coherent during resize and cross-thread retain" {
     reader.join();
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), s.refs.load(.acquire));
+}
+
+test "Surface observed writer starts before mutation and ends on failure" {
+    var page: @import("../../Page.zig") = undefined;
+    page.canvas_epoch = .init(0);
+    page.canvas_writers = .init(0);
+    page.visual_generation = .init(0);
+    var frame: @import("../../Frame.zig") = undefined;
+    frame.page = &page;
+    frame._render_resource_version = .init(0);
+    var surface: Surface = .{ .fonts = "[]", ._width = 1, ._height = 1, ._observer = &frame };
+    const Failure = struct {
+        fn mutate(s: *Surface, owner: *@import("../../Page.zig")) !void {
+            s.lock();
+            defer s.unlock();
+            const write = s.beginWriteLocked();
+            defer write.end();
+            try testing.expectEqual(@as(u64, 1), owner.canvas_writers.load(.acquire));
+            try testing.expectEqual(@as(u64, 1), owner.canvas_epoch.load(.acquire));
+            s._width = 2;
+            return error.InvalidStateError;
+        }
+    };
+    try testing.expectError(error.InvalidStateError, Failure.mutate(&surface, &page));
+    try testing.expectEqual(@as(u64, 0), page.canvas_writers.load(.acquire));
+    try testing.expectEqual(@as(u64, 2), page.canvas_epoch.load(.acquire));
+    try surface.resize(3, 4);
+    try testing.expectEqual(@as(u64, 0), page.canvas_writers.load(.acquire));
+    try testing.expectEqual(@as(u64, 4), page.canvas_epoch.load(.acquire));
+    try testing.expectEqual(@as(u32, 3), surface.size().width);
+    try testing.expectEqual(@as(u32, 4), surface.size().height);
+    try testing.expectEqual(@as(u64, 1), frame._render_resource_version.load(.acquire));
+}
+
+test "Surface observed GL retains one writer until real GPU completion" {
+    var page: @import("../../Page.zig") = undefined;
+    page.canvas_epoch = .init(0);
+    page.canvas_writers = .init(0);
+    page.visual_generation = .init(0);
+    var frame: @import("../../Frame.zig") = undefined;
+    frame.page = &page;
+    frame._render_resource_version = .init(0);
+    var surface: Surface = .{ .fonts = "[]", ._width = 1, ._height = 1, ._observer = &frame };
+    _ = (try surface.initializeGl()) orelse return error.SkipZigTest;
+    defer {
+        surface.observe(null);
+        Surface.GL.release(surface._backing.gl);
+    }
+    try testing.expectEqual(@as(u64, 1), page.canvas_writers.load(.acquire));
+    for (0..2) |_| {
+        const access = try surface.beginGlAccess(true);
+        defer access.end();
+        try testing.expectEqual(@as(u64, 2), page.canvas_writers.load(.acquire));
+        try Surface.GL.clearBitmap(access.backend);
+    }
+    try testing.expectEqual(@as(u64, 1), page.canvas_writers.load(.acquire));
+    try surface.settleObservedWrites();
+    try testing.expectEqual(@as(u64, 0), page.canvas_writers.load(.acquire));
+    const settled_epoch = page.canvas_epoch.load(.acquire);
+    try surface.settleObservedWrites();
+    try testing.expectEqual(settled_epoch, page.canvas_epoch.load(.acquire));
+    try surface.resize(2, 2);
+    try testing.expectEqual(@as(u64, 1), page.canvas_writers.load(.acquire));
+    surface.detachObserver(&frame);
+    try testing.expectEqual(@as(u64, 0), page.canvas_writers.load(.acquire));
 }

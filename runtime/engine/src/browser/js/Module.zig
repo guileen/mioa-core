@@ -62,6 +62,8 @@ pub fn instantiate(self: Module, cb: v8.ResolveModuleCallback) !bool {
 }
 
 pub fn evaluate(self: Module) !js.Value {
+    try @import("../TaskGate.zig").enter();
+    defer @import("../TaskGate.zig").exit();
     const status = self.getStatus();
     switch (status) {
         .kInstantiated, .kEvaluated, .kErrored => {},

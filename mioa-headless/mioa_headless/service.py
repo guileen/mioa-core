@@ -34,6 +34,10 @@ OPERATION_TIMEOUT = 20
 # Pointer input tolerates animation-only render changes; keyboard and non-native
 # input keep the stricter capture-scoped fingerprint rule.
 POINTER_OPERATIONS = frozenset({"mouse.click", "mouse.move", "mouse.wheel"})
+# Browser-chrome actions change the control state, not captured page pixels.
+# A real user can press Ctrl+Tab immediately after a click, so these must not
+# require the capture basis that accepted input deliberately consumes.
+SHELL_OPERATIONS = frozenset({"navigate", "new_tab", "select_tab", "close_tab", "back", "forward", "reload", "page.focus"})
 POINTER_REBINDS = 2
 _RENDER_FINGERPRINT = re.compile(r"[0-9a-fA-F]{64}")
 
@@ -489,35 +493,43 @@ class Session:
         if set(params) - {"operation", "args", "image_id", "frame_seq", "page_id", "frame_id", "observation_id", "owner_revision",
                           "document_epoch", "viewport_epoch", "focused_frame_id", "focused_element_id"}:
             raise ServiceError("invalid_config", "Unknown action fields.")
-        frame = self.frame
-        if frame is None or (params.get("image_id") != frame["image_id"] and params.get("image_id") not in self.recent_frame_ids):
-            raise ServiceError("stale_reference", "Capture a new frame before sending input.")
-        pointer = self.ring is not None and params.get("operation") in POINTER_OPERATIONS
-        scope = self.frame_scopes.get(params.get("image_id"))
-        if scope is not None:
-            # Animation changes only captured render identity; pointer input is
-            # authorized by the live scope and rebound at dispatch, not by pixels.
-            recorded = scope[:-1] if pointer else scope
-            live = self._authorization_scope(frame) if pointer else self._scope(frame)
-            if recorded != live or (pointer and scope[-1] != frame.get("render_fingerprint")):
-                raise ServiceError("stale_reference", "Document, viewport or ownership epoch changed.")
-        if "frame_seq" in params:
-            seq = params["frame_seq"]
-            if type(seq) is not int or "frame_seq" not in frame or not 0 <= frame["frame_seq"] - seq <= 31:
-                raise ServiceError("stale_reference", "Frame generation is outside the active 32-frame window.")
-        for epoch in ("document_epoch", "viewport_epoch"):
-            if epoch in params and (type(params[epoch]) is not int or params[epoch] != frame.get(epoch)):
-                raise ServiceError("stale_reference", "Input belongs to a different document or viewport epoch.")
-        for identity in ("focused_frame_id", "focused_element_id"):
-            if identity in params and params[identity] != frame.get(identity):
-                raise ServiceError("stale_reference", "Keyboard focus differs from the displayed native document.")
-        expected = {key: params.get(key) for key in ("page_id", "frame_id", "observation_id", "owner_revision")}
-        if any(expected[key] != frame[key] for key in ("page_id", "frame_id", "observation_id")) or type(expected["owner_revision"]) is not int:
-            raise ServiceError("stale_reference", "Action does not match the observed page and ownership revision.")
-        self.engine.control.check_write("human", self.human_id, **expected)
         operation, supplied = params.get("operation"), params.get("args")
         if not isinstance(operation, str) or not isinstance(supplied, dict):
             raise ServiceError("invalid_config", "Action operation must be a string and args must be an object.")
+        shell = operation in SHELL_OPERATIONS
+        frame = self.frame
+        if shell:
+            revision = params.get("owner_revision")
+            if type(revision) is not int:
+                raise ServiceError("invalid_config", "Invalid ownership revision.")
+            expected = {"owner_revision": revision}
+            self.engine.control.check_write("human", self.human_id, **expected)
+        else:
+            if frame is None or (params.get("image_id") != frame["image_id"] and params.get("image_id") not in self.recent_frame_ids):
+                raise ServiceError("stale_reference", "Capture a new frame before sending input.")
+            pointer = self.ring is not None and operation in POINTER_OPERATIONS
+            scope = self.frame_scopes.get(params.get("image_id"))
+            if scope is not None:
+                # Animation changes only captured render identity; pointer input is
+                # authorized by the live scope and rebound at dispatch, not by pixels.
+                recorded = scope[:-1] if pointer else scope
+                live = self._authorization_scope(frame) if pointer else self._scope(frame)
+                if recorded != live or (pointer and scope[-1] != frame.get("render_fingerprint")):
+                    raise ServiceError("stale_reference", "Document, viewport or ownership epoch changed.")
+            if "frame_seq" in params:
+                seq = params["frame_seq"]
+                if type(seq) is not int or "frame_seq" not in frame or not 0 <= frame["frame_seq"] - seq <= 31:
+                    raise ServiceError("stale_reference", "Frame generation is outside the active 32-frame window.")
+            for epoch in ("document_epoch", "viewport_epoch"):
+                if epoch in params and (type(params[epoch]) is not int or params[epoch] != frame.get(epoch)):
+                    raise ServiceError("stale_reference", "Input belongs to a different document or viewport epoch.")
+            for identity in ("focused_frame_id", "focused_element_id"):
+                if identity in params and params[identity] != frame.get(identity):
+                    raise ServiceError("stale_reference", "Keyboard focus differs from the displayed native document.")
+            expected = {key: params.get(key) for key in ("page_id", "frame_id", "observation_id", "owner_revision")}
+            if any(expected[key] != frame[key] for key in ("page_id", "frame_id", "observation_id")) or type(expected["owner_revision"]) is not int:
+                raise ServiceError("stale_reference", "Action does not match the observed page and ownership revision.")
+            self.engine.control.check_write("human", self.human_id, **expected)
         args: dict[str, Any] = {}
         if operation in {"navigate", "new_tab"}:
             args["url"] = validate_url(supplied.get("url", "about:blank") if operation == "new_tab" else supplied.get("url"))
@@ -526,7 +538,7 @@ class Session:
             if not isinstance(target, str) or not 0 < len(target) <= 256:
                 raise ServiceError("invalid_config", "A real target_page_id is required.")
             args["target_page_id"] = target
-        elif operation in {"mouse.click", "mouse.move"}:
+        elif operation in {"mouse.click", "mouse.move", "mouse.wheel"}:
             for key, maximum in (("x", frame["viewport"]["width"]), ("y", frame["viewport"]["height"])):
                 value = supplied.get(key)
                 if not _number(value, 0, maximum) or value >= maximum:
@@ -537,11 +549,11 @@ class Session:
                 if not isinstance(button, str) or button not in {"left", "middle", "right"} or type(count) is not int or count not in {1, 2, 3}:
                     raise ServiceError("invalid_config", "Invalid mouse button or click count.")
                 args.update(button=button, click_count=count)
-        elif operation == "mouse.wheel":
-            for key in ("delta_x", "delta_y"):
-                if not _number(supplied.get(key), -10000, 10000):
-                    raise ServiceError("invalid_config", "Wheel deltas exceed service limits.")
-                args[key] = supplied[key]
+            elif operation == "mouse.wheel":
+                for key in ("delta_x", "delta_y"):
+                    if not _number(supplied.get(key), -10000, 10000):
+                        raise ServiceError("invalid_config", "Wheel deltas exceed service limits.")
+                    args[key] = supplied[key]
         elif operation == "keyboard.press":
             key = supplied.get("key")
             if not isinstance(key, str) or not 0 < len(key) <= 100 or any(ord(char) < 32 for char in key):
@@ -633,8 +645,9 @@ class Session:
                 self.validate_action(params)  # Refresh may replace the active document/page.
                 # Native SHM input has the stronger atomic pixel+semantic guard below.
                 # Keep document/view/control checks, not asynchronous mutation delivery.
-                await self.engine.refs.validate(self.engine.refs.visual, self.engine.page(),
-                                                check_mutations=self.ring is None)
+                if params["operation"] not in SHELL_OPERATIONS:
+                    await self.engine.refs.validate(self.engine.refs.visual, self.engine.page(),
+                                                    check_mutations=self.ring is None)
                 guarded = self.ring is not None and params["operation"].startswith(("mouse.", "keyboard."))
                 fingerprint = self.frame.get("render_fingerprint") if guarded else None
                 if guarded and (not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint) is None):

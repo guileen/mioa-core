@@ -42,6 +42,8 @@ const Execution = js.Execution;
 const IDBRequest = @This();
 
 pub const Proto = EventTarget;
+pub const AsyncStatus = enum { completed, pending };
+pub const AsyncDone = *const fn (*anyopaque, ?anyerror) void;
 
 _proto: *EventTarget,
 _type: Type = .generic,
@@ -59,6 +61,22 @@ _result: Result = .{ .none = js.Undefined{} },
 // whether or not we own th result value, if we do, we can free it once we know
 // it cannot be used
 _result_owned: bool = false,
+_async_cancel: ?struct { ctx: *anyopaque, cancel: *const fn (*anyopaque) void } = null,
+_internal_schema: bool = false,
+
+pub fn setAsyncCancel(self: *IDBRequest, ctx: *anyopaque, cancel: *const fn (*anyopaque) void) void {
+    self._async_cancel = .{ .ctx = ctx, .cancel = cancel };
+}
+
+pub fn clearAsyncCancel(self: *IDBRequest) void {
+    self._async_cancel = null;
+}
+
+pub fn cancelAsync(self: *IDBRequest) void {
+    const pending = self._async_cancel orelse return;
+    self._async_cancel = null;
+    pending.cancel(pending.ctx);
+}
 
 const ReadyState = enum {
     pending,
@@ -367,6 +385,7 @@ fn getError(self: *const IDBRequest) !?DOMException {
 // A database operation, captured when a request method is called and run later.
 const Operation = union(enum) {
     none,
+    schema: @import("SchemaIntents.zig").Intent,
     store_get: StoreQuery,
     store_get_key: StoreQuery,
     store_get_all: StoreGetAll,
@@ -384,16 +403,16 @@ const Operation = union(enum) {
 
     const StoreQuery = struct { store: *IDBObjectStore, bounds: Engine.Bounds };
     const StoreGetAll = struct { store: *IDBObjectStore, args: IDBKeyRange.GetAllArgs, mode: IDBObjectStore.GetAllMode };
-    const StoreWrite = struct { store: *IDBObjectStore, kind: IDBObjectStore.WriteKind, value: usize, key: IDBObjectStore.PreparedKey };
+    const StoreWrite = struct { store: *IDBObjectStore, kind: IDBObjectStore.WriteKind, value: usize, key: IDBObjectStore.PreparedKey, indexes: []const Engine.IndexInfo = &.{} };
     const IndexQuery = struct { index: *IDBIndex, bounds: Engine.Bounds };
     const IndexGetAll = struct { index: *IDBIndex, args: IDBKeyRange.GetAllArgs, mode: IDBObjectStore.GetAllMode };
     const CursorIterate = struct { cursor: *IDBCursor, seek: IDBCursor.Seek, offset: u32 };
-    const CursorUpdate = struct { cursor: *IDBCursor, key: []const u8, value: usize };
+    const CursorUpdate = struct { cursor: *IDBCursor, key: []const u8, value: usize, indexes: []const Engine.IndexInfo = &.{} };
     const CursorDelete = struct { cursor: *IDBCursor, key: []const u8 };
 
     fn source(op: Operation) Source {
         return switch (op) {
-            .none => .{ .none = null },
+            .none, .schema => .{ .none = null },
             .store_get, .store_get_key, .store_count, .store_delete => |o| .{ .store = o.store },
             .store_get_all => |o| .{ .store = o.store },
             .store_clear => |store| .{ .store = store },
@@ -410,20 +429,44 @@ const Operation = union(enum) {
     }
 };
 
+pub fn submitSchema(self: *IDBRequest, intent: @import("SchemaIntents.zig").Intent) !void {
+    self._internal_schema = true;
+    self._op = .{ .schema = intent };
+    try self._txn.owned.enqueue(self);
+}
+
+pub fn isSchema(self: *const IDBRequest) bool {
+    return self._internal_schema;
+}
+
 // Commit this request's operation: record it and queue the request on its
 // transaction's drain.
 pub fn submit(self: *IDBRequest, op: Operation, exec: *Execution) !*IDBRequest {
-    self._op = op;
-    self._source = op.source();
     const txn = self._txn.owned;
+    self._op = op;
+    if (txn._engine.profile_async != null) {
+        const store_id: ?i64 = switch (self._op) {
+            .store_write => |write| write.store._store_id,
+            .cursor_update => |update| update.cursor._store._store_id,
+            else => null,
+        };
+        if (store_id) |id| {
+            const arena = txn._arena.allocator();
+            const indexes = try txn.schemaSnapshot().indexesForStore(arena, id);
+            for (indexes) |*index| index.key_path = try @import("Key.zig").dupeKeyPath(arena, index.key_path);
+            switch (self._op) {
+                .store_write => |*write| write.indexes = indexes,
+                .cursor_update => |*update| update.indexes = indexes,
+                else => unreachable,
+            }
+        }
+    }
+    self._source = self._op.source();
     try txn.enqueue(self);
 
-    if (txn.getMode() == .versionchange) {
-        // for "upgradeneeded" we run them immediately (and still queue them, but
-        // their .op == .noop at that point). This is necessary to keep this
-        // operation consistent / ordered with other "upgradeneeded" changes that
-        // happen synchronously (e.g. createIndex). And we queue it so that,
-        // while the re-execute will be noop, the events will still fire.
+    if (txn.getMode() == .versionchange and txn._engine.profile_async == null) {
+        // Local upgrades execute immediately to preserve ordering with schema
+        // changes. Remote upgrades queue schema intents and requests together.
         try self.execute(exec);
     }
     return self;
@@ -441,7 +484,7 @@ pub fn execute(self: *IDBRequest, exec: *Execution) !void {
         .none, .borrowed => {},
     }
     switch (op) {
-        .none => unreachable,
+        .none, .schema => unreachable,
         .store_get => |o| try o.store.runGet(self, o.bounds, exec),
         .store_get_key => |o| try o.store.runGetKey(self, o.bounds, exec),
         .store_get_all => |o| try o.store.runGetAll(self, o.args, o.mode, exec),
@@ -457,6 +500,42 @@ pub fn execute(self: *IDBRequest, exec: *Execution) !void {
         .cursor_update => |o| try o.cursor.runUpdate(self, o.key, o.value, exec),
         .cursor_delete => |o| try o.cursor.runDelete(self, o.key),
     }
+}
+
+// The transaction has already acquired and begun its remote ticket before it
+// calls this method. A pending operation owns its continuation until done.
+pub fn executeAsync(self: *IDBRequest, exec: *Execution, ctx: *anyopaque, done: AsyncDone) !AsyncStatus {
+    const txn = switch (self._txn) {
+        .owned => |owned| owned,
+        .none, .borrowed => {
+            try self.execute(exec);
+            return .completed;
+        },
+    };
+    if (txn._engine.profile_async == null) {
+        try self.execute(exec);
+        return .completed;
+    }
+    const op = self._op;
+    self._op = .none;
+    return switch (op) {
+        .none => .completed,
+        .schema => |intent| try @import("SchemaIntents.zig").execute(txn, self, intent, exec, ctx, done),
+        .store_get => |o| try o.store.runGetAsync(self, o.bounds, exec, ctx, done),
+        .store_get_key => |o| try o.store.runGetKeyAsync(self, o.bounds, exec, ctx, done),
+        .store_get_all => |o| try o.store.runGetAllAsync(self, o.args, o.mode, exec, ctx, done),
+        .store_count => |o| try o.store.runCountAsync(self, o.bounds, exec, ctx, done),
+        .store_delete => |o| try o.store.runDeleteAsync(self, o.bounds, exec, ctx, done),
+        .store_clear => |store| try store.runClearAsync(self, exec, ctx, done),
+        .store_write => |o| try o.store.runWriteAsync(self, o.kind, o.value, o.key, exec, ctx, done, o.indexes),
+        .index_get => |o| try o.index.runGetAsync(self, o.bounds, exec, ctx, done),
+        .index_get_key => |o| try o.index.runGetKeyAsync(self, o.bounds, exec, ctx, done),
+        .index_get_all => |o| try o.index.runGetAllAsync(self, o.args, o.mode, exec, ctx, done),
+        .index_count => |o| try o.index.runCountAsync(self, o.bounds, exec, ctx, done),
+        .cursor_iterate => |o| try o.cursor.runIterateAsync(o.seek, o.offset, exec, ctx, done),
+        .cursor_update => |o| try o.cursor.runUpdateAsync(self, o.key, o.value, o.indexes, exec, ctx, done),
+        .cursor_delete => |o| try o.cursor.runDeleteAsync(self, o.key, exec, ctx, done),
+    };
 }
 
 pub const JsApi = struct {

@@ -167,3 +167,40 @@
   release();
 }
 </script>
+
+<script id=hashAssignmentsPreserveHistory type=module>
+{
+  const my_turn = takeTurn();
+  const state = await testing.async();
+  const release = await my_turn;
+  const root = location.href.split('#')[0];
+  const originalDocument = document;
+  const length = history.length;
+  let stage = 0;
+  const onhash = (event) => {
+    if (stage === 0 && event.newURL === root + '#history-second') {
+      stage = 1;
+      history.back();
+    } else if (stage === 1 && event.newURL === root + '#history-first') {
+      stage = 2;
+      history.forward();
+    } else if (stage === 2 && event.newURL === root + '#history-second') {
+      state.resolve();
+    }
+  };
+  window.addEventListener('hashchange', onhash);
+  location.hash = '#history-first';
+  testing.expectEqual(length + 1, history.length);
+  location.hash = '#history-second';
+  testing.expectEqual(length + 2, history.length);
+  location.hash = '#history-second';
+  testing.expectEqual(length + 2, history.length);
+  await state.done(() => {
+    testing.expectTrue(document === originalDocument);
+    testing.expectEqual(root + '#history-second', location.href);
+    testing.expectEqual(length + 2, history.length);
+    window.removeEventListener('hashchange', onhash);
+  });
+  release();
+}
+</script>

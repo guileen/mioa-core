@@ -189,7 +189,7 @@ pub fn reset(self: *Form, frame: *Frame) !void {
         } else if (element.is(Select)) |select| {
             select.reset(frame);
         } else if (element.is(TextArea)) |textarea| {
-            textarea.reset();
+            textarea.reset(frame);
         } else if (element.is(Output)) |output| {
             try output.reset(frame);
         } else if (element.is(Custom)) |custom| {
@@ -389,4 +389,18 @@ const testing = @import("../../../../testing.zig");
 test "WebApi: HTML.Form" {
     try testing.htmlRunner("element/html/form.html", .{});
     try testing.htmlRunner("element/html/form-validity.html", .{});
+}
+
+test "Form: textarea-only reset advances visual state" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const form_element = try frame.document.createElement("form", null, frame);
+    const textarea_element = try frame.document.createElement("textarea", null, frame);
+    _ = try form_element.asNode().appendChild(textarea_element.asNode(), frame);
+    const textarea = textarea_element.as(TextArea);
+    try textarea.setValue("edited", frame);
+    const before = frame.page.visual_generation.load(.acquire);
+    try form_element.as(Form).reset(frame);
+    try testing.expectEqual("", textarea.getValue());
+    try testing.expect(frame.page.visual_generation.load(.acquire) > before);
 }

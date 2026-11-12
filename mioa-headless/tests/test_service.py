@@ -214,6 +214,18 @@ class SessionLeaseTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(args=args), self.assertRaises(ServiceError):
                 self.session.validate_action({**request, "args": args})
 
+    async def test_wheel_requires_viewport_point_and_forwards_bounded_deltas(self):
+        request = await self.observed_human_frame()
+        request["operation"] = "mouse.wheel"
+        request["args"] = {"x": 10, "y": 20, "delta_x": 3, "delta_y": -4}
+        _, args = self.session.validate_action(request)
+        self.assertEqual(args, {"x": 10, "y": 20, "delta_x": 3, "delta_y": -4})
+        for invalid in ({"x": 100, "y": 20, "delta_x": 0, "delta_y": 1},
+                        {"x": 10, "y": 80, "delta_x": 0, "delta_y": 1},
+                        {"x": 10, "y": 20, "delta_x": 0, "delta_y": 10001}):
+            with self.subTest(args=invalid), self.assertRaises(ServiceError):
+                self.session.validate_action({**request, "args": invalid})
+
     async def test_recent_images_only_survive_identical_semantic_scope(self):
         request = await self.observed_human_frame()
         page = SimpleNamespace(observation_id=4, native_visual_epoch=0)

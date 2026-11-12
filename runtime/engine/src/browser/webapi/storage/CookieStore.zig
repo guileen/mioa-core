@@ -21,9 +21,11 @@ const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
 const URL = @import("../../URL.zig");
+const Session = @import("../../Session.zig");
 const Notification = @import("../../../Notification.zig");
 
 const Cookie = @import("Cookie.zig");
+const ProfileAsync = @import("ProfileAsync.zig");
 const EventTarget = @import("../EventTarget.zig");
 const CookieChangeEvent = @import("../event/CookieChangeEvent.zig");
 
@@ -37,6 +39,8 @@ pub const Proto = EventTarget;
 
 _proto: *EventTarget,
 _exec: ?*Execution = null,
+_profile_event_start: u64 = 0,
+_pending_profile: std.DoublyLinkedList = .{},
 
 pub fn asEventTarget(self: *CookieStore) *EventTarget {
     return self._proto;
@@ -48,20 +52,177 @@ pub fn asEventTarget(self: *CookieStore) *EventTarget {
 /// Idempotent on re-call.
 pub fn attach(self: *CookieStore, exec: *Execution) !void {
     if (self._exec != null) return;
-    self._exec = exec;
+    if (exec.session.cookie_jar.profile_client) |client| {
+        if (!client.cookie_event_watcher_ready or client.event_fd < 0 or client.failed) return error.ProfileCookieEventsUnavailable;
+        if (!client.cookie_events_subscribed) {
+            const reply = try client.request(exec.local_arena, "events.subscribe", struct {}{});
+            defer reply.deinit();
+            const result = reply.value.object.get("result") orelse {
+                client.failed = true;
+                return error.ProfileProtocolError;
+            };
+            const parsed = std.json.parseFromValue(struct { next_sequence: u64 }, exec.local_arena, result, .{}) catch {
+                client.failed = true;
+                return error.ProfileProtocolError;
+            };
+            defer parsed.deinit();
+            client.cookie_events_next_sequence = parsed.value.next_sequence;
+            self._profile_event_start = parsed.value.next_sequence;
+            client.cookie_events_subscribed = true;
+        } else {
+            // A service-side watermark excludes events already published,
+            // including complete or partial frames still queued on the FD.
+            const reply = try client.request(exec.local_arena, "events.cursor", struct {}{});
+            defer reply.deinit();
+            const result = reply.value.object.get("result") orelse {
+                client.failed = true;
+                return error.ProfileProtocolError;
+            };
+            const parsed = std.json.parseFromValue(struct { next_sequence: u64 }, exec.local_arena, result, .{}) catch {
+                client.failed = true;
+                return error.ProfileProtocolError;
+            };
+            defer parsed.deinit();
+            if (parsed.value.next_sequence < client.cookie_events_next_sequence) {
+                client.failed = true;
+                return error.ProfileProtocolError;
+            }
+            self._profile_event_start = parsed.value.next_sequence;
+        }
+    }
     try exec.session.notification.register(.cookie_changed, self, onCookieChanged);
+    self._exec = exec;
 }
 
 /// Removes this CookieStore from the notification list.
 pub fn detach(self: *CookieStore) void {
     const exec = self._exec orelse return;
+    while (self._pending_profile.first) |node| {
+        const request: *ProfileRequest = @fieldParentPtr("node", node);
+        self._pending_profile.remove(node);
+        request.store = null;
+        if (request.resolver) |resolver| resolver.release();
+        request.resolver = null;
+        if (!request.scheduled) {
+            if (exec.session.profile_async_client) |*client| client.cancel(request.id);
+        }
+    }
     exec.session.notification.unregisterAll(self);
     self._exec = null;
+}
+const ProfileEvent = struct {
+    sequence: u64,
+    type: enum { cookie },
+    kind: Notification.CookieChanged.Kind,
+    name: []const u8,
+    value: []const u8,
+    domain: []const u8,
+    path: []const u8,
+    secure: bool,
+    http_only: bool,
+    same_site: Cookie.SameSite,
+};
+
+const ProfileGateEvent = struct {
+    sequence: u64,
+    type: enum { idb_gate },
+    origin: []const u8,
+    ticket: []const u8,
+    state: enum { granted, cancelled },
+};
+
+// Called on the session's JS thread when the event descriptor is readable.
+// Partial frames stay in the client-owned buffer across readiness callbacks.
+pub fn consumeProfileEvents(session: *Session) !void {
+    try @import("../../TaskGate.zig").enter();
+    defer @import("../../TaskGate.zig").exit();
+    const client = session.cookie_jar.profile_client orelse return;
+    errdefer {
+        client.failed = true;
+        session.idb.failAll(error.ProfileServiceLost);
+    }
+    if (client.failed) return error.ProfileServiceLost;
+    if (client.event_fd < 0) return error.ProfileCookieEventsUnavailable;
+    if (client.cookie_event_allocator == null) client.cookie_event_allocator = session.cookie_jar.allocator;
+    try client.cookie_event_buffer.ensureTotalCapacity(session.cookie_jar.allocator, 4);
+    var delivered: usize = 0;
+    while (true) {
+        while (client.cookie_event_used >= 4) {
+            const length = std.mem.readInt(u32, client.cookie_event_buffer.items[0..4], .big);
+            if (length == 0 or length > @import("ProfileIpc.zig").max_message) return error.ProfileProtocolError;
+            const frame_size: usize = 4 + @as(usize, length);
+            try client.cookie_event_buffer.ensureTotalCapacity(session.cookie_jar.allocator, frame_size);
+            if (client.cookie_event_used < frame_size) break;
+            if (!client.cookie_events_subscribed) return error.ProfileProtocolError;
+            const allocator = session.cookie_jar.allocator;
+            const raw = std.json.parseFromSlice(std.json.Value, allocator, client.cookie_event_buffer.items[4..frame_size], .{}) catch return error.ProfileProtocolError;
+            defer raw.deinit();
+            const envelope = std.json.parseFromValue(struct {
+                sequence: u64,
+                type: enum { cookie, idb_gate },
+            }, allocator, raw.value, .{ .ignore_unknown_fields = true }) catch return error.ProfileProtocolError;
+            defer envelope.deinit();
+            if (envelope.value.sequence != client.cookie_events_next_sequence or envelope.value.sequence == std.math.maxInt(u64)) return error.ProfileProtocolError;
+            switch (envelope.value.type) {
+                .cookie => {
+                    const event = std.json.parseFromValue(ProfileEvent, allocator, raw.value, .{}) catch return error.ProfileProtocolError;
+                    defer event.deinit();
+                    client.cookie_events_next_sequence += 1;
+                    session.notification.dispatch(.cookie_changed, &.{
+                        .kind = event.value.kind,
+                        .name = event.value.name,
+                        .value = event.value.value,
+                        .domain = event.value.domain,
+                        .path = event.value.path,
+                        .secure = event.value.secure,
+                        .http_only = event.value.http_only,
+                        .same_site = event.value.same_site,
+                    });
+                },
+                .idb_gate => {
+                    const event = std.json.parseFromValue(ProfileGateEvent, allocator, raw.value, .{}) catch return error.ProfileProtocolError;
+                    defer event.deinit();
+                    client.cookie_events_next_sequence += 1;
+                    switch (event.value.state) {
+                        .granted => session.idb.receiveGrant(event.value.origin, event.value.ticket),
+                        .cancelled => session.idb.receiveCancellation(event.value.origin, event.value.ticket),
+                    }
+                },
+            }
+            const remaining = client.cookie_event_used - frame_size;
+            std.mem.copyForwards(u8, client.cookie_event_buffer.items[0..remaining], client.cookie_event_buffer.items[frame_size..client.cookie_event_used]);
+            client.cookie_event_used = remaining;
+            client.cookie_event_buffer.items.len = remaining;
+            delivered += 1;
+            if (delivered == 64) return;
+        }
+        // Read at most one frame at a time. After the work budget is spent,
+        // any further frame remains in the socket and keeps readiness asserted.
+        const end: usize = if (client.cookie_event_used < 4)
+            4
+        else
+            4 + @as(usize, std.mem.readInt(u32, client.cookie_event_buffer.items[0..4], .big));
+        const available = client.cookie_event_buffer.allocatedSlice()[client.cookie_event_used..end];
+        if (available.len == 0) return error.ProfileProtocolError;
+        const count = std.c.recv(client.event_fd, available.ptr, available.len, std.c.MSG.DONTWAIT);
+        if (count == 0) return error.ProfileServiceLost;
+        if (count < 0) switch (std.c.errno(count)) {
+            .AGAIN => return,
+            .INTR => continue,
+            else => return error.ProfileServiceLost,
+        };
+        client.cookie_event_used += @intCast(count);
+        client.cookie_event_buffer.items.len = client.cookie_event_used;
+    }
 }
 
 fn onCookieChanged(ctx: *anyopaque, data: *const Notification.CookieChanged) !void {
     const self: *CookieStore = @ptrCast(@alignCast(ctx));
     const exec = self._exec orelse return;
+    if (exec.session.cookie_jar.profile_client) |client| {
+        // The receiver increments the cursor immediately before dispatch.
+        if (client.cookie_events_next_sequence <= self._profile_event_start) return;
+    }
 
     // CookieStore exposes only cookies that script would see for the
     // current document — same filter as `match` (HttpOnly hidden,
@@ -192,7 +353,7 @@ const GetInput = union(enum) {
 };
 
 // https://developer.mozilla.org/en-US/docs/Web/API/CookieStore/set
-const CookieInit = struct {
+pub const CookieInit = struct {
     domain: ?[]const u8 = null,
     expires: ?f64 = null,
     maxAge: ?f64 = null,
@@ -221,14 +382,14 @@ const DeleteInput = union(enum) {
     options: DeleteOptions,
 };
 
-const SameSite = enum {
+pub const SameSite = enum {
     strict,
     lax,
     none,
     pub const js_enum_from_string = true;
 };
 
-pub fn get(_: *CookieStore, input: ?GetInput, exec: *const Execution) !js.Promise {
+pub fn get(self: *CookieStore, input: ?GetInput, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
 
     const name: ?[]const u8, const url: ?[]const u8 = if (input) |inp| switch (inp) {
@@ -240,6 +401,7 @@ pub fn get(_: *CookieStore, input: ?GetInput, exec: *const Execution) !js.Promis
         // Unlike getAll(), get() requires a name or url
         return local.typeError("get requires a name or url");
     }
+    if (exec.session.cookie_jar.profile_client != null) return self.profileGet(exec, name, url, true);
 
     const items = matchCookies(exec, name, url, true) catch |err| {
         return local.typeError(@errorName(err));
@@ -251,13 +413,14 @@ pub fn get(_: *CookieStore, input: ?GetInput, exec: *const Execution) !js.Promis
     return local.resolvePromise(items[0]);
 }
 
-pub fn getAll(_: *CookieStore, input: ?GetInput, exec: *const Execution) !js.Promise {
+pub fn getAll(self: *CookieStore, input: ?GetInput, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
 
     const name: ?[]const u8, const url: ?[]const u8 = if (input) |inp| switch (inp) {
         .name => |n| .{ n, null },
         .options => |o| .{ o.name, o.url },
     } else .{ null, null };
+    if (exec.session.cookie_jar.profile_client != null) return self.profileGet(exec, name, url, false);
 
     const items = matchCookies(exec, name, url, false) catch |err| {
         return local.typeError(@errorName(err));
@@ -265,7 +428,7 @@ pub fn getAll(_: *CookieStore, input: ?GetInput, exec: *const Execution) !js.Pro
     return local.resolvePromise(items);
 }
 
-pub fn set(_: *CookieStore, input: SetInput, value: ?[]const u8, exec: *const Execution) !js.Promise {
+pub fn set(self: *CookieStore, input: SetInput, value: ?[]const u8, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
 
     const init: CookieInit = switch (input) {
@@ -275,6 +438,7 @@ pub fn set(_: *CookieStore, input: SetInput, value: ?[]const u8, exec: *const Ex
             .value = value orelse return local.typeError("value is required"),
         },
     };
+    if (exec.session.cookie_jar.profile_client != null) return self.profileSet(exec, init, false);
 
     storeCookie(exec, init, false) catch |err| {
         return local.typeError(@errorName(err));
@@ -283,7 +447,7 @@ pub fn set(_: *CookieStore, input: SetInput, value: ?[]const u8, exec: *const Ex
     return local.resolvePromise({});
 }
 
-pub fn delete(_: *CookieStore, input: DeleteInput, exec: *const Execution) !js.Promise {
+pub fn delete(self: *CookieStore, input: DeleteInput, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
 
     const opts: DeleteOptions = switch (input) {
@@ -294,7 +458,7 @@ pub fn delete(_: *CookieStore, input: DeleteInput, exec: *const Execution) !js.P
     // Deletion per spec is an expired set: write a cookie with the same
     // name/path/domain but with Expires in the past, and the Jar will drop
     // any existing match (or no-op if none).
-    storeCookie(exec, .{
+    const init: CookieInit = .{
         .name = opts.name,
         .value = "",
         .expires = 0,
@@ -302,12 +466,173 @@ pub fn delete(_: *CookieStore, input: DeleteInput, exec: *const Execution) !js.P
         .path = opts.path,
         .sameSite = .strict,
         .partitioned = opts.partitioned,
-    }, true) catch |err| {
+    };
+    if (exec.session.cookie_jar.profile_client != null) return self.profileSet(exec, init, true);
+    storeCookie(exec, init, true) catch |err| {
         return local.typeError(@errorName(err));
     };
 
     return local.resolvePromise({});
 }
+
+fn profileGet(self: *CookieStore, exec: *const Execution, name: ?[]const u8, url: ?[]const u8, first: bool) !js.Promise {
+    const local = exec.js.local.?;
+    const resolved = resolveQueryUrl(exec, url) catch |err| return local.typeError(@errorName(err));
+    if (Cookie.PreparedUri.init(resolved).host.len == 0) return local.typeError("SecurityError");
+    const site: ?[]const u8 = switch (exec.siteForCookies()) {
+        .none => null,
+        .url => |value| value,
+    };
+    return self.profileRequest(exec, if (first) .get else .get_all, "cookies.store_get", .{
+        .url = resolved,
+        .site = site,
+        .name = name,
+        .first_only = first,
+    });
+}
+
+fn profileSet(self: *CookieStore, exec: *const Execution, init: CookieInit, is_delete: bool) !js.Promise {
+    const site: ?[]const u8 = switch (exec.siteForCookies()) {
+        .none => null,
+        .url => |value| value,
+    };
+    return self.profileRequest(exec, .write, "cookies.store_set", .{
+        .url = exec.url.*,
+        .site = site,
+        .init = init,
+        .is_delete = is_delete,
+    });
+}
+
+fn profileRequest(self: *CookieStore, exec: *const Execution, kind: ProfileRequest.Kind, operation: []const u8, payload: anytype) !js.Promise {
+    const local = exec.js.local.?;
+    const event_client = exec.session.cookie_jar.profile_client orelse return local.typeError("ProfileServiceLost");
+    if (event_client.failed or !event_client.cookie_event_watcher_ready) return local.typeError("ProfileServiceLost");
+    const client = if (exec.session.profile_async_client) |*value| value else return local.typeError("ProfileServiceLost");
+    const allocator = exec.session.cookie_jar.allocator;
+    const request = try allocator.create(ProfileRequest);
+    const resolver = local.createPromiseResolver();
+    const global = resolver.persist() catch |err| {
+        allocator.destroy(request);
+        return err;
+    };
+    request.* = .{
+        .store = self,
+        .exec = @constCast(exec),
+        .allocator = allocator,
+        .resolver = global,
+        .kind = kind,
+    };
+    request.id = client.submit(operation, payload, request, ProfileRequest.completed) catch |err| {
+        global.release();
+        allocator.destroy(request);
+        return local.typeError(@errorName(err));
+    };
+    self._pending_profile.append(&request.node);
+    return resolver.promise();
+}
+
+const ProfileRequest = struct {
+    const Kind = enum { get, get_all, write };
+    node: std.DoublyLinkedList.Node = .{},
+    store: ?*CookieStore,
+    exec: *Execution,
+    allocator: std.mem.Allocator,
+    resolver: ?js.PromiseResolver.Global,
+    kind: Kind,
+    id: u64 = 0,
+    scheduled: bool = false,
+    result: ?ProfileAsync.Result = null,
+
+    fn release(self: *ProfileRequest) void {
+        if (self.store) |store| store._pending_profile.remove(&self.node);
+        if (self.result) |result| switch (result) {
+            .reply => |reply| reply.deinit(),
+            .failure => {},
+        };
+        if (self.resolver) |resolver| resolver.release();
+        self.allocator.destroy(self);
+    }
+
+    fn completed(ctx: *anyopaque, result: ProfileAsync.Result) void {
+        const self: *ProfileRequest = @ptrCast(@alignCast(ctx));
+        self.result = result;
+        if (self.store == null) {
+            self.release();
+            return;
+        }
+        self.scheduled = true;
+        self.exec.js.scheduler.add(self, run, 0, .{
+            .name = "CookieStore.profileReply",
+            .finalizer = cancelled,
+        }) catch self.release();
+    }
+
+    fn cancelled(ctx: *anyopaque) void {
+        const self: *ProfileRequest = @ptrCast(@alignCast(ctx));
+        self.release();
+    }
+
+    fn run(ctx: *anyopaque) !?u32 {
+        const self: *ProfileRequest = @ptrCast(@alignCast(ctx));
+        defer self.release();
+        if (self.store == null) return null;
+        var scope: js.Local.Scope = undefined;
+        self.exec.js.localScope(&scope);
+        defer scope.deinit();
+        const resolver = self.resolver.?.local(&scope.local);
+        const event_client = self.exec.session.cookie_jar.profile_client orelse {
+            resolver.rejectError("CookieStore", .{ .type_error = "ProfileServiceLost" });
+            return null;
+        };
+        if (event_client.failed or !event_client.cookie_event_watcher_ready) {
+            resolver.rejectError("CookieStore", .{ .type_error = "ProfileServiceLost" });
+            return null;
+        }
+        switch (self.result.?) {
+            .failure => |err| resolver.rejectError("CookieStore", .{ .type_error = @errorName(err) }),
+            .reply => |reply| {
+                const result = reply.value.object.get("result") orelse {
+                    resolver.rejectError("CookieStore", .{ .type_error = "ProfileProtocolError" });
+                    return null;
+                };
+                if (self.kind == .write) {
+                    if (result != .null) {
+                        resolver.rejectError("CookieStore", .{ .type_error = "ProfileProtocolError" });
+                    } else {
+                        resolver.resolve("CookieStore", {});
+                    }
+                    return null;
+                }
+                const rows = std.json.parseFromValue([]StoreRow, self.allocator, result, .{}) catch {
+                    resolver.rejectError("CookieStore", .{ .type_error = "ProfileProtocolError" });
+                    return null;
+                };
+                defer rows.deinit();
+                const items = self.allocator.alloc(CookieListItem, rows.value.len) catch {
+                    resolver.rejectError("CookieStore", .{ .type_error = "OutOfMemory" });
+                    return null;
+                };
+                defer self.allocator.free(items);
+                for (rows.value, 0..) |row, i| items[i] = .{
+                    .name = String.wrap(row.name),
+                    .value = String.wrap(row.value),
+                    .domain = if (row.domain) |domain| String.wrap(domain) else null,
+                    .path = String.wrap(row.path),
+                    .expires = row.expires,
+                    .secure = row.secure,
+                    .sameSite = row.sameSite,
+                };
+                if (self.kind == .get) {
+                    if (items.len == 0) resolver.resolve("CookieStore.get", @as(?CookieListItem, null)) else resolver.resolve("CookieStore.get", items[0]);
+                } else {
+                    resolver.resolve("CookieStore.getAll", items);
+                }
+            },
+        }
+        return null;
+    }
+};
 
 // Resolve the optional `url` per CookieStore.get/getAll spec. In a Window
 // context, only the document's own URL is allowed (matches the cookie scope
@@ -346,6 +671,8 @@ fn matchCookies(
     if (target.host.len == 0) {
         return error.SecurityError;
     }
+
+    if (session.cookie_jar.profile_client != null) return error.ProfileCookieOperationUnsupported;
 
     try session.cookie_jar.removeExpired(null);
 
@@ -391,15 +718,33 @@ fn matchCookies(
 
     return items.items;
 }
+pub const StoreRow = struct {
+    name: []const u8,
+    value: []const u8,
+    domain: ?[]const u8,
+    path: []const u8,
+    expires: ?f64,
+    secure: bool,
+    sameSite: []const u8,
+};
 
 fn storeCookie(exec: *const Execution, init_: CookieInit, is_delete: bool) !void {
-    const session = exec.session;
-    const url = exec.url.*;
+    const jar = &exec.session.cookie_jar;
+    const site = exec.siteForCookies();
+    if (jar.profile_client != null) return error.ProfileCookieOperationUnsupported;
+    return storeForJar(jar, exec.local_arena, exec.url.*, site, init_, is_delete);
+}
+
+// Shared by the in-process API and the Profile owner, so the owner enforces
+// the same validation and non-HTTP cookie protections as a local store.
+pub fn storeForJar(jar: *Cookie.Jar, scratch: std.mem.Allocator, url: [:0]const u8, site: Cookie.SiteForCookies, init_: CookieInit, is_delete: bool) !void {
+    if (jar.profile_client != null) return error.ProfileCookieOperationUnsupported;
 
     var init = init_;
 
     init.name = std.mem.trim(u8, init.name, " \t");
     init.value = std.mem.trim(u8, init.value, " \t");
+    if (init.name.len + init.value.len > Cookie.max_cookie_size) return error.CookieSizeExceeded;
 
     if (init.maxAge) |max_age| {
         if (init.expires != null) {
@@ -468,7 +813,7 @@ fn storeCookie(exec: *const Execution, init_: CookieInit, is_delete: bool) !void
         }
     }
 
-    if (init.sameSite != .none and Cookie.areSameSite(exec.siteForCookies(), URL.getHostname(url)) == false) {
+    if (init.sameSite != .none and Cookie.areSameSite(site, URL.getHostname(url)) == false) {
         return error.SameSiteBlocked;
     }
 
@@ -479,7 +824,7 @@ fn storeCookie(exec: *const Execution, init_: CookieInit, is_delete: bool) !void
 
     // Script can't set HttpOnly, so __Http- and __Host-Http- never pass.
     if (Cookie.prefixOf(init.name)) |prefix| {
-        const resolved_path = try Cookie.parsePath(exec.local_arena, url, init.path);
+        const resolved_path = try Cookie.parsePath(scratch, url, init.path);
         if (!prefix.allows(trustworthy, false, if (init.domain) |d| d.len > 0 else false, resolved_path)) {
             return error.InvalidPrefixedCookie;
         }
@@ -488,7 +833,7 @@ fn storeCookie(exec: *const Execution, init_: CookieInit, is_delete: bool) !void
     // The errdefer only protects construction failures. Once we `break :blk`
     // with the Cookie value, `Jar.add` owns its lifetime.
     const cookie: Cookie = blk: {
-        var arena = std.heap.ArenaAllocator.init(session.cookie_jar.allocator);
+        var arena = std.heap.ArenaAllocator.init(jar.allocator);
         errdefer arena.deinit();
         const aa = arena.allocator();
 
@@ -520,7 +865,7 @@ fn storeCookie(exec: *const Execution, init_: CookieInit, is_delete: bool) !void
     };
 
     // CookieStore is a script API, so is_http = false.
-    try session.cookie_jar.add(cookie, lp.datetime.timestamp(.real), false);
+    try jar.add(cookie, lp.datetime.timestamp(.real), false);
 }
 
 // Control characters (U+0000–U+001F and U+007F DEL) and `;` cannot appear in

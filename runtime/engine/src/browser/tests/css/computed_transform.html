@@ -8,6 +8,11 @@
   Chrome. Animation libraries (popmotion) regex it and crash otherwise.
 -->
 
+<style>
+  #stylesheet-transform { transform: translateX(10px) scale(2); }
+  #stylesheet-important-transform { transform: rotate(90deg) !important; }
+</style>
+
 <div id=translate_scale style="transform: translateX(10px) scale(2)"></div>
 <div id=rotate style="transform: rotate(45deg)"></div>
 <div id=rotate90 style="transform: rotate(90deg)"></div>
@@ -16,6 +21,8 @@
 <div id=explicit_none style="transform: none"></div>
 <div id=unset></div>
 <div id=matrix style="transform: matrix(1, 2, 3, 4, 5, 6)"></div>
+<div id=stylesheet-transform></div>
+<div id=stylesheet-important-transform style="transform: rotate(45deg)"></div>
 
 <script id=resolved_transform>
   const t = (id) => getComputedStyle(document.getElementById(id)).transform;
@@ -27,6 +34,9 @@
   testing.expectEqual('none', t('explicit_none'));
   testing.expectEqual('none', t('unset'));
   testing.expectEqual('matrix(1, 2, 3, 4, 5, 6)', t('matrix'));
+  testing.expectEqual('matrix(2, 0, 0, 2, 10, 0)', t('stylesheet-transform'));
+  // Author !important outranks an inline normal declaration.
+  testing.expectEqual('matrix(6.12323e-17, 1, -1, 6.12323e-17, 0, 0)', t('stylesheet-important-transform'));
 
   // getPropertyValue goes through the same path; el.style keeps the
   // specified value.

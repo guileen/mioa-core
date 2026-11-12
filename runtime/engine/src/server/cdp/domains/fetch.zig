@@ -125,6 +125,13 @@ pub fn requestIntercept(arena: Allocator, bc: *CDP.BrowserContext, intercept: *c
     const session_id = bc.fetch_session_id orelse return;
 
     const transfer = intercept.transfer;
+    if (transfer.req.resource_type == .document and
+        bc.intercept_state.matches(.Response, transfer.req.url, transfer.req.resource_type))
+    {
+        // Navigation may stream only when no response-stage consumer must
+        // inspect/replace the complete body before the document sees it.
+        transfer.req.streaming = false;
+    }
     if (!bc.intercept_state.matches(.Request, transfer.req.url, transfer.req.resource_type)) {
         // Leaves wait_for_interception false: the request proceeds untouched.
         return;
@@ -355,6 +362,11 @@ fn continueRequest(cmd: *CDP.Command) !void {
 
     if (params.interceptResponse) |intercept_response| {
         transfer._intercept_response = intercept_response;
+    }
+    if (request.resource_type == .document and
+        (transfer._intercept_response orelse bc.intercept_state.matches(.Response, request.url, request.resource_type)))
+    {
+        request.streaming = false;
     }
 
     try client.continueIntercepted(transfer);

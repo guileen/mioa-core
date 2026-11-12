@@ -24,11 +24,22 @@
 const std = @import("std");
 const zenai = @import("zenai");
 const lp = @import("lightpanda");
+const ThreadApi = @import("thread_api");
 
 const Client = zenai.provider.Client;
 const Message = zenai.provider.Message;
 
 const ModelCall = @This();
+const HelperContext = struct {
+    model_call: *ModelCall,
+    client: Client,
+    model: []const u8,
+    messages: *std.ArrayList(Message),
+    list_alloc: std.mem.Allocator,
+    data_alloc: std.mem.Allocator,
+    handler: Client.ToolHandler,
+    config: Client.RunToolsConfig,
+};
 
 const ToolCall = struct {
     allocator: std.mem.Allocator,
@@ -70,20 +81,45 @@ pub fn run(
     if (config.stream != null) forwarded.stream = .{ .context = @ptrCast(&self), .onText = forwardText };
     const forward_tool: Client.ToolHandler = .{ .context = @ptrCast(&self), .callFn = forwardTool };
 
-    const args = .{ client, model, messages, list_alloc, data_alloc, forward_tool, forwarded };
-    const thread = std.Thread.spawn(.{}, helperMain, .{ &self, args }) catch
+    // The stack context stays live until join below; a failed start falls back synchronously.
+    var helper_context: HelperContext = .{
+        .model_call = &self,
+        .client = client,
+        .model = model,
+        .messages = messages,
+        .list_alloc = list_alloc,
+        .data_alloc = data_alloc,
+        .handler = forward_tool,
+        .config = forwarded,
+    };
+    var thread_handle: ?*anyopaque = null;
+    if (ThreadApi.mioa_thread_start_v1(helperEntry, &helper_context, &thread_handle) != ThreadApi.MIOA_THREAD_OK) {
         return client.runTools(model, messages, list_alloc, data_alloc, handler, config);
+    }
     self.serve(session);
-    thread.join();
+    ThreadApi.mioa_thread_join_v1(&thread_handle);
     return self.outcome;
 }
 
-fn helperMain(self: *ModelCall, args: anytype) void {
-    self.outcome = @call(.auto, Client.runTools, args);
+fn helperMain(context: *HelperContext) void {
+    const self = context.model_call;
+    self.outcome = context.client.runTools(
+        context.model,
+        context.messages,
+        context.list_alloc,
+        context.data_alloc,
+        context.handler,
+        context.config,
+    );
     self.mutex.lockUncancelable(lp.io);
     self.finished = true;
     self.mutex.unlock(lp.io);
     self.posted.set(lp.io);
+}
+
+fn helperEntry(context: ?*anyopaque) callconv(.c) void {
+    const helper: *HelperContext = @ptrCast(@alignCast(context.?));
+    helperMain(helper);
 }
 
 /// Agent thread: run what the helper hands over, pump the session in between.

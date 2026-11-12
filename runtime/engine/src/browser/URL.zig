@@ -644,6 +644,7 @@ pub fn getRobotsUrl(arena: Allocator, url: [:0]const u8) ![:0]const u8 {
     );
 }
 
+/// Percent-decodes ASCII hex pairs; malformed escapes remain literal (URL §1.3).
 pub fn unescape(arena: Allocator, input: []const u8) ![]const u8 {
     if (std.mem.findScalar(u8, input, '%') == null) {
         return input;
@@ -654,18 +655,19 @@ pub fn unescape(arena: Allocator, input: []const u8) ![]const u8 {
     var i: usize = 0;
     while (i < input.len) {
         if (input[i] == '%' and i + 2 < input.len) {
-            const hex = input[i + 1 .. i + 3];
-            const byte = std.fmt.parseInt(u8, hex, 16) catch {
-                result.appendAssumeCapacity(input[i]);
-                i += 1;
-                continue;
+            const byte: ?u8 = blk: {
+                const high = std.fmt.charToDigit(input[i + 1], 16) catch break :blk null;
+                const low = std.fmt.charToDigit(input[i + 2], 16) catch break :blk null;
+                break :blk high * 16 + low;
             };
-            result.appendAssumeCapacity(byte);
-            i += 3;
-        } else {
-            result.appendAssumeCapacity(input[i]);
-            i += 1;
+            if (byte) |value| {
+                result.appendAssumeCapacity(value);
+                i += 3;
+                continue;
+            }
         }
+        result.appendAssumeCapacity(input[i]);
+        i += 1;
     }
 
     return result.items;
@@ -1466,6 +1468,26 @@ test "URL: unescape" {
         const result = try unescape(arena, "hello%2");
         try testing.expectEqual("hello%2", result);
     }
+}
+
+test "URL: unescape accepts exactly two ASCII hex digits" {
+    const arena = testing.arena_allocator;
+    const digits = "0123456789abcdef";
+    for (0..256) |first| {
+        for (0..256) |second| {
+            const input = [_]u8{ '%', @intCast(first), @intCast(second) };
+            const high = std.mem.findScalar(u8, digits, std.ascii.toLower(input[1]));
+            const low = std.mem.findScalar(u8, digits, std.ascii.toLower(input[2]));
+            const result = try unescape(arena, &input);
+            if (high != null and low != null) {
+                const expected = [_]u8{@intCast(high.? * 16 + low.?)};
+                try std.testing.expectEqualSlices(u8, &expected, result);
+            } else {
+                try std.testing.expectEqualSlices(u8, &input, result);
+            }
+        }
+    }
+    try testing.expectString("%A%2%+F%_A%41", try unescape(arena, "%%41%2%+F%_A%2541"));
 }
 
 test "URL: getHost" {

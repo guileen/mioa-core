@@ -41,36 +41,237 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }
 }
 
-/// A desktop input sequence is one native event-loop turn. Validate the exact
-/// rendered pixels and semantic document tree before any input side effect.
+fn resetNativeInput(bc: *CDP.BrowserContext) void {
+    bc.suppress_next_char = false;
+    if (bc.mainFrame()) |frame| {
+        frame.page.input_pointer = .{};
+        frame.page.input_modifiers = .{};
+    }
+}
+
+fn rejectElementInput(cmd: *CDP.Command, bc: *CDP.BrowserContext, message: []const u8) !void {
+    resetNativeInput(bc);
+    return cmd.sendError(-32042, message, .{});
+}
+
+fn nativeFocusMatches(frame: *Frame, channel: *const CDP.BrowserContext.NativeInputChannel) bool {
+    if (@intFromPtr(frame) != channel.frame or frame._loader_id != channel.loader or
+        !std.meta.eql(frame.page.getViewport(), channel.viewport)) return false;
+    const focused = Frame.user_input.focusedFrame(frame);
+    const element = Frame.user_input.focusedElement(focused);
+    return @intFromPtr(focused) == channel.focus_frame and focused._loader_id == channel.focus_loader and
+        (if (element) |el| @intFromPtr(el) else @as(usize, 0)) == channel.focus_element;
+}
+
+/// A desktop input sequence is one native event-loop turn. Governed input checks
+/// exact retained model authority; the legacy API retains its full pixel guard.
 fn dispatchNativeAction(cmd: *CDP.Command) !void {
     const Method = enum { dispatchMouseEvent, dispatchKeyEvent, insertText };
+    const Phase = enum { begin, end, cancel };
     const Params = struct {
-        expectedRenderFingerprint: []const u8,
+        expectedObjectId: ?[]const u8 = null,
+        expectedDocumentId: ?[]const u8 = null,
+        expectedRenderFingerprint: ?[]const u8 = null,
+        expectedVisualGeneration: ?u64 = null,
+        expectedSceneRevision: ?u64 = null,
+        channelId: ?u64 = null,
+        channelPhase: ?Phase = null,
         events: []const struct { method: Method, params: CDP.InputParams },
     };
     const params = try cmd.params(Params) orelse return error.InvalidParams;
-    if (params.expectedRenderFingerprint.len != 64 or params.events.len == 0 or params.events.len > 32) return error.InvalidParams;
+    if (params.events.len > 32 or (params.channelId == null) != (params.channelPhase == null)) return error.InvalidParams;
+    if ((params.expectedObjectId == null) != (params.expectedDocumentId == null)) return error.InvalidParams;
+    if (params.expectedObjectId != null and (params.channelId != null or params.expectedRenderFingerprint != null or
+        params.expectedVisualGeneration != null or params.expectedSceneRevision != null)) return error.InvalidParams;
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    var channel: ?*CDP.BrowserContext.NativeInputChannel = null;
+    if (params.channelId) |id| {
+        if (id == 0 or id > 9007199254740991) return error.InvalidParams;
+        const lane: usize = @intCast((id - 1) % bc.native_input_channels.len);
+        const lane_slot = &bc.native_input_channels[lane];
+        if (params.channelPhase.? == .begin) {
+            if (id <= bc.native_input_high_water[lane]) return error.InvalidParams;
+            if (lane_slot.id != 0) return cmd.sendError(-32000, "native input channel capacity exhausted", .{});
+            channel = lane_slot;
+        } else {
+            if (lane_slot.id == id) channel = lane_slot;
+            if (params.channelPhase.? == .cancel) {
+                if (channel) |slot| {
+                    resetNativeInput(bc);
+                    slot.* = .{};
+                }
+                return cmd.sendResult(.{ .status = "reset" }, .{});
+            }
+            const retained = channel orelse return cmd.sendError(-32042, "native input channel expired", .{});
+            const current = bc.mainFrame();
+            if (!retained.ready or current == null or !nativeFocusMatches(current.?, retained)) {
+                resetNativeInput(bc);
+                retained.* = .{};
+                return cmd.sendResult(.{ .status = "reset" }, .{});
+            }
+        }
+    }
+    if (params.events.len == 0) return error.InvalidParams;
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
     const loader_id = frame._loader_id;
-    const fingerprint = try @import("../../../browser/native_layout.zig").frameFingerprint(frame);
-    const hex = std.fmt.bytesToHex(fingerprint, .lower);
-    if (!std.mem.eql(u8, &hex, params.expectedRenderFingerprint)) return cmd.sendError(-32042, "stale native render fingerprint", .{});
+    const ending = params.channelPhase != null and params.channelPhase.? == .end;
+    // Validate the complete physical sequence before consuming authority/effects.
+    var identity: CDP.BrowserContext.NativeInputChannel = .{};
+    if (params.channelPhase != null) {
+        for (params.events, 0..) |event, index| {
+            var nested = cmd.*;
+            nested.input.params = event.params;
+            switch (event.method) {
+                .dispatchMouseEvent => {
+                    const mouse = try nested.params(struct {
+                        type: []const u8,
+                        x: f64,
+                        y: f64,
+                        button: []const u8 = "none",
+                        clickCount: i32 = 0,
+                    }) orelse return error.InvalidParams;
+                    if (!ending and index == 0 and params.events.len == 2 and std.mem.eql(u8, mouse.type, "mouseMoved")) continue;
+                    if (identity.key_count != 0 or index + 1 != params.events.len or params.events.len > (if (ending) @as(usize, 1) else 2) or
+                        !std.mem.eql(u8, mouse.type, if (ending) "mouseReleased" else "mousePressed")) return error.InvalidParams;
+                    identity.mouse = true;
+                    identity.x = mouse.x;
+                    identity.y = mouse.y;
+                    identity.click_count = mouse.clickCount;
+                    identity.button = if (std.mem.eql(u8, mouse.button, "left")) 0 else if (std.mem.eql(u8, mouse.button, "middle")) 1 else if (std.mem.eql(u8, mouse.button, "right")) 2 else return error.InvalidParams;
+                },
+                .dispatchKeyEvent => {
+                    if (identity.mouse or params.events.len > 8 or index != identity.key_count) return error.InvalidParams;
+                    const key = try nested.params(struct { type: []const u8, key: []const u8 = "", code: []const u8 = "" }) orelse return error.InvalidParams;
+                    if (ending) {
+                        if (!std.mem.eql(u8, key.type, "keyUp")) return error.InvalidParams;
+                    } else if (!std.mem.eql(u8, key.type, "keyDown") and !std.mem.eql(u8, key.type, "rawKeyDown")) return error.InvalidParams;
+                    const name = if (key.code.len > 0) key.code else key.key;
+                    if (name.len == 0 or name.len > 100) return error.InvalidParams;
+                    @memcpy(identity.keys[index][0..name.len], name);
+                    identity.key_lengths[index] = name.len;
+                    identity.key_count += 1;
+                },
+                .insertText => return error.InvalidParams,
+            }
+        }
+        if (ending) {
+            const retained = channel.?;
+            var matches = identity.mouse == retained.mouse and identity.key_count == retained.key_count;
+            if (identity.mouse) {
+                matches = matches and identity.button == retained.button and identity.click_count == retained.click_count;
+            } else if (identity.key_count == retained.key_count) {
+                for (0..identity.key_count) |index| {
+                    const original = retained.key_count - 1 - index;
+                    matches = matches and std.mem.eql(u8, identity.keys[index][0..identity.key_lengths[index]], retained.keys[original][0..retained.key_lengths[original]]);
+                }
+            }
+            if (!matches) {
+                resetNativeInput(bc);
+                retained.* = .{};
+                return cmd.sendResult(.{ .status = "reset" }, .{});
+            }
+        }
+    }
+    if (params.expectedObjectId) |_| {
+        // Session-bound DOM authority is checked immediately before every event below.
+        for (params.events) |event| {
+            if (event.method == .dispatchMouseEvent) return error.InvalidParams;
+        }
+    } else if (ending) {
+        // Original retained channel, not a newer displayed binding.
+    } else if (params.expectedVisualGeneration) |generation| {
+        const scene = params.expectedSceneRevision orelse return error.InvalidParams;
+        const displayed = bc.native_displayed_capture;
+        if (generation == 0 or displayed.generation != generation or displayed.loader != loader_id or
+            scene == 0 or scene != bc.native_displayed_scene or
+            !@import("../../../browser/ExactVisualGuard.zig").validate(frame, displayed.guard, true))
+            return cmd.sendError(-32042, "stale displayed native frame", .{});
+        // One authorization consumes this displayed basis before any side effect.
+        bc.native_displayed_capture = .{};
+    } else {
+        if (params.expectedSceneRevision != null) return error.InvalidParams;
+        const expected = params.expectedRenderFingerprint orelse return error.InvalidParams;
+        const fingerprint = try @import("../../../browser/native_layout.zig").frameFingerprint(frame);
+        const hex = std.fmt.bytesToHex(fingerprint, .lower);
+        if (expected.len != 64 or !std.mem.eql(u8, &hex, expected))
+            return cmd.sendError(-32042, "stale native render fingerprint", .{});
+    }
+    if (params.channelPhase != null and params.channelPhase.? == .begin) {
+        channel.?.* = identity;
+        channel.?.id = params.channelId.?;
+        channel.?.frame = @intFromPtr(frame);
+        channel.?.loader = loader_id;
+        bc.native_input_high_water[@intCast((params.channelId.? - 1) % bc.native_input_high_water.len)] = params.channelId.?;
+    }
+    if (ending) channel.?.ready = false; // Unknown terminal effects can only reset next.
+    errdefer if (channel != null) {
+        resetNativeInput(bc);
+    };
     var discard: std.Io.Writer.Discarding = .init(&.{});
     for (params.events) |event| {
         const active = bc.mainFrame() orelse return cmd.sendError(-32042, "native action document changed", .{});
-        if (active != frame or active._loader_id != loader_id) return cmd.sendError(-32042, "native action document changed", .{});
+        if (active != frame or active._loader_id != loader_id) {
+            resetNativeInput(bc);
+            return cmd.sendError(-32042, "native action document changed", .{});
+        }
+        if (ending and !nativeFocusMatches(active, channel.?)) {
+            resetNativeInput(bc);
+            channel.?.* = .{};
+            return cmd.sendResult(.{ .status = "reset" }, .{});
+        }
         var nested = cmd.*;
         nested.input.action = @tagName(event.method);
         nested.input.params = event.params;
         nested.sender = .{ .capture = &discard.writer };
+        if (params.expectedObjectId) |object_id| {
+            const registered = @import("dom.zig").getNode(cmd.arena, bc, cmd.input.session_id, null, null, object_id) catch
+                return rejectElementInput(cmd, bc, "native input element expired");
+            const node = registered.dom;
+            const Node = @import("../../../browser/webapi/Node.zig");
+            const element = node.is(Node.Element) orelse return error.InvalidParams;
+            const document_node = @import("dom.zig").getNode(cmd.arena, bc, cmd.input.session_id, null, null, params.expectedDocumentId.?) catch
+                return rejectElementInput(cmd, bc, "native input document expired");
+            const document = document_node.dom.is(Node.Document) orelse return error.InvalidParams;
+            const owner = node.ownerFrame(active) orelse return rejectElementInput(cmd, bc, "native input document expired");
+            if (!node.isConnected() or node.getDocument(owner) != owner.window._document)
+                return rejectElementInput(cmd, bc, "native input element detached");
+            if (node.getDocument(owner) != document)
+                return rejectElementInput(cmd, bc, "native input document changed");
+            const key_up = if (event.method == .dispatchKeyEvent) blk: {
+                const key = try nested.params(struct { type: []const u8 }) orelse return error.InvalidParams;
+                break :blk std.mem.eql(u8, key.type, "keyUp");
+            } else false;
+            if (Frame.user_input.focusedFrame(active) != owner or (!key_up and Frame.user_input.focusedElement(owner) != element))
+                return rejectElementInput(cmd, bc, "native input focus changed");
+        }
         switch (event.method) {
-            .dispatchMouseEvent => try dispatchMouseEvent(&nested),
+            .dispatchMouseEvent => {
+                if (ending) {
+                    // Ignore mutable Python cursor position for a physical up.
+                    const retained = channel.?;
+                    try Frame.user_input.triggerMouseRelease(frame, retained.x, retained.y, retained.button, retained.click_count);
+                } else try dispatchMouseEvent(&nested);
+            },
             .dispatchKeyEvent => try dispatchKeyEvent(&nested),
             .insertText => try insertText(&nested),
         }
     }
+    if (channel) |retained| {
+        if (ending) {
+            retained.* = .{};
+        } else {
+            const active = bc.mainFrame();
+            if (active != null and active.? == frame and frame._loader_id == loader_id) {
+                const focused = Frame.user_input.focusedFrame(frame);
+                retained.viewport = frame.page.getViewport();
+                retained.focus_frame = @intFromPtr(focused);
+                retained.focus_loader = focused._loader_id;
+                retained.focus_element = if (Frame.user_input.focusedElement(focused)) |el| @intFromPtr(el) else 0;
+                retained.ready = true;
+            } else resetNativeInput(bc);
+        }
+    }
+    if (ending) return cmd.sendResult(.{ .status = "ok" }, .{});
     return cmd.sendResult(null, .{});
 }
 
@@ -281,6 +482,178 @@ fn insertText(cmd: *CDP.Command) !void {
 const lp = @import("lightpanda");
 const testing = @import("../testing.zig");
 
+test "cdp.input: physical channels deliver up once or reset without retargeting" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const old_fonts = testing.base.test_config.mode.serve.render_font;
+    var fonts: std.ArrayList([]const u8) = .empty;
+    defer fonts.deinit(testing.allocator);
+    try fonts.append(testing.allocator, "src/rust/render/fonts/DejaVuSans.ttf");
+    testing.base.test_config.mode.serve.render_font = fonts;
+    defer testing.base.test_config.mode.serve.render_font = old_fonts;
+    const bc = try ctx.loadBrowserContext(.{});
+    const handle = try bc.session.createPage();
+    const frame = handle.frame().?;
+    try frame.navigate("http://localhost:9582/src/browser/tests/mcp_actions.html", .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun(
+        \\document.body.innerHTML='<input id="a"><input id="b">';
+        \\globalThis.a=document.getElementById('a'); globalThis.b=document.getElementById('b');
+        \\globalThis.ups=[]; document.addEventListener('keyup',e=>ups.push(e.target.id));
+    , null);
+    const guard = @import("../../../browser/ExactVisualGuard.zig");
+    for (1..5) |id| {
+        _ = try ls.local.compileAndRun("a.focus()", null);
+        const capture = try guard.prepare(frame, .{ .owner = @intFromPtr(bc), .generation = id });
+        bc.native_displayed_capture = .{ .generation = id, .loader = frame._loader_id, .guard = capture };
+        bc.native_displayed_scene = id;
+        try testing.expect(guard.pinDisplayed(frame, capture));
+        try ctx.processMessage(.{ .id = 930, .method = "Input.dispatchNativeAction", .params = .{
+            .expectedVisualGeneration = id,
+            .expectedSceneRevision = id,
+            .channelId = id,
+            .channelPhase = "begin",
+            .events = .{.{ .method = "dispatchKeyEvent", .params = .{ .type = "rawKeyDown", .key = "Shift", .code = "ShiftLeft", .modifiers = 8 } }},
+        } });
+        try ctx.expectSentResult(null, .{ .id = 930 });
+        try testing.expectEqual(0, bc.native_displayed_capture.generation);
+        if (id == 2) _ = try ls.local.compileAndRun("b.focus()", null);
+        if (id == 4) {
+            try ctx.processMessage(.{ .id = 934, .method = "Emulation.setDeviceMetricsOverride", .params = .{
+                .width = 600,
+                .height = 400,
+                .deviceScaleFactor = 1,
+                .mobile = false,
+            } });
+        }
+        if (id == 3) {
+            try ctx.processMessage(.{ .id = 931, .method = "Input.dispatchNativeAction", .params = .{
+                .channelId = id,
+                .channelPhase = "cancel",
+                .events = .{},
+            } });
+        } else {
+            try ctx.processMessage(.{ .id = 931, .method = "Input.dispatchNativeAction", .params = .{
+                .channelId = id,
+                .channelPhase = "end",
+                .events = .{.{ .method = "dispatchKeyEvent", .params = .{ .type = "keyUp", .key = "Shift", .code = "ShiftLeft" } }},
+            } });
+        }
+        if (id == 1) {
+            try ctx.expectSentResult(.{ .status = "ok" }, .{ .id = 931 });
+        } else try ctx.expectSentResult(.{ .status = "reset" }, .{ .id = 931 });
+        try testing.expect((try ls.local.compileAndRun("ups.join() === 'a'", null)).isTrue());
+        for (bc.native_input_channels) |channel| try testing.expectEqual(0, channel.id);
+    }
+    for ([_]u64{ 7, 6 }) |id| {
+        _ = try ls.local.compileAndRun("a.focus()", null);
+        const capture = try guard.prepare(frame, .{ .owner = @intFromPtr(bc), .generation = id });
+        bc.native_displayed_capture = .{ .generation = id, .loader = frame._loader_id, .guard = capture };
+        bc.native_displayed_scene = id;
+        try testing.expect(guard.pinDisplayed(frame, capture));
+        try ctx.processMessage(.{ .id = 938, .method = "Input.dispatchNativeAction", .params = .{
+            .expectedVisualGeneration = id,
+            .expectedSceneRevision = id,
+            .channelId = id,
+            .channelPhase = "begin",
+            .events = .{.{ .method = "dispatchKeyEvent", .params = .{ .type = "rawKeyDown", .key = "Shift", .code = "ShiftLeft", .modifiers = 8 } }},
+        } });
+        try ctx.expectSentResult(null, .{ .id = 938 });
+        try ctx.processMessage(.{ .id = 939, .method = "Input.dispatchNativeAction", .params = .{
+            .channelId = id,
+            .channelPhase = "end",
+            .events = .{.{ .method = "dispatchKeyEvent", .params = .{ .type = "keyUp", .key = "Shift", .code = "ShiftLeft" } }},
+        } });
+        try ctx.expectSentResult(.{ .status = "ok" }, .{ .id = 939 });
+    }
+    try testing.expect((try ls.local.compileAndRun("ups.join() === 'a,a,a'", null)).isTrue());
+    _ = try ls.local.compileAndRun(
+        \\document.body.innerHTML='<button id="pointer" style="position:fixed;left:0;top:0;width:100px;height:100px">hit</button>';
+        \\globalThis.pointerUps=0; document.addEventListener('mouseup',e=>{if(e.target.id==='pointer')pointerUps++});
+    , null);
+    const capture = try guard.prepare(frame, .{ .owner = @intFromPtr(bc), .generation = 5 });
+    bc.native_displayed_capture = .{ .generation = 5, .loader = frame._loader_id, .guard = capture };
+    bc.native_displayed_scene = 5;
+    try testing.expect(guard.pinDisplayed(frame, capture));
+    try ctx.processMessage(.{ .id = 935, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedVisualGeneration = 5,
+        .expectedSceneRevision = 5,
+        .channelId = 5,
+        .channelPhase = "begin",
+        .events = .{.{ .method = "dispatchMouseEvent", .params = .{ .type = "mousePressed", .x = 20, .y = 20, .button = "left", .clickCount = 1 } }},
+    } });
+    try ctx.expectSentResult(null, .{ .id = 935 });
+    try testing.expect(frame.page.input_pointer.down_target != null);
+    try ctx.processMessage(.{ .id = 936, .method = "Input.dispatchNativeAction", .params = .{
+        .channelId = 5,
+        .channelPhase = "end",
+        .events = .{.{ .method = "dispatchMouseEvent", .params = .{ .type = "mouseReleased", .x = 500, .y = 300, .button = "left", .clickCount = 1 } }},
+    } });
+    try ctx.expectSentResult(.{ .status = "ok" }, .{ .id = 936 });
+    try testing.expect((try ls.local.compileAndRun("pointerUps===1", null)).isTrue());
+    try testing.expect(frame.page.input_pointer.down_target == null);
+    try ctx.processMessage(.{ .id = 937, .method = "Input.dispatchNativeAction", .params = .{
+        .channelId = 5,
+        .channelPhase = "end",
+        .events = .{.{ .method = "dispatchMouseEvent", .params = .{ .type = "mouseReleased", .x = 20, .y = 20, .button = "left", .clickCount = 1 } }},
+    } });
+    try ctx.expectSentError(-32042, "native input channel expired", .{ .id = 937 });
+    try testing.expect((try ls.local.compileAndRun("pointerUps===1", null)).isTrue());
+}
+
+test "cdp.input: physical terminal after navigation never enters replacement document" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const old_fonts = testing.base.test_config.mode.serve.render_font;
+    var fonts: std.ArrayList([]const u8) = .empty;
+    defer fonts.deinit(testing.allocator);
+    try fonts.append(testing.allocator, "src/rust/render/fonts/DejaVuSans.ttf");
+    testing.base.test_config.mode.serve.render_font = fonts;
+    defer testing.base.test_config.mode.serve.render_font = old_fonts;
+    const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
+    const frame = bc.mainFrame().?;
+    const url = "http://127.0.0.1:9582/src/browser/tests/mcp_actions.html";
+    {
+        var ls: lp.js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.compileAndRun("document.body.innerHTML='<input id=\"old\">'; document.getElementById('old').focus()", null);
+    }
+    const guard = @import("../../../browser/ExactVisualGuard.zig");
+    const capture = try guard.prepare(frame, .{ .owner = @intFromPtr(bc), .generation = 1 });
+    bc.native_displayed_capture = .{ .generation = 1, .loader = frame._loader_id, .guard = capture };
+    bc.native_displayed_scene = 1;
+    try testing.expect(guard.pinDisplayed(frame, capture));
+    try ctx.processMessage(.{ .id = 940, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedVisualGeneration = 1,
+        .expectedSceneRevision = 1,
+        .channelId = 1,
+        .channelPhase = "begin",
+        .events = .{.{ .method = "dispatchKeyEvent", .params = .{ .type = "rawKeyDown", .key = "Shift", .code = "ShiftLeft" } }},
+    } });
+    try ctx.expectSentResult(null, .{ .id = 940 });
+    const old_loader = frame._loader_id;
+    try ctx.processMessage(.{ .id = 942, .method = "Page.navigate", .params = .{ .url = url } });
+    try testing.waitForPage(bc);
+    const replacement = bc.mainFrame().?;
+    try testing.expect(replacement._loader_id != old_loader);
+    var ls: lp.js.Local.Scope = undefined;
+    replacement.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun("globalThis.newUps=0; document.addEventListener('keyup',()=>newUps++)", null);
+    try ctx.processMessage(.{ .id = 941, .method = "Input.dispatchNativeAction", .params = .{
+        .channelId = 1,
+        .channelPhase = "end",
+        .events = .{.{ .method = "dispatchKeyEvent", .params = .{ .type = "keyUp", .key = "Shift", .code = "ShiftLeft" } }},
+    } });
+    try ctx.expectSentResult(.{ .status = "reset" }, .{ .id = 941 });
+    try testing.expect((try ls.local.compileAndRun("newUps===0", null)).isTrue());
+    for (bc.native_input_channels) |channel| try testing.expectEqual(0, channel.id);
+}
+
 test "cdp.input: native fingerprint rejects non-DOM visual changes before input" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -291,8 +664,9 @@ test "cdp.input: native fingerprint rejects non-DOM visual changes before input"
     testing.base.test_config.mode.serve.render_font = fonts;
     defer testing.base.test_config.mode.serve.render_font = old_fonts;
     const bc = try ctx.loadBrowserContext(.{});
-    const page = try bc.session.createPage();
-    const frame = page.frame().?;
+    const handle = try bc.session.createPage();
+    const page = handle.page().?;
+    const frame = handle.frame().?;
     try frame.navigate("http://localhost:9582/src/browser/tests/mcp_actions.html", .{ .reason = .address_bar, .kind = .{ .push = null } });
     try testing.waitForPage(bc);
     var ls: lp.js.Local.Scope = undefined;
@@ -305,6 +679,12 @@ test "cdp.input: native fingerprint rejects non-DOM visual changes before input"
         \\guard.focus(); globalThis.nativeEdits=0;
         \\guard.addEventListener('input',()=>nativeEdits++);
     , null);
+    var generation = page.visual_generation.load(.acquire);
+    _ = try ls.local.compileAndRun("guardSheet.cssRules[0].selectorText='input:focus'", null);
+    try testing.expect(page.visual_generation.load(.acquire) > generation);
+    generation = page.visual_generation.load(.acquire);
+    _ = try ls.local.compileAndRun("guardSheet.cssRules[0].style.color='red'", null);
+    try testing.expect(page.visual_generation.load(.acquire) > generation);
     const layout = @import("../../../browser/native_layout.zig");
     const displayed = try layout.frameFingerprint(frame);
     _ = try ls.local.compileAndRun("guard.value='programmatic'", null);
@@ -314,20 +694,94 @@ test "cdp.input: native fingerprint rejects non-DOM visual changes before input"
         .expectedRenderFingerprint = &std.fmt.bytesToHex(displayed, .lower),
         .events = .{.{ .method = "insertText", .params = .{ .text = "blocked" } }},
     } });
-    try ctx.expectSentError(-32042, "stale native render fingerprint", .{ .id = 901 });
     try testing.expect((try ls.local.compileAndRun("guard.value==='programmatic' && nativeEdits===0", null)).isTrue());
     _ = try ls.local.compileAndRun("guardSheet.insertRule('input { margin-left:50px }',0)", null);
     const cssom_changed = try layout.frameFingerprint(frame);
     try testing.expect(!std.mem.eql(u8, &value_changed, &cssom_changed));
+    generation = page.visual_generation.load(.acquire);
     _ = try ls.local.compileAndRun("document.getElementById('surface').getContext('2d').fillRect(0,0,10,10)", null);
+    try testing.expect(page.visual_generation.load(.acquire) > generation);
     const canvas_changed = try layout.frameFingerprint(frame);
     try testing.expect(!std.mem.eql(u8, &cssom_changed, &canvas_changed));
+    generation = page.visual_generation.load(.acquire);
+    try ctx.processMessage(.{ .id = 903, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedVisualGeneration = generation,
+        .expectedSceneRevision = 1,
+        .expectedRenderFingerprint = &std.fmt.bytesToHex(canvas_changed, .lower),
+        .events = .{.{ .method = "insertText", .params = .{ .text = "blocked" } }},
+    } });
+    try testing.expect((try ls.local.compileAndRun("nativeEdits===0", null)).isTrue());
     try ctx.processMessage(.{ .id = 902, .method = "Input.dispatchNativeAction", .params = .{
         .expectedRenderFingerprint = &std.fmt.bytesToHex(canvas_changed, .lower),
         .events = .{.{ .method = "insertText", .params = .{ .text = "!" } }},
     } });
     try ctx.expectSentResult(null, .{ .id = 902 });
     try testing.expect((try ls.local.compileAndRun("nativeEdits===1", null)).isTrue());
+}
+
+test "cdp.input: native exact displayed model rejects mutations and survives candidate rollover" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const old_fonts = testing.base.test_config.mode.serve.render_font;
+    var fonts: std.ArrayList([]const u8) = .empty;
+    defer fonts.deinit(testing.allocator);
+    try fonts.append(testing.allocator, "src/rust/render/fonts/DejaVuSans.ttf");
+    testing.base.test_config.mode.serve.render_font = fonts;
+    defer testing.base.test_config.mode.serve.render_font = old_fonts;
+    const bc = try ctx.loadBrowserContext(.{});
+    const handle = try bc.session.createPage();
+    const frame = handle.frame().?;
+    try frame.navigate("http://localhost:9582/src/browser/tests/mcp_actions.html", .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun(
+        \\document.body.innerHTML='<input id="exact-field" value="a">';
+        \\globalThis.exactField=document.getElementById('exact-field');
+        \\exactField.focus(); globalThis.exactEdits=0;
+        \\exactField.addEventListener('input',()=>exactEdits++);
+    , null);
+    const guard = @import("../../../browser/ExactVisualGuard.zig");
+    const first = try guard.prepare(frame, .{ .owner = @intFromPtr(bc), .generation = 1 });
+    bc.native_captures[1] = .{ .generation = 1, .loader = frame._loader_id, .guard = first };
+    try ctx.processMessage(.{ .id = 910, .method = "Page.bindDisplayedFrame", .params = .{
+        .sceneRevision = 1,
+        .visualGeneration = 1,
+    } });
+    try ctx.expectSentResult(null, .{ .id = 910 });
+    _ = try ls.local.compileAndRun("exactField.value='changed'", null);
+    try ctx.processMessage(.{ .id = 911, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedVisualGeneration = 1,
+        .expectedSceneRevision = 1,
+        .events = .{.{ .method = "insertText", .params = .{ .text = "blocked" } }},
+    } });
+    try ctx.expectSentError(-32042, "stale displayed native frame", .{ .id = 911 });
+    try testing.expect((try ls.local.compileAndRun("exactEdits===0 && exactField.value==='changed'", null)).isTrue());
+
+    const fresh = try guard.prepare(frame, .{ .owner = @intFromPtr(bc), .generation = 2 });
+    bc.native_captures[2] = .{ .generation = 2, .loader = frame._loader_id, .guard = fresh };
+    try ctx.processMessage(.{ .id = 912, .method = "Page.bindDisplayedFrame", .params = .{
+        .sceneRevision = 2,
+        .visualGeneration = 2,
+    } });
+    try ctx.expectSentResult(null, .{ .id = 912 });
+    for (3..14) |generation| _ = try guard.prepare(frame, .{ .owner = @intFromPtr(bc), .generation = generation });
+    try ctx.processMessage(.{ .id = 913, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedVisualGeneration = 2,
+        .expectedSceneRevision = 2,
+        .events = .{.{ .method = "insertText", .params = .{ .text = "!" } }},
+    } });
+    try ctx.expectSentResult(null, .{ .id = 913 });
+    try testing.expectEqual(0, bc.native_displayed_capture.generation);
+    try testing.expect((try ls.local.compileAndRun("exactEdits===1 && exactField.value.includes('!')", null)).isTrue());
+    try ctx.processMessage(.{ .id = 914, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedVisualGeneration = 2,
+        .expectedSceneRevision = 2,
+        .events = .{.{ .method = "insertText", .params = .{ .text = "replayed" } }},
+    } });
+    try ctx.expectSentError(-32042, "stale displayed native frame", .{ .id = 914 });
+    try testing.expect((try ls.local.compileAndRun("exactEdits===1", null)).isTrue());
 }
 
 test "cdp.input: insertText is a user edit for tooLong" {
@@ -784,6 +1238,39 @@ test "cdp.input: dispatchMouseEvent mouseWheel cancelability follows listener pa
     try testing.expect(result.isTrue());
 }
 
+// Wheel coordinates are viewport-relative. Prefer the visible leaf, but target
+// the container itself once scrolling has clipped that leaf out of its box.
+fn wheelPointInContainer(frame: *Frame, target_id: []const u8, scroller_id: []const u8) !struct { x: f64, y: f64 } {
+    const target = frame.document.getElementById(target_id).?;
+    const scroller = frame.document.getElementById(scroller_id).?;
+    const container = scroller.boundingClientRectValues(frame);
+    const viewport = frame.page.getViewport();
+    var left = @max(0, container.x);
+    var top = @max(0, container.y);
+    var right = @min(@as(f64, @floatFromInt(viewport.width)), container.x + container.width);
+    var bottom = @min(@as(f64, @floatFromInt(viewport.height)), container.y + container.height);
+    try testing.expect(right > left and bottom > top);
+    const leaf = target.boundingClientRectValues(frame);
+    const leaf_left = @max(left, leaf.x);
+    const leaf_top = @max(top, leaf.y);
+    const leaf_right = @min(right, leaf.x + leaf.width);
+    const leaf_bottom = @min(bottom, leaf.y + leaf.height);
+    if (leaf_right > leaf_left and leaf_bottom > leaf_top) {
+        left = leaf_left;
+        top = leaf_top;
+        right = leaf_right;
+        bottom = leaf_bottom;
+    }
+    const point = .{ .x = (left + right) / 2, .y = (top + bottom) / 2 };
+    var hit = try frame.document.hitTest(point.x, point.y, frame);
+    while (hit) |el| {
+        if (el == scroller) break;
+        hit = el.parentElement();
+    }
+    try testing.expect(hit != null);
+    return .{ .x = point.x, .y = point.y };
+}
+
 test "cdp.input: dispatchMouseEvent mouseWheel scrolls a scroll container, not the viewport" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -804,17 +1291,16 @@ test "cdp.input: dispatchMouseEvent mouseWheel scrolls a scroll container, not t
     try_catch.init(&ls.local);
     defer try_catch.deinit();
 
-    const rect_x = try (try ls.local.compileAndRun("document.getElementById('scrollbox').getBoundingClientRect().x", null)).toF64();
-    const rect_y = try (try ls.local.compileAndRun("document.getElementById('scrollbox').getBoundingClientRect().y", null)).toF64();
+    var point = try wheelPointInContainer(frame, "scrollbox", "scrollbox");
 
     try ctx.processMessage(.{
         .id = 1,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = rect_x, .y = rect_y, .deltaY = 40 },
+        .params = .{ .type = "mouseWheel", .x = point.x, .y = point.y, .deltaY = 40 },
     });
 
-    const box = try ls.local.compileAndRun("document.getElementById('scrollbox').scrollTop === 40 && window.scrollY === 0", null);
-    try testing.expect(box.isTrue());
+    try testing.expectEqual(@as(f64, 40), try (try ls.local.compileAndRun("document.getElementById('scrollbox').scrollTop", null)).toF64());
+    try testing.expectEqual(@as(f64, 0), try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
 
     // The scroll event is scheduled, not fired inline with the wheel.
     var runner = bc.session.runner(.{});
@@ -822,24 +1308,27 @@ test "cdp.input: dispatchMouseEvent mouseWheel scrolls a scroll container, not t
 
     // Per axis: x is not scrollable on the box, so it goes to the viewport.
     _ = try ls.local.compileAndRun("document.getElementById('scrollbox').style.overflow = 'hidden scroll'", null);
+    point = try wheelPointInContainer(frame, "scrollbox", "scrollbox");
     try ctx.processMessage(.{
         .id = 2,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = rect_x, .y = rect_y, .deltaX = 30, .deltaY = 10 },
+        .params = .{ .type = "mouseWheel", .x = point.x, .y = point.y, .deltaX = 30, .deltaY = 10 },
     });
-    const split = try ls.local.compileAndRun("document.getElementById('scrollbox').scrollTop === 50 && document.getElementById('scrollbox').scrollLeft === 0 && window.scrollX === 30 && window.scrollY === 0", null);
-    try testing.expect(split.isTrue());
+    try testing.expectEqual(@as(f64, 50), try (try ls.local.compileAndRun("document.getElementById('scrollbox').scrollTop", null)).toF64());
+    try testing.expectEqual(@as(f64, 0), try (try ls.local.compileAndRun("document.getElementById('scrollbox').scrollLeft", null)).toF64());
+    try testing.expectEqual(@as(f64, 30), try (try ls.local.compileAndRun("window.scrollX", null)).toF64());
+    try testing.expectEqual(@as(f64, 0), try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
 
     // The container may be declared in a stylesheet rather than inline.
-    const sheet_x = try (try ls.local.compileAndRun("document.getElementById('sheetleaf').getBoundingClientRect().x", null)).toF64();
-    const sheet_y = try (try ls.local.compileAndRun("document.getElementById('sheetleaf').getBoundingClientRect().y", null)).toF64();
+    point = try wheelPointInContainer(frame, "sheetleaf", "sheetscroll");
     try ctx.processMessage(.{
         .id = 3,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = sheet_x, .y = sheet_y, .deltaY = 40 },
+        .params = .{ .type = "mouseWheel", .x = point.x, .y = point.y, .deltaY = 40 },
     });
-    const sheet = try ls.local.compileAndRun("document.getElementById('sheetscroll').scrollTop === 40 && document.getElementById('sheetleaf').scrollTop === 0 && window.scrollY === 0", null);
-    try testing.expect(sheet.isTrue());
+    try testing.expectEqual(@as(f64, 40), try (try ls.local.compileAndRun("document.getElementById('sheetscroll').scrollTop", null)).toF64());
+    try testing.expectEqual(@as(f64, 0), try (try ls.local.compileAndRun("document.getElementById('sheetleaf').scrollTop", null)).toF64());
+    try testing.expectEqual(@as(f64, 0), try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
     try runner.waitForScript(frame._frame_id, "window.sheetScrolled === true", 1000);
 }
 
@@ -863,8 +1352,13 @@ test "cdp.input: dispatchMouseEvent mouseWheel chains once the container is satu
     try_catch.init(&ls.local);
     defer try_catch.deinit();
 
-    const leaf_x = try (try ls.local.compileAndRun("document.getElementById('innerleaf').getBoundingClientRect().x", null)).toF64();
-    const leaf_y = try (try ls.local.compileAndRun("document.getElementById('innerleaf').getBoundingClientRect().y", null)).toF64();
+    // Remove the paragraph's collapsing UA margin: this test deliberately has
+    // exactly 500px of content, not 516px including its default top margin.
+    _ = try ls.local.compileAndRun("document.getElementById('innerleaf').style.margin = '0'", null);
+    const scroller = frame.document.getElementById("outerscroll").?;
+    try testing.expectEqual(@as(f64, 100), scroller.getClientHeight(frame));
+    try testing.expectEqual(@as(f64, 500), scroller.getScrollHeight(frame));
+    var point = try wheelPointInContainer(frame, "innerleaf", "outerscroll");
 
     // #outerscroll is a 100px box over 500px of content. A wheel latches to one
     // scroller: the container takes the whole delta and keeps what doesn't fit,
@@ -872,41 +1366,44 @@ test "cdp.input: dispatchMouseEvent mouseWheel chains once the container is satu
     try ctx.processMessage(.{
         .id = 1,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = 1000 },
+        .params = .{ .type = "mouseWheel", .x = point.x, .y = point.y, .deltaY = 1000 },
     });
-    const latched = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 400 && window.scrollY === 0", null);
-    try testing.expect(latched.isTrue());
+    try testing.expectEqual(@as(f64, 400), try (try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop", null)).toF64());
+    try testing.expectEqual(@as(f64, 0), try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
 
     // Saturated now, so the next wheel latches to the viewport instead.
+    point = try wheelPointInContainer(frame, "innerleaf", "outerscroll");
     try ctx.processMessage(.{
         .id = 2,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = 100 },
+        .params = .{ .type = "mouseWheel", .x = point.x, .y = point.y, .deltaY = 100 },
     });
-    const chained = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 400 && window.scrollY === 100", null);
-    try testing.expect(chained.isTrue());
+    try testing.expectEqual(@as(f64, 400), try (try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop", null)).toF64());
+    try testing.expectEqual(@as(f64, 100), try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
 
     // overscroll-behavior keeps the latch on a container that can't move, so
     // nothing scrolls at all.
     _ = try ls.local.compileAndRun("document.getElementById('outerscroll').style.overscrollBehavior = 'contain'", null);
+    point = try wheelPointInContainer(frame, "innerleaf", "outerscroll");
     try ctx.processMessage(.{
         .id = 3,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = 100 },
+        .params = .{ .type = "mouseWheel", .x = point.x, .y = point.y, .deltaY = 100 },
     });
-    const contained = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 400 && window.scrollY === 100", null);
-    try testing.expect(contained.isTrue());
+    try testing.expectEqual(@as(f64, 400), try (try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop", null)).toF64());
+    try testing.expectEqual(@as(f64, 100), try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
 
     // Reversing direction latches back to the container, which can move again.
     // The 100 it can't give back stays unscrolled: no split here either.
     _ = try ls.local.compileAndRun("document.getElementById('outerscroll').style.overscrollBehavior = 'auto'", null);
+    point = try wheelPointInContainer(frame, "innerleaf", "outerscroll");
     try ctx.processMessage(.{
         .id = 4,
         .method = "Input.dispatchMouseEvent",
-        .params = .{ .type = "mouseWheel", .x = leaf_x, .y = leaf_y, .deltaY = -500 },
+        .params = .{ .type = "mouseWheel", .x = point.x, .y = point.y, .deltaY = -500 },
     });
-    const upward = try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop === 0 && window.scrollY === 100", null);
-    try testing.expect(upward.isTrue());
+    try testing.expectEqual(@as(f64, 0), try (try ls.local.compileAndRun("document.getElementById('outerscroll').scrollTop", null)).toF64());
+    try testing.expectEqual(@as(f64, 100), try (try ls.local.compileAndRun("window.scrollY", null)).toF64());
 }
 
 test "cdp.input: dispatchMouseEvent mouseWheel on page content scrolls the viewport" {
@@ -3830,4 +4327,128 @@ test "cdp.input: Unicode range replacement keeps input and textarea carets in UT
             \\ctl.tagName === 'INPUT' ? ctl.value === 'aéX中文z' : ctl.value === 'a\néX中文z'
         , null)).isTrue());
     }
+}
+
+test "cdp.input: element-bound text rejects focus drift and detached nodes" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .url = "mcp_actions.html" });
+    const frame = bc.mainFrame().?;
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun(
+        \\document.body.innerHTML='<input id="bound"><input id="other">';
+        \\globalThis.bound=document.getElementById('bound');globalThis.other=document.getElementById('other');bound.focus();
+    , null);
+    const inspector = try bc.inspectorSession(null);
+    const remote = (try inspector.getRemoteObject(&ls.local, "", frame.document.getElementById("bound").?.asNode())).?;
+    defer remote.deinit();
+    const object_id = (try remote.getObjectId(testing.allocator)).?;
+    defer testing.allocator.free(object_id);
+    const document_remote = (try inspector.getRemoteObject(&ls.local, "", frame.window._document.asNode())).?;
+    defer document_remote.deinit();
+    const document_id = (try document_remote.getObjectId(testing.allocator)).?;
+    defer testing.allocator.free(document_id);
+    try ctx.processMessage(.{ .id = 950, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedObjectId = object_id,
+        .expectedDocumentId = document_id,
+        .events = .{.{ .method = "insertText", .params = .{ .text = "safe" } }},
+    } });
+    try ctx.expectSentResult(null, .{ .id = 950 });
+    try testing.expect((try ls.local.compileAndRun("bound.value==='safe' && other.value===''", null)).isTrue());
+    _ = try ls.local.compileAndRun("other.focus()", null);
+    try ctx.processMessage(.{ .id = 951, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedObjectId = object_id,
+        .expectedDocumentId = document_id,
+        .events = .{.{ .method = "insertText", .params = .{ .text = "secret" } }},
+    } });
+    try ctx.expectSentError(-32042, "native input focus changed", .{ .id = 951 });
+    try testing.expect((try ls.local.compileAndRun("bound.value==='safe' && other.value===''", null)).isTrue());
+    _ = try ls.local.compileAndRun("bound.focus();bound.value='';bound.addEventListener('input',()=>other.focus(),{once:true})", null);
+    try ctx.processMessage(.{ .id = 952, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedObjectId = object_id,
+        .expectedDocumentId = document_id,
+        .events = .{
+            .{ .method = "insertText", .params = .{ .text = "a" } },
+            .{ .method = "insertText", .params = .{ .text = "secret" } },
+        },
+    } });
+    try ctx.expectSentError(-32042, "native input focus changed", .{ .id = 952 });
+    try testing.expect((try ls.local.compileAndRun("bound.value==='a' && other.value===''", null)).isTrue());
+    _ = try ls.local.compileAndRun("bound.focus()", null);
+    try ctx.processMessage(.{ .id = 956, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedObjectId = object_id,
+        .expectedDocumentId = document_id,
+        .events = .{
+            .{ .method = "dispatchKeyEvent", .params = .{ .type = "keyDown", .key = "Tab", .code = "Tab" } },
+            .{ .method = "dispatchKeyEvent", .params = .{ .type = "keyUp", .key = "Tab", .code = "Tab" } },
+        },
+    } });
+    try ctx.expectSentResult(null, .{ .id = 956 });
+    try testing.expect((try ls.local.compileAndRun("document.activeElement===other && bound.value==='a' && other.value===''", null)).isTrue());
+    _ = try ls.local.compileAndRun("bound.remove();other.focus()", null);
+    try ctx.processMessage(.{ .id = 953, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedObjectId = object_id,
+        .expectedDocumentId = document_id,
+        .events = .{.{ .method = "insertText", .params = .{ .text = "secret" } }},
+    } });
+    try ctx.expectSentError(-32042, "native input element detached", .{ .id = 953 });
+    try testing.expect((try ls.local.compileAndRun("other.value===''", null)).isTrue());
+    _ = try ls.local.compileAndRun(
+        \\const destination=document.createElement('iframe');document.body.append(destination);
+        \\destination.contentDocument.body.append(destination.contentDocument.adoptNode(bound));bound.focus();
+    , null);
+    try ctx.processMessage(.{ .id = 955, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedObjectId = object_id,
+        .expectedDocumentId = document_id,
+        .events = .{.{ .method = "insertText", .params = .{ .text = "secret" } }},
+    } });
+    try ctx.expectSentError(-32042, "native input document changed", .{ .id = 955 });
+    try testing.expect((try ls.local.compileAndRun("bound.value==='a' && other.value===''", null)).isTrue());
+}
+
+test "cdp.input: child navigation invalidates retained element input authority" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .url = "cdp/input_iframe.html" });
+    const main = bc.mainFrame().?;
+    const child = main.child_frames.items[0];
+    var object_id: []const u8 = undefined;
+    var document_id: []const u8 = undefined;
+    {
+        var ls: lp.js.Local.Scope = undefined;
+        child.js.localScope(&ls);
+        defer ls.deinit();
+        const inspector = try bc.inspectorSession(null);
+        const node = child.document.getElementById("text").?;
+        const remote = (try inspector.getRemoteObject(&ls.local, "", node.asNode())).?;
+        defer remote.deinit();
+        object_id = (try remote.getObjectId(testing.allocator)).?;
+        errdefer testing.allocator.free(object_id);
+        const document = (try inspector.getRemoteObject(&ls.local, "", child.window._document.asNode())).?;
+        defer document.deinit();
+        document_id = (try document.getObjectId(testing.allocator)).?;
+    }
+    defer testing.allocator.free(object_id);
+    defer testing.allocator.free(document_id);
+    {
+        var ls: lp.js.Local.Scope = undefined;
+        main.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.compileAndRun("document.querySelector('iframe').src='iframe/input_child.html?bound-navigation'", null);
+    }
+    _ = try bc.session.processQueuedNavigation();
+    const current = main.child_frames.items[0];
+    var ls: lp.js.Local.Scope = undefined;
+    current.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.compileAndRun("document.getElementById('text').value='untouched';document.getElementById('text').focus()", null);
+    try ctx.processMessage(.{ .id = 954, .method = "Input.dispatchNativeAction", .params = .{
+        .expectedObjectId = object_id,
+        .expectedDocumentId = document_id,
+        .events = .{.{ .method = "insertText", .params = .{ .text = "secret" } }},
+    } });
+    try ctx.expectSentError(-32042, "native input element expired", .{ .id = 954 });
+    try testing.expect((try ls.local.compileAndRun("document.getElementById('text').value==='untouched'", null)).isTrue());
 }

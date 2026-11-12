@@ -17,12 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Interactive numbered-choice picker for stdin/stderr prompts (provider
-//! selection, /save mode, …). Self-contained raw-terminal handling; runs
-//! before — or without — the isocline REPL.
+//! selection, /save mode, …). Runs before — or without — the isocline REPL.
 
 const std = @import("std");
 const lp = @import("lightpanda");
 const ansi = @import("ansi.zig");
+
+const TerminalMode = extern struct { storage: [32]u64 = @splat(0) };
+extern "c" fn mioa_terminal_stdin_raw_enter_v1(*TerminalMode) i32;
+extern "c" fn mioa_terminal_stdin_raw_restore_v1(*TerminalMode) i32;
 
 pub fn interactiveTty() bool {
     const stdin_tty = std.Io.File.stdin().isTty(lp.io) catch false;
@@ -99,45 +102,30 @@ const ChoiceState = struct {
 };
 
 const RawTerminal = struct {
-    original: std.posix.termios,
+    mode: TerminalMode,
 
-    fn enable() error{NotInteractive}!RawTerminal {
+    fn enable(self: *RawTerminal) error{NotInteractive}!void {
         if (!interactiveTty()) return error.NotInteractive;
-        // A tty that refuses raw mode is non-interactive for our purposes.
-        const original = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return error.NotInteractive;
-        var raw = original;
-        raw.iflag.BRKINT = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.INPCK = false;
-        raw.iflag.ISTRIP = false;
-        raw.iflag.IXON = false;
-        raw.oflag.OPOST = false;
-        raw.cflag.CSIZE = .CS8;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
-        raw.cc[@backingInt(std.c.V.MIN)] = 0;
-        raw.cc[@backingInt(std.c.V.TIME)] = 1;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw) catch return error.NotInteractive;
-        // Under `ansi.kitty_disambiguate` (pushed by `Terminal.readLine`),
-        // cursor keys arrive as CSI-u the byte reader can't parse; push the
-        // legacy encoding to force plain arrows. restore() pops back to
-        // whatever the REPL had pushed.
+        if (mioa_terminal_stdin_raw_enter_v1(&self.mode) != 0) return error.NotInteractive;
+        // Preserve the REPL's keyboard protocol while reading legacy arrows.
         _ = std.c.write(std.posix.STDOUT_FILENO, ansi.kitty_legacy.ptr, ansi.kitty_legacy.len);
-        return .{ .original = original };
     }
 
-    fn restore(self: *const RawTerminal) void {
+    fn restore(self: *RawTerminal) !void {
         _ = std.c.write(std.posix.STDOUT_FILENO, ansi.kitty_pop.ptr, ansi.kitty_pop.len);
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        if (mioa_terminal_stdin_raw_restore_v1(&self.mode) != 0) return error.TerminalRestoreFailed;
     }
 };
 
 fn promptInteractiveChoice(header: []const u8, items: []const [:0]const u8, default: ?usize) !usize {
-    var raw: RawTerminal = try .enable();
-    defer raw.restore();
+    var raw: RawTerminal = .{ .mode = .{} };
+    try raw.enable();
+    const result = promptInteractiveChoiceRaw(header, items, default);
+    try raw.restore();
+    return result;
+}
 
+fn promptInteractiveChoiceRaw(header: []const u8, items: []const [:0]const u8, default: ?usize) !usize {
     var state: ChoiceState = .init(default);
     const line_count = items.len + 2;
     var first_render = true;

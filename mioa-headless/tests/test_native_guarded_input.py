@@ -22,6 +22,17 @@ class GuardedInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["params"]["type"] for event in args[1]["events"]],
                          ["mouseMoved", "mousePressed", "mouseReleased"])
         self.assertTrue(all(event["method"] == "dispatchMouseEvent" for event in args[1]["events"]))
+
+    async def test_wheel_uses_supplied_viewport_point_in_guarded_native_turn(self):
+        page = self.page()
+        await page.guarded_input("mouse.wheel", {"x": 17, "y": 19, "delta_x": 3, "delta_y": -4}, "c" * 64)
+        page.context.cdp.send.assert_awaited_once()
+        params = page.context.cdp.send.await_args.args[1]
+        self.assertEqual(params["events"], [{
+            "method": "dispatchMouseEvent",
+            "params": {"type": "mouseWheel", "x": 17, "y": 19, "deltaX": 3, "deltaY": -4, "modifiers": 0},
+        }])
+        self.assertEqual((page.mouse.x, page.mouse.y), (17, 19))
         self.assertIsNone(page._native_input_batch)
 
     async def test_keyboard_events_cannot_dispatch_before_native_guard(self):

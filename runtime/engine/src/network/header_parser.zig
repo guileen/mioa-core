@@ -21,12 +21,11 @@ const std = @import("std");
 /// Block size of the CPU.
 const block_size = @sizeOf(usize);
 
-/// Whether a byte is allowed in a header key; controls (including space),
-/// the `:` delimiter and DEL are excluded.
-fn isHeaderKeyByte(byte: u8) bool {
+/// HTTP token bytes, shared by field names and methods (RFC 9110 §§5.1, 5.6.2).
+fn isTokenByte(byte: u8) bool {
     return switch (byte) {
-        0...' ', ':', 0x7f => false,
-        else => true,
+        '0'...'9', 'A'...'Z', 'a'...'z', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
     };
 }
 
@@ -65,22 +64,25 @@ fn matchHeaderKey(cursor: *Cursor) void {
         const Int = @Int(.unsigned, vec_size);
 
         while (cursor.hasLength(vec_size)) {
-            const spaces: Vec = @splat(' ');
-            const colons: Vec = @splat(':');
-            const deletes: Vec = @splat(0x7f);
             const chunk = cursor.asVector(vec_size);
-
-            // Per-lane `isHeaderKeyByte`: a lane is 1 when its byte is valid,
-            // above space (which also rules out the controls) and neither the
-            // `:` delimiter nor DEL. Inverting the mask makes invalid lanes
-            // 1s, so `@ctz` yields the index of the first invalid byte, or
-            // `vec_size` when the whole chunk is valid.
-            const mask = @intFromBool(chunk > spaces) & ~(@intFromBool(chunk == colons) | @intFromBool(chunk == deletes));
+            const case_bit: Vec = @splat(0x20);
+            const lower = chunk | case_bit;
+            const a: Vec = @splat('a');
+            const z: Vec = @splat('z');
+            const zero: Vec = @splat('0');
+            const nine: Vec = @splat('9');
+            const hyphen: Vec = @splat('-');
+            // Common field-name characters stay vectorized. Stop at other
+            // bytes and let the token scan below distinguish legal punctuation
+            // from delimiters and invalid bytes without rescanning this prefix.
+            const mask = (@intFromBool(lower >= a) & @intFromBool(lower <= z)) |
+                (@intFromBool(chunk >= zero) & @intFromBool(chunk <= nine)) |
+                @intFromBool(chunk == hyphen);
             const advance_by = @ctz(~@as(Int, @bitCast(mask)));
             // Advance.
             cursor.advance(advance_by);
             if (advance_by != vec_size) {
-                return;
+                break;
             }
         }
     }
@@ -88,9 +90,9 @@ fn matchHeaderKey(cursor: *Cursor) void {
     // NOTE: SWAR is not preferred here, this might change in the future
     // but honestly header keys are not so long.
 
-    // Fallback for len < `vec_size`.
+    // Scalar tail and uncommon token punctuation.
     while (cursor.end - cursor.idx > 0) : (cursor.advance(1)) {
-        if (isHeaderKeyByte(cursor.char()) == false) {
+        if (isTokenByte(cursor.char()) == false) {
             return;
         }
     }
@@ -292,7 +294,7 @@ pub const Method = union(enum) {
     custom: []const u8,
 };
 
-/// Parses an HTTP method, checks for shortest possible request length too.
+/// Parses a case-sensitive HTTP method token (RFC 9110 §§5.6.2, 9.1).
 fn parseMethod(cursor: *Cursor) !Method {
     // Though the shortest standardized HTTP method is GET, we can receive
     // a single character for method on non-standard ones.
@@ -375,9 +377,12 @@ fn parseMethod(cursor: *Cursor) !Method {
 
     // That 4 bytes we've consumed earlier might've a delimiter in them.
     cursor.rewind(4);
-    // Continue until first space appearance.
+    // Validate custom methods during the existing scan; standard methods
+    // above are known tokens and keep their fast path.
     const method_start = cursor.current();
-    while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {}
+    while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {
+        if (!isTokenByte(cursor.char())) return error.Invalid;
+    }
     if (cursor.reachedEnd()) {
         return error.Incomplete;
     }
@@ -396,10 +401,13 @@ pub const HttpVersion = enum(u1) { @"1.1", @"1.0" };
 pub fn parseRequest(bytes: []const u8) !struct { Method, []const u8, HttpVersion, Header.Iterator } {
     var cursor = Cursor{ .idx = bytes.ptr, .start = bytes.ptr, .end = bytes.ptr + bytes.len };
     const method = try parseMethod(&cursor);
-    // Parse path.
+    // Scan the target without decoding it. Controls cannot belong to a URI
+    // or hide a request-line boundary (RFC 9112 §3.2).
     const path_start = cursor.current();
-    // Find the first space.
-    while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {}
+    while (cursor.end - cursor.current() > 0 and cursor.char() != ' ') : (cursor.advance(1)) {
+        const byte = cursor.char();
+        if (byte < ' ' or byte == 0x7f) return error.Invalid;
+    }
     const path_end = cursor.current();
     // 0 length path.
     if (path_start == path_end) {
@@ -449,13 +457,10 @@ pub const Disposition = struct {
     filename: ?[]const u8 = null,
 };
 
-// Parses a part's Content-Disposition value: `form-data` followed by
-// `; key="value"` params. Values are quoted-strings whose CR/LF/" were
-// percent-escaped by the encoder (writeMultipartName), so the next raw '"'
-// always closes the value; a raw ';' inside quotes is legal and preserved.
-// Parameters that are not `key="quoted"` pairs — e.g. RFC 5987
-// `filename*=UTF-8''...`, which real servers emit — are skipped rather than
-// failing the whole parse, matching browser leniency.
+// Content-Disposition parameters accept MIME tokens or quoted-strings
+// (RFC 2183 §2 / RFC 2045 §5.1), with SP/HTAB around "=" (RFC 822 §3.4.2).
+// Quoted values preserve internal whitespace and semicolons; writeMultipartName
+// percent-escapes CR/LF/". Malformed parameters and unknown keys are ignored.
 pub fn parseDisposition(value: []const u8) !Disposition {
     // `Header.parse` already excludes the surrounding OWS from the value.
     var rest = value;
@@ -465,7 +470,7 @@ pub fn parseDisposition(value: []const u8) !Disposition {
     rest = rest["form-data".len..];
 
     var disposition = Disposition{};
-    while (true) {
+    parameters: while (true) {
         rest = std.mem.trimStart(u8, rest, " \t");
         if (rest.len == 0) {
             return disposition;
@@ -475,29 +480,35 @@ pub fn parseDisposition(value: []const u8) !Disposition {
         }
         rest = std.mem.trimStart(u8, rest[1..], " \t");
 
-        // An unquoted value cannot contain a `;`, so the next one (or the end
-        // of the header) bounds this parameter when it has to be skipped.
+        // Bound both searches to this parameter so missing "=" parameters
+        // do not repeatedly scan the remaining header.
         const semi = std.mem.findScalar(u8, rest, ';') orelse rest.len;
-        const eq = std.mem.findScalar(u8, rest, '=') orelse rest.len;
-        if (eq >= semi) {
-            // No `=` in this parameter; skip it.
+        const eq = std.mem.findScalar(u8, rest[0..semi], '=') orelse {
             rest = rest[semi..];
             continue;
-        }
-        const key = rest[0..eq];
-        const after_eq = rest[eq + 1 ..];
-
-        if (after_eq.len == 0 or after_eq[0] != '"') {
-            // Unquoted value; skip it.
-            rest = rest[semi..];
-            continue;
-        }
-        const end = std.mem.findScalarPos(u8, after_eq, 1, '"') orelse {
-            // Unterminated quoted value; ignore the rest of the header.
-            return disposition;
         };
-        const param_value = after_eq[1..end];
-        rest = after_eq[end + 1 ..];
+        const key = std.mem.trimEnd(u8, rest[0..eq], " \t");
+        const after_eq = std.mem.trimStart(u8, rest[eq + 1 ..], " \t");
+
+        const param_value = if (after_eq.len != 0 and after_eq[0] == '"') quoted: {
+            const end = std.mem.findScalarPos(u8, after_eq, 1, '"') orelse {
+                // Unterminated quoted value; ignore the rest of the header.
+                return disposition;
+            };
+            rest = after_eq[end + 1 ..];
+            break :quoted after_eq[1..end];
+        } else token: {
+            const bytes = std.mem.trim(u8, rest[eq + 1 .. semi], " \t");
+            rest = rest[semi..];
+            if (bytes.len == 0) continue;
+            for (bytes) |byte| {
+                switch (byte) {
+                    0...' ', 0x7f...0xff, '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=' => continue :parameters,
+                    else => {},
+                }
+            }
+            break :token bytes;
+        };
 
         if (std.ascii.eqlIgnoreCase(key, "name")) {
             disposition.name = param_value;
@@ -684,6 +695,36 @@ test "header_parser: parse HTTP header invalid" {
     }
 }
 
+test "header_parser: field names require HTTP token bytes" {
+    const token_bytes = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const suffix = ": v\r\nrest";
+    var bytes: [64]u8 = undefined;
+    for ([_]usize{ 1, 15, 16, 17, 31, 32, 33, 48 }) |len| {
+        for (0..len) |pos| {
+            for (0..256) |value| {
+                const byte: u8 = @intCast(value);
+                // A colon ends the field name rather than belonging to it.
+                if (byte == ':') continue;
+                @memset(bytes[0..len], 'a');
+                @memcpy(bytes[len..][0..suffix.len], suffix);
+                bytes[pos] = byte;
+                var cursor = initCursor(bytes[0 .. len + suffix.len]);
+                var header = Header{ .key = "unchanged", .value = "unchanged" };
+                if (std.mem.indexOfScalar(u8, token_bytes, byte) != null) {
+                    try header.parse(&cursor);
+                    try testing.expectString(bytes[0..len], header.key);
+                    try testing.expectString("v", header.value);
+                    try testing.expectString("rest", cursor.remaining());
+                } else {
+                    try testing.expectError(error.Invalid, header.parse(&cursor));
+                    try testing.expectString("unchanged", header.key);
+                    try testing.expectString("unchanged", header.value);
+                }
+            }
+        }
+    }
+}
+
 test "header_parser: header iterator" {
     // Headers iterate until the terminating blank line; afterwards the
     // iterator stays exhausted and the cursor is left at the body.
@@ -746,15 +787,11 @@ test "header_parser: parse Content-Disposition" {
     d = try parseDisposition("form-data; foo=\"bar\"; name=\"a;b\"");
     try testing.expectString("a;b", d.name.?);
 
-    // Parameters without `=` or with an unquoted value — e.g. RFC 5987
-    // `filename*` — are skipped without failing the parse; later well-formed
-    // parameters still apply.
+    // Unknown parameters — including RFC 5987 filename* — are ignored;
+    // later recognized parameters still apply.
     d = try parseDisposition("form-data; filename*=UTF-8''file%20name.jpg; name=\"n\"");
     try testing.expectString("n", d.name.?);
     try testing.expectEqual(null, d.filename);
-    d = try parseDisposition("form-data; foo; name=bare; filename=\"f.txt\"");
-    try testing.expectEqual(null, d.name);
-    try testing.expectString("f.txt", d.filename.?);
 
     // An unterminated quoted value ends the parse, keeping what was found.
     d = try parseDisposition("form-data; name=\"a\"; filename=\"f");
@@ -765,6 +802,75 @@ test "header_parser: parse Content-Disposition" {
     // rejected.
     try testing.expectError(error.InvalidFormData, parseDisposition("attachment; name=\"a\""));
     try testing.expectError(error.InvalidFormData, parseDisposition("form-data name=\"a\""));
+}
+
+test "header_parser: token Content-Disposition parameters" {
+    const disposition = try parseDisposition("form-data; name=field; filename=report.txt");
+    try testing.expect(disposition.name != null and disposition.filename != null);
+    try testing.expectString("field", disposition.name.?);
+    try testing.expectString("report.txt", disposition.filename.?);
+
+    const punctuation = try parseDisposition("form-data; name=field-1_2.3%22; filename=\"a;b.txt\"");
+    try testing.expect(punctuation.name != null and punctuation.filename != null);
+    try testing.expectString("field-1_2.3%22", punctuation.name.?);
+    try testing.expectString("a;b.txt", punctuation.filename.?);
+
+    const invalid = [_][]const u8{ "", "two words", "a/b", "a=b", "a\x01b", "\xff" };
+    for (invalid) |value| {
+        var buffer: [128]u8 = undefined;
+        const header = try std.fmt.bufPrint(&buffer, "form-data; name={s}; filename=valid.txt", .{value});
+        const parsed = try parseDisposition(header);
+        try testing.expect(parsed.filename != null);
+        try testing.expectEqual(null, parsed.name);
+        try testing.expectString("valid.txt", parsed.filename.?);
+    }
+}
+
+test "header_parser: disposition parameter whitespace" {
+    const cases = [_]struct { header: []const u8, name: []const u8, filename: []const u8 }{
+        .{
+            .header = "Content-Disposition: form-data; name = field; filename= report.txt\r\n",
+            .name = "field",
+            .filename = "report.txt",
+        },
+        .{
+            .header = "Content-Disposition: Form-Data; name\t=\t\" field \"; filename \t= \t\"a;b.txt\"\r\n",
+            .name = " field ",
+            .filename = "a;b.txt",
+        },
+    };
+    for (cases) |case| {
+        var cursor = initCursor(case.header);
+        var header: Header = undefined;
+        try header.parse(&cursor);
+        const parsed = try parseDisposition(header.value);
+        try testing.expect(parsed.name != null and parsed.filename != null);
+        try testing.expectString(case.name, parsed.name.?);
+        try testing.expectString(case.filename, parsed.filename.?);
+    }
+
+    for ([_][]const u8{
+        "form-data; name = \t; filename = ok.txt",
+        "form-data; na me = field; filename = ok.txt",
+    }) |value| {
+        const parsed = try parseDisposition(value);
+        try testing.expectEqual(null, parsed.name);
+        try testing.expect(parsed.filename != null);
+        try testing.expectString("ok.txt", parsed.filename.?);
+    }
+}
+
+test "header_parser: skip disposition parameters without equals" {
+    const cases = [_][]const u8{
+        "form-data; broken; name=field; filename=ok.txt",
+        "form-data; ; \t ; broken; name=\"field\"; filename=\"ok.txt\"; trailing",
+    };
+    for (cases) |value| {
+        const parsed = try parseDisposition(value);
+        try testing.expect(parsed.name != null and parsed.filename != null);
+        try testing.expectString("field", parsed.name.?);
+        try testing.expectString("ok.txt", parsed.filename.?);
+    }
 }
 
 test "header_parser: cursor" {
@@ -809,7 +915,7 @@ test "header_parser: parse request" {
     const req = try parseRequest("GET /   HTTP/1.1\r\n\r\n");
     try testing.expectString("/", req[1]);
 
-    // Longer paths are accepted (but not validated).
+    // Longer paths and query strings are preserved without URI decoding.
     const req2 = try parseRequest("GET /chat/room?id=1 HTTP/1.1\r\n\r\n");
     try testing.expectString("/chat/room?id=1", req2[1]);
 }
@@ -845,6 +951,67 @@ test "header_parser: parse request methods" {
     }
 }
 
+test "header_parser: custom methods require HTTP token bytes" {
+    const token_bytes = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    var request = "POSTER / HTTP/1.1\r\nHost: example\r\n\r\n".*;
+    for (0.."POSTER".len) |pos| {
+        const original = request[pos];
+        for (0..256) |value| {
+            const byte: u8 = @intCast(value);
+            request[pos] = byte;
+            if (std.mem.indexOfScalar(u8, token_bytes, byte) != null) {
+                const method, const path, const version, var headers = try parseRequest(&request);
+                try testing.expectString(request[0.."POSTER".len], method.custom);
+                try testing.expectString("/", path);
+                try testing.expectEqual(.@"1.1", version);
+                const header = (try headers.next()).?;
+                try testing.expectString("Host", header.key);
+                try testing.expectString("example", header.value);
+                try testing.expectEqual(null, try headers.next());
+            } else {
+                try testing.expectError(error.Invalid, parseRequest(&request));
+            }
+        }
+        request[pos] = original;
+    }
+}
+
+test "header_parser: request targets reject controls without decoding escapes" {
+    const target = "/json/version";
+    var request = ("GET " ++ target ++ " HTTP/1.1\r\n\r\n").*;
+    for (0..target.len) |pos| {
+        const offset = "GET ".len + pos;
+        const original = request[offset];
+        for (0..33) |value| {
+            request[offset] = if (value == 32) 0x7f else @intCast(value);
+            try testing.expectError(error.Invalid, parseRequest(&request));
+        }
+        request[offset] = original;
+    }
+
+    // Preserve encoded octets and each target form; URI interpretation belongs
+    // to the consumer, not this allocation-free request-line boundary.
+    const cases = [_]struct { method: []const u8, target: []const u8, tag: std.meta.Tag(Method) }{
+        .{ .method = "GET", .target = "/path?x=%00%09%0A%7F", .tag = .get },
+        .{ .method = "GET", .target = "http://example.test/path?q=1", .tag = .get },
+        .{ .method = "CONNECT", .target = "example.test:443", .tag = .connect },
+        .{ .method = "OPTIONS", .target = "*", .tag = .options },
+    };
+    for (cases) |case| {
+        var buffer: [128]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&buffer, "{s} {s} HTTP/1.1\r\nHost: example\r\n\r\nbody", .{ case.method, case.target });
+        const method, const path, const version, var headers = try parseRequest(bytes);
+        try testing.expectEqual(case.tag, std.meta.activeTag(method));
+        try testing.expectString(case.target, path);
+        try testing.expectEqual(.@"1.1", version);
+        const header = (try headers.next()).?;
+        try testing.expectString("Host", header.key);
+        try testing.expectString("example", header.value);
+        try testing.expectEqual(null, try headers.next());
+        try testing.expectString("body", headers.cursor.remaining());
+    }
+}
+
 test "header_parser: parse request invalid" {
     const invalid_cases = [_][]const u8{
         " / HTTP/1.1\r\n\r\n", // 0 length method
@@ -863,15 +1030,20 @@ test "header_parser: parse request invalid" {
     // `DELETE` exercises the multi-byte peek continuation and the path is
     // longer than the minimum request length, proving neither scan can run
     // past the end of a truncated buffer.
-    const bytes = "DELETE /websocket/endpoint HTTP/1.1\r\n";
-    for (0..bytes.len) |len| {
-        try testing.expectError(error.Incomplete, parseRequest(bytes[0..len]));
+    const requests = [_][]const u8{
+        "DELETE /websocket/endpoint HTTP/1.1\r\n",
+        "POSTER /websocket/endpoint HTTP/1.1\r\n",
+    };
+    for (requests) |bytes| {
+        for (0..bytes.len) |len| {
+            try testing.expectError(error.Incomplete, parseRequest(bytes[0..len]));
+        }
     }
 }
 
 fn expectMatchesReference(bytes: []const u8) !void {
     var key_expected: usize = 0;
-    while (key_expected < bytes.len and isHeaderKeyByte(bytes[key_expected])) key_expected += 1;
+    while (key_expected < bytes.len and isTokenByte(bytes[key_expected])) key_expected += 1;
     var value_expected: usize = 0;
     while (value_expected < bytes.len and isHeaderValueByte(bytes[value_expected])) value_expected += 1;
 

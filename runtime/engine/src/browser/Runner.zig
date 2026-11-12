@@ -173,7 +173,7 @@ fn _wait(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
                 if (elapsed >= timeout_ms) {
                     return .timeout;
                 }
-                _ = try self.http_client.tick(@min(timeout_ms - elapsed, 200));
+                _ = try self.tickNetwork(@min(timeout_ms - elapsed, 200));
                 break :done_blk 0;
             },
         };
@@ -351,7 +351,7 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
         };
         const ms_to_wait = @min(timeout_ms, ms_to_next_task);
 
-        const waited = try http_client.tick(@intCast(ms_to_wait));
+        const waited = try self.tickNetwork(@intCast(ms_to_wait));
 
         // If the HttpClient didn't wait/poll then it has nothing to do, and we
         // should tell our callerto wait until the next task is ready.
@@ -364,11 +364,91 @@ fn _tick(self: *Runner, comptime is_cdp: bool, timeout_ms: u32, conditions: []Wa
     // WebSocket often remain open forever. We can't wait for them to "complete".
     // But, if we have web socket connections, we still want to make progress on
     // them, so we tick with no delay.
-    if (activity.ws_conns > 0 or activity.ws_events > 0) {
-        _ = try http_client.tick(0);
+    if (activity.ws_conns > 0 or activity.ws_events > 0 or profileEventFd(browser) != null or profileAsyncPollFd(browser) != null) {
+        _ = try self.tickNetwork(0);
+        // A profile event may have queued a JS task after the earlier idle
+        // check. Run it before an outer idle loop goes back to sleep.
+        if (has_runnable_page and browser.hasMacrotasks()) return .{ .ok = 0 };
     }
 
     return .done;
+}
+
+pub fn profileEventFd(browser: *Browser) ?std.posix.fd_t {
+    const session = if (browser.session) |*s| s else return null;
+    const client = if (session.profile_client) |*c| c else return null;
+    if (!client.cookie_event_watcher_ready or client.failed or client.event_fd < 0) return null;
+    return client.event_fd;
+}
+
+pub fn profileAsyncPollFd(browser: *Browser) ?std.posix.pollfd {
+    const session = if (browser.session) |*s| s else return null;
+    const client = if (session.profile_async_client) |*c| c else return null;
+    if (!client.hasPending()) return null;
+    return .{
+        .fd = client.fd,
+        .events = std.posix.POLL.IN | (if (client.wantsWrite()) @as(i16, std.posix.POLL.OUT) else 0),
+        .revents = 0,
+    };
+}
+
+// Wait on the event stream and any outstanding asynchronous Profile request
+// alongside curl and CDP; callbacks run only after curl leaves its wait.
+pub fn tickNetwork(self: *Runner, timeout_ms: u32) !bool {
+    const browser = self.browser;
+    const fd = profileEventFd(browser);
+    const async_fd = profileAsyncPollFd(browser);
+    var fds: [2]@import("../sys/libcurl.zig").CurlWaitFd = undefined;
+    var count: usize = 0;
+    if (fd) |event_fd| {
+        fds[count] = .{ .fd = event_fd, .events = .{ .pollin = true }, .revents = .{} };
+        count += 1;
+    }
+    var wait_ms = timeout_ms;
+    if (async_fd) |poll_fd| {
+        fds[count] = .{ .fd = poll_fd.fd, .events = .{ .pollin = true, .pollout = poll_fd.events & std.posix.POLL.OUT != 0 }, .revents = .{} };
+        count += 1;
+        if (browser.session) |*session| {
+            if (session.profile_async_client) |*client| {
+                if (client.timeoutMillis()) |remaining| wait_ms = @min(wait_ms, remaining);
+            }
+        }
+    }
+    const waited = if (count == 0)
+        try self.http_client.tick(wait_ms)
+    else
+        try self.http_client.tickWithExternalFds(wait_ms, fds[0..count]);
+    if (profileEventFd(browser)) |live_fd| {
+        if (fd != null and live_fd == fd.?) {
+            if (browser.session) |*session| {
+                @import("webapi/storage/CookieStore.zig").consumeProfileEvents(session) catch |err| {
+                    if (session.profile_client) |*client| {
+                        client.failed = true;
+                        client.cookie_event_watcher_ready = false;
+                    }
+                    session.idb.failAll(error.ProfileServiceLost);
+                    log.err(.browser, "profile event stream", .{ .err = err });
+                };
+            }
+        }
+    }
+    if (async_fd) |old_fd| {
+        // curl's waitfd flags do not expose HUP/ERR. Probe the same descriptor
+        // without waiting so disconnects and ready I/O are both distinguished
+        // from a wake caused by unrelated curl or CDP work.
+        var ready = [_]std.posix.pollfd{old_fd};
+        _ = std.posix.poll(&ready, 0) catch 0;
+        if (browser.session) |*session| {
+            if (session.profile_async_client) |*client| {
+                if (client.fd == old_fd.fd) {
+                    if (ready[0].revents & std.posix.POLL.OUT != 0) client.onWritable();
+                    if (ready[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) client.onReadable();
+                    client.onTimeout();
+                }
+            }
+        }
+    }
+    return waited;
 }
 
 pub fn waitForSelector(self: *Runner, frame_id: u32, input: [:0]const u8, timeout_ms: u32) !*Node.Element {
@@ -402,7 +482,14 @@ pub fn waitForSelector(self: *Runner, frame_id: u32, input: [:0]const u8, timeou
         }
         switch (try self.tickForFrame(frame_id, timeout_ms - elapsed, .{ .until = .done })) {
             // Idle: poll so `timeout_ms` means "wait up to N ms", not "fail now".
-            .done => lp.io.sleep(.fromMilliseconds(@intCast(@min(timeout_ms - elapsed, 50))), .awake) catch {},
+            .done => {
+                const delay = @min(timeout_ms - elapsed, 50);
+                if (profileEventFd(self.browser) != null or profileAsyncPollFd(self.browser) != null) {
+                    _ = try self.tickNetwork(delay);
+                } else {
+                    lp.io.sleep(.fromMilliseconds(@intCast(delay)), .awake) catch {};
+                }
+            },
             .ok => |recommended_sleep_ms| {
                 if (recommended_sleep_ms > 0) {
                     lp.io.sleep(.fromMilliseconds(@intCast(recommended_sleep_ms)), .awake) catch {};
@@ -479,7 +566,14 @@ pub fn waitForScript(self: *Runner, frame_id: u32, src: [:0]const u8, timeout_ms
         }
         switch (try self.tickForFrame(frame_id, timeout_ms - elapsed, .{ .until = .done })) {
             // Idle: poll so `timeout_ms` means "wait up to N ms", not "fail now".
-            .done => lp.io.sleep(.fromMilliseconds(@intCast(@min(timeout_ms - elapsed, 50))), .awake) catch {},
+            .done => {
+                const delay = @min(timeout_ms - elapsed, 50);
+                if (profileEventFd(self.browser) != null or profileAsyncPollFd(self.browser) != null) {
+                    _ = try self.tickNetwork(delay);
+                } else {
+                    lp.io.sleep(.fromMilliseconds(@intCast(delay)), .awake) catch {};
+                }
+            },
             .ok => |recommended_sleep_ms| {
                 if (recommended_sleep_ms > 0) {
                     lp.io.sleep(.fromMilliseconds(@intCast(recommended_sleep_ms)), .awake) catch {};

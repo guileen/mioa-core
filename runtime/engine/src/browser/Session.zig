@@ -23,6 +23,8 @@ const App = @import("../App.zig");
 const Config = @import("../Config.zig");
 
 const storage = @import("webapi/storage/storage.zig");
+const ProfileIpc = @import("webapi/storage/ProfileIpc.zig");
+const ProfileAsync = @import("webapi/storage/ProfileAsync.zig");
 const IdbManager = @import("webapi/storage/idb/idb.zig").Manager;
 const CacheStore = @import("webapi/cache/Store.zig");
 const Factory = @import("Factory.zig");
@@ -41,6 +43,9 @@ const ServiceWorkerGlobalScope = @import("webapi/ServiceWorkerGlobalScope.zig");
 
 const log = lp.log;
 const ArenaPool = App.ArenaPool;
+// A connected capability is single-Session; sharing its request counter with
+// another independent Session would make reply attribution ambiguous.
+var profile_session_claimed: std.atomic.Value(bool) = .init(false);
 
 // A Session represents a browsing context group (cookie jar, session storage,
 // navigation history) within a Browser. It owns a set of live Pages — each a
@@ -56,6 +61,8 @@ arena: *lp.Arena,
 // frame id, and so the history. Removed by closePage.
 navigations: std.AutoHashMapUnmanaged(u32, *Navigation) = .empty,
 storage_shed: storage.Shed,
+profile_client: ?ProfileIpc.Client = null,
+profile_async_client: ?ProfileAsync.Client = null,
 // In-memory sessionStorage, one origin namespace per live top-level frame id.
 // Like navigation history, this outlives replacement Pages, not the tab.
 session_storage: std.AutoHashMapUnmanaged(u32, storage.SessionNamespace) = .empty,
@@ -160,6 +167,12 @@ const max_console_bytes = 64 * 1024;
 
 /// App/serve must call this before ready/getInfo when no Session exists yet.
 pub fn preflightStorage(allocator: std.mem.Allocator, path: []const u8) !void {
+    // The lease-owning service performs Profile storage admission in this
+    // experimental mode. It is not valid to open a second writable cookie jar.
+    var profile_service_fd_present: c_int = 0;
+    const status = Config.EnvironmentApi.mioa_environment_has_v1("MIOA_PROFILE_SERVICE_FD", &profile_service_fd_present);
+    if (status != Config.EnvironmentApi.MIOA_ENVIRONMENT_OK) return error.InvalidEnvironment;
+    if (profile_service_fd_present != 0) return;
     try @import("webapi/storage/Persistence.zig").preflight(allocator, path);
     var jar = storage.Cookie.Jar.init(allocator, null);
     defer jar.deinit();
@@ -190,15 +203,74 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
     errdefer self.cookie_jar.deinit();
     errdefer self.storage_shed.deinit(allocator);
     errdefer self.idb.deinit();
-    self.idb.path = browser.app.config.storagePath();
-    self.storage_shed.path = browser.app.config.storagePath();
-    if (browser.app.config.storagePath()) |path| {
-        try @import("webapi/storage/Persistence.zig").preflight(allocator, path);
-        try @import("../cookies.zig").restoreProfile(&self.cookie_jar, path);
+    if (std.c.getenv("MIOA_PROFILE_SERVICE_FD")) |fd_text| {
+        if (browser.app.config.cookieFile() != null or browser.app.config.cookieJarFile() != null)
+            return error.InvalidProfileOwner;
+        if (profile_session_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+            return error.QualificationRequired;
+        errdefer profile_session_claimed.store(false, .release);
+        const fd = std.fmt.parseInt(std.posix.fd_t, std.mem.span(fd_text), 10) catch return error.invalid_config;
+        if (fd <= 2) return error.invalid_config;
+        const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 1, .usec = 0 });
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout);
+        self.profile_client = ProfileIpc.Client.init(fd);
+        errdefer if (self.profile_client) |*client| client.deinit();
+        const client = &self.profile_client.?;
+        if (std.c.getenv("MIOA_PROFILE_EVENTS_FD")) |event_text| {
+            const event_fd = std.fmt.parseInt(std.posix.fd_t, std.mem.span(event_text), 10) catch return error.invalid_config;
+            if (event_fd <= 2 or event_fd == fd) return error.invalid_config;
+            client.event_fd = event_fd;
+            const sys_net = @import("../sys/net.zig");
+            const flags = try sys_net.fcntl(event_fd, std.posix.F.GETFL, 0);
+            _ = try sys_net.fcntl(event_fd, std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+        }
+        const response = try client.request(allocator, "session.ping", struct {}{});
+        response.deinit();
+        if (client.event_fd >= 0) {
+            // The shared stream also carries IndexedDB gate notifications, so
+            // subscribe before any page can issue a Profile operation.
+            const subscription = try client.request(allocator, "events.subscribe", struct {}{});
+            defer subscription.deinit();
+            const result = subscription.value.object.get("result") orelse return error.ProfileProtocolError;
+            const cursor = std.json.parseFromValue(struct { next_sequence: u64 }, allocator, result, .{}) catch return error.ProfileProtocolError;
+            defer cursor.deinit();
+            client.cookie_events_next_sequence = cursor.value.next_sequence;
+            client.cookie_events_subscribed = true;
+            client.cookie_event_watcher_ready = true;
+        }
+        if (std.c.getenv("MIOA_PROFILE_IDB_FD")) |idb_text| {
+            const idb_fd = std.fmt.parseInt(std.posix.fd_t, std.mem.span(idb_text), 10) catch return error.invalid_config;
+            if (idb_fd <= 2 or idb_fd == fd or idb_fd == client.event_fd) return error.invalid_config;
+            const async_allocator = @import("webapi/storage/RuntimeMemory.zig").allocator(allocator) catch |err| {
+                _ = std.c.close(idb_fd);
+                return err;
+            };
+            self.profile_async_client = ProfileAsync.Client.init(idb_fd, async_allocator);
+            errdefer if (self.profile_async_client) |*async_client| async_client.deinit();
+            const sys_net = @import("../sys/net.zig");
+            const flags = try sys_net.fcntl(idb_fd, std.posix.F.GETFL, 0);
+            _ = try sys_net.fcntl(idb_fd, std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+            self.idb.profile_async = &self.profile_async_client.?;
+        }
+        self.storage_shed.profile_client = client;
+        self.cookie_jar.profile_client = client;
+        self.idb.profile_client = client;
+    } else {
+        self.idb.path = browser.app.config.storagePath();
+        self.storage_shed.path = browser.app.config.storagePath();
+        if (browser.app.config.storagePath()) |path| {
+            try @import("webapi/storage/Persistence.zig").preflight(allocator, path);
+            try @import("../cookies.zig").restoreProfile(&self.cookie_jar, path);
+        }
     }
 }
 
 pub fn deinit(self: *Session) void {
+    if (self.profile_client) |*client| client.cookie_event_watcher_ready = false;
+    // Fail pending async callbacks while their page and execution contexts
+    // still exist; closing pages first would leave callback contexts dangling.
+    if (self.profile_async_client != null) self.idb.failAll(error.ProfileServiceLost);
     if (self._console_capture) {
         self.notification.unregister(.console_message, self);
     }
@@ -236,7 +308,12 @@ pub fn deinit(self: *Session) void {
     }
     self.session_storage.deinit(self.browser.app.allocator);
     self.idb.deinit();
+    if (self.profile_async_client) |*client| client.deinit();
     self.cache_store.deinit();
+    if (self.profile_client) |*client| {
+        client.deinit();
+        profile_session_claimed.store(false, .release);
+    }
     {
         const allocator = self.browser.app.allocator;
         var it = self.bridge_store.iterator();
@@ -408,13 +485,20 @@ fn installNewActivePage(self: *Session, frame_id: u32) !*Frame {
 pub fn createPage(self: *Session) !PageHandle {
     // Drain any pending Page deinits now, while we're at a known-safe point
     self.processDestroyQueues();
+    return self.createPageContext();
+}
 
-    if (comptime lp.IS_DEBUG) {
-        log.debug(.browser, "create page", .{});
-    }
+// Called from executing page JS: destruction must wait until that stack unwinds.
+pub fn createAuxiliaryPage(self: *Session) !PageHandle {
+    const handle = try self.createPageContext();
+    self.navigationFor(handle.frame().?)._script_closable = true;
+    return handle;
+}
 
+fn createPageContext(self: *Session) !PageHandle {
     const frame_id = self.nextFrameId();
     const frame = try self.installNewActivePage(frame_id);
+    errdefer self.closePage(frame_id);
 
     frame.document._ready_state = .complete;
     try self.createNavigation(frame);
@@ -434,6 +518,7 @@ pub fn closePage(self: *Session, frame_id: u32) void {
         self.discardPendingPage(pending);
     }
     self.tearDownPage(live);
+    self.notification.dispatch(.page_closed, frame_id);
 }
 
 // Creates the session history of `frame`, a new top-level browsing context:
@@ -458,7 +543,7 @@ pub fn createNavigation(self: *Session, frame: *Frame) !void {
 // Page teardown calls this only when no replacement uses the same frame id.
 // The Navigation's memory lives in the session arena.
 pub fn removeNavigation(self: *Session, frame_id: u32) void {
-    _ = self.navigations.remove(frame_id);
+    if (self.navigations.fetchRemove(frame_id)) |entry| entry.value.clearFormSnapshots();
     if (self.session_storage.fetchRemove(frame_id)) |entry| {
         var namespace = entry.value;
         namespace.deinit(self.browser.app.allocator);
@@ -510,6 +595,8 @@ pub fn closeAllPages(self: *Session) void {
         self.queuePageDestruction(page);
     }
     self.pages.clearRetainingCapacity();
+    var navigation_it = self.navigations.valueIterator();
+    while (navigation_it.next()) |navigation| navigation.*.clearFormSnapshots();
     self.navigations.clearRetainingCapacity();
     self.processDestroyQueues();
 }
@@ -645,6 +732,10 @@ pub fn idleSlice(self: *Session) u31 {
     self.processDestroyQueues();
 
     if (self.pages.items.len == 0) {
+        if (Runner.profileEventFd(self.browser) != null or Runner.profileAsyncPollFd(self.browser) != null) {
+            var r = self.runner(.{});
+            _ = r.tickNetwork(0) catch {};
+        }
         // no page, we don't want the watchdog to kill us.
         self.browser.http_client.heartbeat.disarm();
         return quiet_ms;
@@ -712,6 +803,12 @@ pub fn processQueuedNavigation(self: *Session) !bool {
         i += 1;
         if (i == pages.len) {
             i = 0;
+        }
+
+        if (self.navigationFor(&page.frame)._close_requested) {
+            self._nav_cursor = i;
+            self.closePage(page.frame._frame_id);
+            return true;
         }
 
         if (page.queued_navigation.items.len != 0) {
@@ -958,6 +1055,7 @@ fn processRootQueuedNavigation(self: *Session, page: *Page) !void {
 // (initiateRootNavigation); each caller owns any arena tied to `url`/`opts`.
 fn replaceRootImmediate(self: *Session, frame_id: u32, url: [:0]const u8, opts: Frame.NavigateOpts) !void {
     if (self.livePage(frame_id)) |page| {
+        self.navigationFor(&page.frame).snapshotCurrentForm(&page.frame);
         self.tearDownPage(page);
     } else if (comptime lp.IS_DEBUG) {
         lp.assert(false, "Session.replaceRootImmediate - no live page", .{});
@@ -1063,6 +1161,7 @@ pub fn commitPendingPage(self: *Session, replacement: *Page) !void {
     if (comptime lp.IS_DEBUG) {
         log.debug(.browser, "commit pending page", .{});
     }
+    self.navigationFor(&old.frame).snapshotCurrentForm(&old.frame);
 
     // Step 1: clear the OLD page's CDP / V8 inspector state while it is still
     // walkable (node_registry, inspector context group, isolated worlds). OLD

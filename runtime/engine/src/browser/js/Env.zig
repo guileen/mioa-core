@@ -159,8 +159,11 @@ pub fn init(app: *App, opts: InitOpts) !Env {
     v8.v8__Isolate__CreateParams__CONSTRUCT(params);
     params.snapshot_blob = @ptrCast(&snapshot.startup_data);
 
-    params.array_buffer_allocator = v8.v8__ArrayBuffer__Allocator__NewDefaultAllocator(js.ArrayBuffer.MAX_LENGTH).?;
-    errdefer v8.v8__ArrayBuffer__Allocator__DELETE(params.array_buffer_allocator.?);
+    params.array_buffer_allocator = if (lp.RuntimeMemory.isManaged() and @import("build_config").accounted_clone)
+        lp_runtime_v8_buffers(js.ArrayBuffer.MAX_LENGTH) orelse return error.OutOfMemory
+    else
+        v8.v8__ArrayBuffer__Allocator__NewDefaultAllocator(js.ArrayBuffer.MAX_LENGTH).?;
+    errdefer deleteBufferAllocator(params.array_buffer_allocator.?);
 
     params.external_references = snapshot.external_references;
 
@@ -171,6 +174,9 @@ pub fn init(app: *App, opts: InitOpts) !Env {
             @as(usize, mb) * 1024 * 1024,
         );
     }
+
+    if (lp.RuntimeMemory.isManaged() and @import("build_config").accounted_clone)
+        lp_runtime_v8_configure_code_range(params);
 
     var isolate = js.Isolate.init(params);
     errdefer isolate.deinit();
@@ -275,7 +281,7 @@ pub fn deinit(self: *Env) void {
     v8.v8__Platform__NotifyIsolateShutdown(self.platform.handle, self.isolate.handle);
     self.isolate.exit();
     self.isolate.deinit();
-    v8.v8__ArrayBuffer__Allocator__DELETE(self.isolate_params.array_buffer_allocator.?);
+    deleteBufferAllocator(self.isolate_params.array_buffer_allocator.?);
     allocator.destroy(self.isolate_params);
 }
 
@@ -479,6 +485,8 @@ pub fn destroyContext(self: *Env, context: *Context) void {
 }
 
 pub fn runMicrotasks(self: *Env) void {
+    @import("../TaskGate.zig").enterOrExit();
+    defer @import("../TaskGate.zig").exit();
     // Checkpoints only happen at en empty JS stack.
     for (self.contexts.items) |ctx| {
         if (ctx.call_depth > 0) {
@@ -649,6 +657,8 @@ pub fn msToNextTask(self: *Env) ?u64 {
 }
 
 pub fn pumpMessageLoop(self: *const Env) void {
+    @import("../TaskGate.zig").enterOrExit();
+    defer @import("../TaskGate.zig").exit();
     var hs: v8.HandleScope = undefined;
     v8.v8__HandleScope__CONSTRUCT(&hs, self.isolate.handle);
     defer v8.v8__HandleScope__DESTRUCT(&hs);
@@ -680,6 +690,8 @@ pub fn waitForBackgroundTasks(self: *Env) void {
 }
 
 pub fn runIdleTasks(self: *const Env) void {
+    @import("../TaskGate.zig").enterOrExit();
+    defer @import("../TaskGate.zig").exit();
     v8.v8__Platform__RunIdleTasks(self.platform.handle, self.isolate.handle, 1);
 }
 
@@ -722,11 +734,8 @@ pub fn protectHeapLimit(self: *Env) void {
     v8.v8__Isolate__AutomaticallyRestoreInitialHeapLimit(self.isolate.handle, 0.5);
 }
 
-// v8 is telling us it's about to run out of memory for this isolate. We'll
-// do two things:
-// 1 - Terminate the execution (attempting to prevent v8 from OOM'ing the process)
-// 2 - Grant more headroom so execution can reach a stack-guard check, where
-//     the terminate lands
+// V8 requests termination headroom mid-GC. RequestInterrupt still controls the
+// unwind, but logical heap-limit growth cannot manufacture physical backing.
 //
 // The terminate must go through requestTerminate (RequestInterrupt), NOT a
 // direct TerminateExecution: we're mid-GC, which is an arbitrary point —
@@ -762,8 +771,8 @@ fn onNearHeapLimit(self: *Env, current_limit: usize, initial_limit: usize) usize
         self.requestTerminate();
     }
 
-    // give it 256MB more to, hopefully, shtudown cleanly
-    return @max(current_limit, initial_limit + 256 * 1024 * 1024);
+    // No unconditional +256MiB escape. Backing admission remains authoritative.
+    return current_limit;
 }
 
 // Called from the network thread, caused v8 to eventually call terminateInterrupt
@@ -889,6 +898,8 @@ pub fn cancelTerminate(self: *Env) void {
 /// aren't tracked in `contexts`. Guarded so a sighandler-thread terminate
 /// can't land mid-checkpoint.
 pub fn performIsolateMicrotasks(self: *Env) void {
+    @import("../TaskGate.zig").enterOrExit();
+    defer @import("../TaskGate.zig").exit();
     self.terminate_mutex.lockUncancelable(lp.io);
     defer self.terminate_mutex.unlock(lp.io);
     if (self.terminatePending()) return;
@@ -1055,7 +1066,7 @@ test "Env: a heap limit reached during teardown does not arm a termination" {
 
     const granted = env.onNearHeapLimit(limit, limit);
     try testing.expectEqual(false, env.terminatePending());
-    try testing.expect(granted > limit);
+    try testing.expectEqual(limit, granted);
 }
 
 test "Env: script report names the running frame and script stack" {
@@ -1272,4 +1283,16 @@ test "Env: Frame context" {
     try testing.expectEqual(true, (try ls.local.exec("typeof Node !== 'undefined'", null)).isTrue());
     try testing.expectEqual(true, (try ls.local.exec("typeof WorkerGlobalScope === 'undefined'", null)).isTrue());
     try testing.expectEqual(true, (try ls.local.exec("typeof DedicatedWorkerGlobalScope === 'undefined'", null)).isTrue());
+}
+
+extern "c" fn lp_runtime_v8_configure_code_range(*v8.CreateParams) void;
+extern "c" fn lp_runtime_v8_buffers(usize) ?*v8.ArrayBufferAllocator;
+extern "c" fn lp_runtime_v8_buffers_delete(*v8.ArrayBufferAllocator) void;
+
+fn deleteBufferAllocator(value: *v8.ArrayBufferAllocator) void {
+    if (lp.RuntimeMemory.isManaged() and @import("build_config").accounted_clone) {
+        lp_runtime_v8_buffers_delete(value);
+    } else {
+        v8.v8__ArrayBuffer__Allocator__DELETE(value);
+    }
 }

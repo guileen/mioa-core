@@ -35,7 +35,12 @@ pub fn main(init: std.process.Init) !void {
     var mem: [8192]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&mem);
 
-    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    // Alloc-site unwinding is disabled: Zig 0.17's Mach-O unwinder panics with
+    // `corruptSwitch` while capturing frames in this 171MB test binary, and the
+    // ensuing panic path deadlocks. Bucket/canary tracking is unaffected.
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{
+        .stack_trace_frames = 0,
+    });
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
 
@@ -210,7 +215,11 @@ const Runner = struct {
                     if (@errorReturnTrace()) |trace| {
                         std.debug.dumpErrorReturnTrace(trace);
                     }
-                    try fail_list.append(self.allocator, try self.allocator.dupe(u8, friendly_name));
+                    // Recording a failure must not be the thing that fails: the
+                    // runner allocator is a fixed 8 KiB buffer, and a suite with
+                    // many failures overflowed it, aborting the shard with OOM
+                    // instead of reporting the failures. Names live until exit.
+                    try fail_list.append(std.heap.page_allocator, try std.heap.page_allocator.dupe(u8, friendly_name));
                     if (self.env.fail_first) {
                         if (claim) |*c| c.stop();
                         break;

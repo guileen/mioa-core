@@ -20,6 +20,8 @@
 // VTTCue.getCueAsHTML(): https://w3c.github.io/webvtt/#cue-text-parsing-rules
 
 const std = @import("std");
+const build_config = @import("build_config");
+const entities = @import("../../entities.zig");
 
 const Frame = @import("../../Frame.zig");
 const html5ever = @import("../../parser/html5ever.zig");
@@ -300,15 +302,19 @@ fn consumeCharacterReference(arena: Allocator, out: *std.ArrayList(u8), input: [
         },
     }
 
-    // Longest match: html5ever's table also holds every prefix of every name,
-    // so we can stop as soon as nothing starts with what we've read.
+    // Both providers distinguish exact names from prefixes, so stop as soon
+    // as nothing starts with what we've read, retaining the longest match.
     var matched_end: ?usize = null;
     var codepoints: [2]u32 = undefined;
     var end = start + 1;
     while (end <= input.len) : (end += 1) {
         const name = input[start..end];
         var found: [2]u32 = undefined;
-        switch (html5ever.html5ever_named_character_reference(name.ptr, name.len, &found)) {
+        const result = switch (comptime build_config.entities_provider) {
+            .zig => entities.lookup(name, &found),
+            .rust => html5ever.html5ever_named_character_reference(name.ptr, name.len, &found),
+        };
+        switch (result) {
             0 => break,
             1 => {},
             else => {

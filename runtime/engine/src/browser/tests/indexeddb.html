@@ -1542,4 +1542,42 @@
     });
 }
 </script>
+
+<!-- Backfill must enumerate committed records through the upgrade transaction's
+     owner, then persist both old and newly inserted index entries. -->
+<script id="upgrade_index_backfill_existing_records" type=module>
+{
+    const state = await testing.async();
+    const setup = indexedDB.open("backfill-existing-db", 1);
+    setup.onupgradeneeded = () => {
+        const store = setup.result.createObjectStore("items", { keyPath: "id" });
+        store.put({ id: 1, group: "a" });
+        store.put({ id: 2, group: "b" });
+    };
+    setup.onsuccess = () => {
+        setup.result.close();
+        const upgrade = indexedDB.open("backfill-existing-db", 2);
+        upgrade.onupgradeneeded = () => {
+            const store = upgrade.transaction.objectStore("items");
+            store.createIndex("by_group", "group");
+            store.put({ id: 3, group: "a" });
+        };
+        upgrade.onsuccess = () => {
+            const db = upgrade.result;
+            const tx = db.transaction("items");
+            const index = tx.objectStore("items").index("by_group");
+            const a = index.getAllKeys("a");
+            const b = index.get("b");
+            tx.oncomplete = () => {
+                state.resolve({ keys: a.result, item: b.result });
+                db.close();
+            };
+        };
+    };
+    await state.done((result) => {
+        testing.expectEqual([1, 3], result.keys);
+        testing.expectEqual({ id: 2, group: "b" }, result.item);
+    });
+}
+</script>
 </body>

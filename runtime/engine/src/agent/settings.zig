@@ -29,6 +29,7 @@ const Config = lp.Config;
 const picker = @import("picker.zig");
 const string = @import("../string.zig");
 const auth = @import("auth/auth.zig");
+const ProcessApi = @import("process_api");
 const Candidate = zenai.provider.Candidate;
 
 pub const api_keys_hint = "ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, HF_TOKEN, AI_GATEWAY_API_KEY, MISTRAL_API_KEY, or OPENROUTER_API_KEY (Vertex AI: VERTEX_API_KEY, or GOOGLE_CLOUD_PROJECT via gcloud; Codex: a ChatGPT subscription via /provider codex)";
@@ -94,36 +95,42 @@ pub fn detectLocalProvider(allocator: std.mem.Allocator, tag: Config.AiProvider,
 /// With GOOGLE_CLOUD_PROJECT set, zenai's client always sends Bearer auth —
 /// an API key can never work, so the credential must be an OAuth token.
 pub fn vertexProjectMode() bool {
-    return std.c.getenv("GOOGLE_CLOUD_PROJECT") != null;
+    var present: c_int = 0;
+    return Config.EnvironmentApi.mioa_environment_has_v1("GOOGLE_CLOUD_PROJECT", &present) == Config.EnvironmentApi.MIOA_ENVIRONMENT_OK and present != 0;
 }
 
 /// Caller owns the result. Failure prints gcloud's own stderr so the real
 /// cause (not logged in, missing SDK) reaches the user.
 pub fn gcloudAccessToken(allocator: std.mem.Allocator) ![:0]const u8 {
-    // gcloud needs the real environment (HOME for its config).
-    var environ_map = try lp.environMap(allocator);
-    defer environ_map.deinit();
+    const output_capacity = 64 * 1024;
+    const stdout_buffer = try allocator.alloc(u8, output_capacity);
+    defer allocator.free(stdout_buffer);
+    const stderr_buffer = try allocator.alloc(u8, output_capacity);
+    defer allocator.free(stderr_buffer);
 
-    const result = std.process.run(allocator, lp.io, .{
-        .argv = &.{ "gcloud", "auth", "print-access-token" },
-        .environ_map = &environ_map,
-        .stdout_limit = .limited(64 * 1024),
-    }) catch |err| {
-        if (err == error.FileNotFound) {
-            std.debug.print("gcloud not found on PATH; install the Google Cloud SDK, or unset GOOGLE_CLOUD_PROJECT to use Vertex express mode with GOOGLE_API_KEY.\n", .{});
-            return error.GcloudNotFound;
-        }
-        return err;
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    const failed = switch (result.term) {
-        .exited => |code| code != 0,
-        else => true,
-    };
-    const token = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-    if (failed or token.len == 0) {
-        std.debug.print("`gcloud auth print-access-token` failed:\n{s}", .{result.stderr});
+    const argv = [_][*c]const u8{ "gcloud", "auth", "print-access-token" };
+    const argv_ptr: [*c]const [*c]const u8 = @ptrCast(&argv);
+    var result: ProcessApi.MioaProcessCaptureResultV1 = undefined;
+    const status = ProcessApi.mioa_process_capture_v1(
+        argv_ptr,
+        argv.len,
+        stdout_buffer.ptr,
+        stdout_buffer.len,
+        stderr_buffer.ptr,
+        stderr_buffer.len,
+        &result,
+    );
+    if (status == ProcessApi.MIOA_PROCESS_NOT_FOUND) {
+        std.debug.print("gcloud not found on PATH; install the Google Cloud SDK, or unset GOOGLE_CLOUD_PROJECT to use Vertex express mode with GOOGLE_API_KEY.\n", .{});
+        return error.GcloudNotFound;
+    }
+    if (status == ProcessApi.MIOA_PROCESS_NO_MEMORY) return error.OutOfMemory;
+    if (status != ProcessApi.MIOA_PROCESS_OK and status != ProcessApi.MIOA_PROCESS_CHILD_FAILED) {
+        return error.GcloudTokenFailed;
+    }
+    const token = std.mem.trim(u8, stdout_buffer[0..result.stdout_length], &std.ascii.whitespace);
+    if (status == ProcessApi.MIOA_PROCESS_CHILD_FAILED or result.exited == 0 or result.exit_code != 0 or token.len == 0) {
+        std.debug.print("`gcloud auth print-access-token` failed:\n{s}", .{stderr_buffer[0..result.stderr_length]});
         return error.GcloudTokenFailed;
     }
     return allocator.dupeSentinel(u8, token, 0);

@@ -115,11 +115,16 @@ pub const String = extern struct {
         };
     }
 
+    /// Static interns need no release; other long strings require their owning allocator.
     pub fn deinit(self: *const String, allocator: Allocator) void {
         const len = self.len;
         if (len > 12) {
             const p: [*]const u8 = @ptrFromInt(self.suffix.ptr);
-            allocator.free(p[0..@intCast(len)]);
+            const bytes = p[0..@intCast(len)];
+            if (intern(bytes)) |static| {
+                if (p == static.ptr) return;
+            }
+            allocator.free(bytes);
         }
     }
 
@@ -131,6 +136,7 @@ pub const String = extern struct {
         return wrap(std.mem.trim(u8, self.str(), values));
     }
 
+    /// Long results keep their allocated storage, even when the content has a static intern.
     pub fn concat(allocator: Allocator, parts: []const []const u8) !String {
         var total_len: usize = 0;
         for (parts) |part| {
@@ -157,7 +163,7 @@ pub const String = extern struct {
         return .{
             .len = @intCast(total_len),
             .prefix = @bitCast(result[0..4].*),
-            .suffix = .{ .ptr = @intFromPtr((intern(result) orelse result).ptr) },
+            .suffix = .{ .ptr = @intFromPtr(result.ptr) },
         };
     }
 
@@ -790,5 +796,21 @@ test "String.concat" {
         const result = try String.concat(testing.allocator, &.{ original[0..5], " world", original[5..] });
         defer result.deinit(testing.allocator);
         try testing.expectEqual("Hello world!", result.str());
+    }
+}
+
+test "String: ownership of long interned input" {
+    for ([_][]const u8{ "border-radius", "padding-bottom", "text-decoration", "background-color", "ordinary long string" }) |input| {
+        const value = try String.init(std.testing.allocator, input, .{});
+        defer value.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(input, value.str());
+    }
+}
+
+test "String: ownership of concatenated interned content" {
+    for ([_][]const u8{ "border-radius", "padding-bottom", "text-decoration", "background-color", "ordinary long string" }) |input| {
+        const value = try String.concat(std.testing.allocator, &.{ input[0..5], input[5..] });
+        defer value.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(input, value.str());
     }
 }

@@ -58,6 +58,28 @@ _activation: ?NavigationActivation = null,
 // from that initial entry replaces it.
 _initial_entry: bool = false,
 
+// Browsing-context property, preserved across replacement root documents.
+_script_closable: bool = false,
+_close_requested: bool = false,
+
+pub fn clearFormSnapshots(self: *Navigation) void {
+    for (self._entries.items) |entry| entry.clearFormSnapshot();
+}
+
+// Called at the actual root-document swap, never when a request is queued.
+pub fn snapshotCurrentForm(self: *Navigation, frame: *Frame) void {
+    const entry = self.getCurrentEntryOrNull() orelse return;
+    entry.clearFormSnapshot();
+    // Opaque documents cannot safely be associated with a later response.
+    if (frame.origin == null or frame._last_navigate_error != null) return;
+    entry._form_snapshot = @import("FormSnapshot.zig").capture(frame) catch null;
+}
+
+pub fn restoreTraversedForm(self: *Navigation, frame: *Frame) void {
+    const entry = self.getCurrentEntryOrNull() orelse return;
+    if (entry._form_snapshot) |snapshot| snapshot.restore(frame);
+}
+
 pub fn asEventTarget(self: *Navigation) *EventTarget {
     return self._proto;
 }
@@ -221,6 +243,7 @@ pub fn pushEntry(
     // of _entries, so fire even if a later step fails, and don't let one
     // entry's failure skip the others.
     defer for (disposed) |d| {
+        d.clearFormSnapshot();
         d.fireDispose(frame) catch |err| {
             log.debug(.event, "NavigationHistoryEntry.dispose", .{ .err = err });
         };
@@ -292,6 +315,7 @@ pub fn replaceEntry(
 
     // Per spec, dispose fires last, after currententrychange. old_entry is
     // already out of _entries, so fire even if the dispatch below fails.
+    old_entry.clearFormSnapshot();
     defer old_entry.fireDispose(frame) catch |err| {
         log.debug(.event, "NavigationHistoryEntry.dispose", .{ .err = err });
     };
@@ -434,7 +458,7 @@ pub fn navigateInner(
             }
         },
         .traverse => |index| {
-            self._index = index;
+            if (is_same_document) self._index = index;
 
             if (is_same_document) {
                 try frame.window._location._url.setHref(new_url, &frame.js.execution);

@@ -70,8 +70,11 @@ const ascii_whitespace = "\t\n\x0c\r ";
 
 fn base64Decode(arena: Allocator, input: []const u8) ![]const u8 {
     // Forgiving-base64 decode — https://infra.spec.whatwg.org/#forgiving-base64-decode.
-    // Shared with atob via the encoding helper; remap to this module's error name.
-    return base64.decode(arena, .{ .raw = input }) catch return error.InvalidBase64;
+    // Shared with atob; remap invalid input only, preserving allocation failures.
+    return base64.decode(arena, .{ .raw = input }) catch |err| switch (err) {
+        error.InvalidCharacterError => error.InvalidBase64,
+        else => err,
+    };
 }
 
 const testing = @import("../testing.zig");
@@ -111,6 +114,11 @@ test "data_url: forgiving-base64 rejects misplaced/over-padding" {
     try std.testing.expectError(error.InvalidBase64, parse(arena, "data:;base64,="));
     try std.testing.expectError(error.InvalidBase64, parse(arena, "data:;base64,ab=c")); // interior "="
     try std.testing.expectError(error.InvalidBase64, parse(arena, "data:;base64,==")); // no data
+}
+
+test "data_url: allocation failure is not invalid base64" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parse(failing.allocator(), "data:;base64,WA=="));
 }
 
 test "data_url: bare charset gets text/plain prefix" {

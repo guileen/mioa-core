@@ -19,6 +19,7 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 const h5e = @import("html5ever.zig");
+const Prescan = @import("Prescan.zig");
 
 const js = @import("../js/js.zig");
 const Frame = @import("../Frame.zig");
@@ -109,6 +110,10 @@ allow_declarative_shadow: bool = false,
 // behavior.
 context: ?*Element = null,
 
+// The throwaway context element handle html5ever roots fragment appends on.
+// `_appendCallback` folds it into `container`.
+context_handle: ?*ParsedNode = null,
+
 // // Fragment parsing doesn't run custom element constructor synchronously
 fragment: bool = false,
 
@@ -154,6 +159,10 @@ pub fn flushPendingText(self: *Parser) !void {
         self.buf.items,
         .{ .dupe = true },
     );
+    // The first chunk stamped node insertion, but later streamed chunks replace
+    // visible text in place. Preserve parser live-collection cursors while
+    // invalidating layout/model authority for this actual replacement.
+    self.frame.styleChanged();
 }
 
 fn appendTextChunk(self: *Parser, parent: *Node, txt: []const u8) !void {
@@ -219,14 +228,14 @@ const Error = struct {
     };
 };
 
-pub const PrescanResource = h5e.PrescanResource;
-const PrescanCallback = h5e.PrescanCallback;
+pub const PrescanResource = Prescan.PrescanResource;
+const PrescanCallback = Prescan.PrescanCallback;
 
 // Preload scanner: a tokenizer-only pass over a buffered document, reporting
 // fetchable script resources (and the first <base href>) through `callback`.
 // Builds no tree; purely a hint source.
 pub fn prescan(html: []const u8, charset: []const u8, ctx: *anyopaque, callback: PrescanCallback) void {
-    h5e.html5ever_prescan(html.ptr, html.len, charset.ptr, charset.len, ctx, callback);
+    Prescan.prescan(html, charset, ctx, callback);
 }
 
 pub fn parse(self: *Parser, html: []const u8) void {
@@ -384,6 +393,7 @@ pub const Streaming = struct {
     pub fn deinit(self: *Streaming) void {
         if (self.handle) |handle| {
             h5e.html5ever_streaming_parser_destroy(handle);
+            self.handle = null;
         }
     }
 
@@ -437,8 +447,11 @@ pub const Streaming = struct {
     }
 
     fn feed(self: *Streaming, data: []const u8) !void {
+        // `window.stop()` / `done()` tear the handle down; a chunk still in
+        // flight from the loader must be dropped rather than unwrapped.
+        const active = self.handle orelse return;
         const result = h5e.html5ever_streaming_parser_feed(
-            self.handle.?,
+            active,
             data.ptr,
             data.len,
         );
@@ -551,10 +564,14 @@ fn createContextElementCallback(ctx: *anyopaque, data: *anyopaque, qname: h5e.Qu
     const previous_creation = frame._custom_element_creation;
     frame._custom_element_creation = .bare_context;
     defer frame._custom_element_creation = previous_creation;
-    return self._createElementCallback(data, qname, attributes, .unknown) catch |err| {
+    const handle = self._createElementCallback(data, qname, attributes, .unknown) catch |err| {
         self.err = .{ .err = err, .source = .create_element };
         return null;
     };
+    // The context element is a throwaway: html5ever only queries its name to
+    // pick the insertion mode. Children appended *to it* belong to `container`.
+    self.context_handle = @ptrCast(@alignCast(handle));
+    return handle;
 }
 
 fn _createElementCallbackWithDefaultnamespace(ctx: *anyopaque, data: *anyopaque, qname: h5e.QualName, attributes: h5e.AttributeIterator, default_namespace: Element.Namespace) ?*anyopaque {
@@ -773,7 +790,13 @@ fn appendCallback(ctx: *anyopaque, parent_ref: *anyopaque, node_or_text: h5e.Nod
         self.err = .{ .err = err, .source = .append };
     };
 }
-fn _appendCallback(self: *Parser, parent_pn: *ParsedNode, node_or_text: h5e.NodeOrText) !void {
+fn _appendCallback(self: *Parser, parent_arg: *ParsedNode, node_or_text: h5e.NodeOrText) !void {
+    // Fragment parsing roots the sink at the throwaway context element; its
+    // children are the fragment, so they belong to the caller's container.
+    const parent_pn: *ParsedNode = if (self.context_handle) |handle|
+        (if (parent_arg == handle) &self.container else parent_arg)
+    else
+        parent_arg;
     // child node is guaranteed not to belong to another parent
     switch (node_or_text.toUnion()) {
         .node => |cpn| {
@@ -1082,4 +1105,24 @@ test "Parser: isWellFormedXML" {
     try testing.expectEqual(false, isWellFormedXML("<a>unclosed"));
     try testing.expectEqual(false, isWellFormedXML("<a x=1/>"));
     try testing.expectEqual(false, isWellFormedXML("<?xml version=\"2.0\"?><a/>"));
+}
+
+test "Parser: streamed text flush invalidates exact visual authority without resetting collection cursors" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const host = try frame.document.createElement("div", null, frame);
+    _ = try frame.document.asNode().appendChild(host.asNode(), frame);
+    var parser = init(frame.page_arena, host.asNode(), frame, .{});
+    try parser.appendTextChunk(host.asNode(), "first");
+    const text = parser.pending_text.?.text_node;
+    const guard = @import("../ExactVisualGuard.zig");
+    const capture = try guard.prepare(frame, .{ .owner = 1, .generation = 1 });
+    try parser.appendTextChunk(host.asNode(), "second");
+    try testing.expectEqual("first", text.getData().str());
+    try testing.expect(guard.validate(frame, capture, false));
+    const dom_version = frame.page.dom_version;
+    try parser.flushPendingText();
+    try testing.expectEqual("firstsecond", text.getData().str());
+    try testing.expectEqual(dom_version, frame.page.dom_version);
+    try testing.expect(!guard.validate(frame, capture, false));
 }

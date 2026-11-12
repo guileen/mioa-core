@@ -32,6 +32,7 @@ const Allocator = std.mem.Allocator;
 const CSSStyleDeclaration = @This();
 
 _element: ?*Element = null,
+_rule_owner: ?*Element = null,
 _properties: std.DoublyLinkedList = .{},
 _is_computed: bool = false,
 _syncing: bool = false,
@@ -88,29 +89,40 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
 
 fn propertyValue(self: *const CSSStyleDeclaration, normalized: []const u8, wrapped: String, frame: *Frame) []const u8 {
 
-    // Computed styles must reflect stylesheet rules, not just the element's
-    // inline `style=` attribute. Limited to display/visibility — what aria
-    // tree builders (Playwright ariaSnapshot) consult on every element — and
-    // pointer-events and text-transform, which innerText applies.
+    // Computed styles use specialized paths for layout-sensitive properties,
+    // then the shared stylesheet cascade for ordinary declarations. This keeps
+    // getComputedStyle aligned with author rules and inline priority.
     if (self._is_computed) {
         if (self._element) |element| {
             if (element.ownerFrame(frame)) |owner| {
                 const style_manager = &owner._style_manager;
-                if (wrapped.eql(comptime .wrap("display"))) {
-                    if (style_manager.hasDisplayNone(element)) {
-                        return "none";
-                    }
-                } else if (wrapped.eql(comptime .wrap("visibility"))) {
-                    if (style_manager.hasVisibilityHiddenInherited(element)) {
-                        return "hidden";
-                    }
-                } else if (wrapped.eqlSlice("pointer-events")) {
-                    if (style_manager.hasPointerEventsNone(element)) {
-                        return "none";
-                    }
-                } else if (wrapped.eqlSlice("text-transform")) {
+                if (wrapped.eql(comptime .wrap("display")) and style_manager.hasDisplayNone(element)) {
+                    return "none";
+                }
+                if (wrapped.eql(comptime .wrap("visibility")) and style_manager.hasVisibilityHiddenInherited(element)) {
+                    return "hidden";
+                }
+                if (wrapped.eqlSlice("pointer-events") and style_manager.hasPointerEventsNone(element)) {
+                    return "none";
+                }
+                if (wrapped.eqlSlice("text-transform")) {
                     // Inherited: the nearest declaration up the tree wins.
                     return style_manager.textTransform(element).keyword();
+                }
+                if (!isCustomProperty(normalized) and
+                    !wrapped.eql(comptime .wrap("font-size")) and
+                    !wrapped.eql(comptime .wrap("width")) and
+                    !wrapped.eql(comptime .wrap("height")))
+                {
+                    // Resolve author declarations through the shared cascade.
+                    // transform is matrix-normalized by getPropertyValue after
+                    // this lookup; dimensions and font-size have dedicated paths.
+                    if (style_manager.computedPropertyValue(element, wrapped)) |value| {
+                        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "initial")) {
+                            return getDefaultPropertyValue(self, wrapped);
+                        }
+                        return value;
+                    }
                 }
             }
         }
@@ -407,7 +419,17 @@ fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, fra
 // Serialize current properties back to the element's style attribute so that
 // DOM serialization (outerHTML, getAttribute) reflects JS-modified styles.
 fn syncStyleAttribute(self: *CSSStyleDeclaration, frame: *Frame) !void {
-    const element = self._element orelse return;
+    const element = self._element orelse {
+        // Styles owned by CSS rules have no element attribute to invalidate.
+        if (self._rule_owner) |owner| {
+            if (owner.ownerFrame(frame)) |owner_frame| {
+                owner_frame.styleChanged();
+                return;
+            }
+        }
+        frame.styleChanged();
+        return;
+    };
     const css_text = try self.getCssText(frame);
     self._syncing = true;
     defer self._syncing = false;

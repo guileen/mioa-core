@@ -36,14 +36,13 @@ pub const SelectionDirection = enum { backward, forward, none };
 _rc: lp.RC = .{},
 _range: ?*Range = null,
 _direction: SelectionDirection = .none,
+// Intrusive membership in the selected range's owner list.
+_range_next: ?*Selection = null,
 
 pub const init: Selection = .{};
 
 pub fn deinit(self: *Selection, page: *Page) void {
-    if (self._range) |r| {
-        r.asAbstractRange().releaseRef(page);
-        self._range = null;
-    }
+    self.clearRange(page);
 }
 
 pub fn releaseRef(self: *Selection, page: *Page) void {
@@ -54,7 +53,9 @@ pub fn acquireRef(self: *Selection) void {
     self._rc.acquire();
 }
 
-fn dispatchSelectionChangeEvent(frame: *Frame) !void {
+fn dispatchSelectionChangeEvent(self: *Selection, frame: *Frame) !void {
+    const document: *@import("Document.zig") = @fieldParentPtr("_selection", self);
+    if (document._frame) |owner| owner.page.visualChanged();
     const event = try Event.init("selectionchange", .{}, frame.page);
     try frame._event_manager.dispatch(frame.document.asEventTarget(), event);
 }
@@ -158,7 +159,7 @@ fn addRange(self: *Selection, range: *Range, frame: *Frame) !void {
     }
 
     self.setRange(range, frame);
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 fn removeRange(self: *Selection, range: *Range, frame: *Frame) !void {
@@ -167,7 +168,7 @@ fn removeRange(self: *Selection, range: *Range, frame: *Frame) !void {
         return error.NotFound;
     }
     self.setRange(null, frame);
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 fn removeAllRanges(self: *Selection, frame: *Frame) !void {
@@ -177,7 +178,7 @@ fn removeAllRanges(self: *Selection, frame: *Frame) !void {
 
     self.setRange(null, frame);
     self._direction = .none;
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 fn collapseToEnd(self: *Selection, frame: *Frame) !void {
@@ -193,7 +194,7 @@ fn collapseToEnd(self: *Selection, frame: *Frame) !void {
 
     self.setRange(new_range, frame);
     self._direction = .none;
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 fn collapseToStart(self: *Selection, frame: *Frame) !void {
@@ -209,7 +210,7 @@ fn collapseToStart(self: *Selection, frame: *Frame) !void {
 
     self.setRange(new_range, frame);
     self._direction = .none;
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 fn containsNode(self: *const Selection, node: *Node, partial: bool) !bool {
@@ -241,7 +242,7 @@ fn containsNode(self: *const Selection, node: *Node, partial: bool) !bool {
 fn deleteFromDocument(self: *Selection, frame: *Frame) !void {
     const range = self._range orelse return;
     try range.deleteContents(frame);
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 fn extend(self: *Selection, node: *Node, _offset: ?u32, frame: *Frame) !void {
@@ -290,7 +291,7 @@ fn extend(self: *Selection, node: *Node, _offset: ?u32, frame: *Frame) !void {
     }
 
     self.setRange(new_range, frame);
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 fn getRangeAt(self: *Selection, index: u32) !*Range {
@@ -613,7 +614,7 @@ fn applyModify(self: *Selection, alter: ModifyAlter, new_node: *Node, new_offset
 
             self.setRange(new_range, frame);
             self._direction = .none;
-            try dispatchSelectionChangeEvent(frame);
+            try self.dispatchSelectionChangeEvent(frame);
         },
         .extend => try self.extend(new_node, new_offset, frame),
     }
@@ -635,7 +636,7 @@ fn selectAllChildren(self: *Selection, parent: *Node, frame: *Frame) !void {
 
     self.setRange(range, frame);
     self._direction = .forward;
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 fn setBaseAndExtent(
@@ -682,7 +683,7 @@ fn setBaseAndExtent(
     }
 
     self.setRange(range, frame);
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 pub fn collapse(self: *Selection, _node: ?*Node, _offset: ?u32, frame: *Frame) !void {
@@ -709,7 +710,7 @@ pub fn collapse(self: *Selection, _node: ?*Node, _offset: ?u32, frame: *Frame) !
 
     self.setRange(range, frame);
     self._direction = .none;
-    try dispatchSelectionChangeEvent(frame);
+    try self.dispatchSelectionChangeEvent(frame);
 }
 
 pub fn toString(self: *const Selection, frame: *Frame) ![]const u8 {
@@ -718,13 +719,29 @@ pub fn toString(self: *const Selection, frame: *Frame) ![]const u8 {
 }
 
 fn setRange(self: *Selection, new_range: ?*Range, frame: *Frame) void {
-    if (self._range) |existing| {
-        _ = existing.asAbstractRange().releaseRef(frame.page);
-    }
+    if (self._range == new_range) return;
+    self.clearRange(frame.page);
     if (new_range) |nr| {
         nr.asAbstractRange().acquireRef();
+        self._range_next = nr._selections;
+        nr._selections = self;
     }
     self._range = new_range;
+}
+
+fn clearRange(self: *Selection, page: *Page) void {
+    const range = self._range orelse return;
+    var link = &range._selections;
+    while (link.*) |current| {
+        if (current == self) {
+            link.* = self._range_next;
+            break;
+        }
+        link = &current._range_next;
+    }
+    self._range = null;
+    self._range_next = null;
+    range.asAbstractRange().releaseRef(page);
 }
 
 pub const JsApi = struct {
@@ -766,4 +783,32 @@ pub const JsApi = struct {
 const testing = @import("../../testing.zig");
 test "WebApi: Selection" {
     try testing.htmlRunner("selection.html", .{});
+}
+
+test "Selection: live range mutations invalidate every selection owner" {
+    const first = try testing.createFrame();
+    const second = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const text = try Frame.node_factory.createTextNode(first.document, "abcdef");
+    const range = try Range.init(first);
+    try range.setStart(text, 1);
+    try range.setEnd(text, 5);
+    first.document._selection.setRange(range, first);
+    second.document._selection.setRange(range, second);
+    const first_before = first.page.visual_generation.load(.acquire);
+    const second_before = second.page.visual_generation.load(.acquire);
+    try range.setEnd(text, 4);
+    try testing.expect(first.page.visual_generation.load(.acquire) > first_before);
+    try testing.expect(second.page.visual_generation.load(.acquire) > second_before);
+    first.document._selection.setRange(null, first);
+    const removed = first.page.visual_generation.load(.acquire);
+    const selected = second.page.visual_generation.load(.acquire);
+    range.collapse(true);
+    try testing.expectEqual(removed, first.page.visual_generation.load(.acquire));
+    try testing.expect(second.page.visual_generation.load(.acquire) > selected);
+    second.document._selection.setRange(null, second);
+    const unselected = second.page.visual_generation.load(.acquire);
+    try range.setStart(text, 0);
+    try testing.expectEqual(removed, first.page.visual_generation.load(.acquire));
+    try testing.expectEqual(unselected, second.page.visual_generation.load(.acquire));
 }

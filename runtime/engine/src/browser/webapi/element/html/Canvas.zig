@@ -30,6 +30,7 @@ const OffscreenCanvas = @import("../../canvas/OffscreenCanvas.zig");
 const WebGLRenderingContext = @import("../../canvas/WebGLRenderingContext.zig");
 const CanvasRenderingContext2D = @import("../../canvas/CanvasRenderingContext2D.zig");
 const context2d = @import("../../canvas/context2d.zig");
+const png_encoder = @import("../../../png.zig");
 
 const HtmlElement = @import("../Html.zig");
 
@@ -164,7 +165,7 @@ fn png(self: *const Canvas, arena: std.mem.Allocator) !?[]const u8 {
     const image = try self.pixels(arena);
     if (!image.origin_clean) return error.SecurityError;
     if (image.width == 0 or image.height == 0) return null;
-    if (!lp_rgba_png(image.bytes.ptr, image.width, image.height, &writer.writer, write)) return error.InvalidStateError;
+    if (!png_encoder.write(image.bytes.ptr, image.width, image.height, &writer.writer, write)) return error.InvalidStateError;
     return writer.written();
 }
 fn write(context: *anyopaque, bytes: [*]const u8, len: usize) callconv(.c) bool {
@@ -172,7 +173,6 @@ fn write(context: *anyopaque, bytes: [*]const u8, len: usize) callconv(.c) bool 
     writer.writeAll(bytes[0..len]) catch return false;
     return true;
 }
-extern "c" fn lp_rgba_png([*]const u8, u32, u32, *anyopaque, *const fn (*anyopaque, [*]const u8, usize) callconv(.c) bool) bool;
 fn toDataURL(self: *const Canvas, _: ?[]const u8, _: ?f64, exec: *Execution) ![]const u8 {
     const bytes = (try self.png(exec.local_arena)) orelse return "data:,";
     const codec = std.base64.standard.Encoder;
@@ -264,6 +264,7 @@ pub const Build = struct {
         };
         canvas._origin_clean = true;
         _ = frame._render_resource_version.fetchAdd(1, .release);
+        frame.page.visualChanged();
     }
 };
 

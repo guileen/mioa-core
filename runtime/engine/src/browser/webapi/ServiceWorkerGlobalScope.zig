@@ -441,8 +441,11 @@ pub fn receiveMessage(self: *ServiceWorkerGlobalScope, data: js.Value) !void {
         self._proto.js.localScope(&ls);
         defer ls.deinit();
 
-        const cloned = data.structuredCloneTo(&ls.local) catch break :blk null;
-        break :blk cloned.persist() catch break :blk null;
+        const cloned = data.structuredCloneTo(&ls.local) catch |err| {
+            if (err == error.JsException) break :blk null;
+            return err;
+        };
+        break :blk try cloned.persist();
     };
 
     if (self._state == .parsed) {

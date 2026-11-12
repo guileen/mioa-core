@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+const ThreadApi = @import("thread_api");
 
 const sys_net = @import("sys/net.zig");
 const posix = std.posix;
@@ -80,13 +81,32 @@ fn runImpl(self: *TestWSServer, wg: *lp.WaitGroup) !void {
             continue;
         };
 
-        const thread = std.Thread.spawn(.{}, handleClient, .{client}) catch |err| {
-            std.debug.print("[WS Server] Thread spawn error: {}\n", .{err});
+        const context = std.heap.page_allocator.create(ClientContext) catch {
+            std.debug.print("[WS Server] Thread context allocation failed\n", .{});
             _ = std.c.close(client);
             continue;
         };
-        thread.detach();
+        context.* = .{ .client = client };
+        var thread_handle: ?*anyopaque = null;
+        const status = ThreadApi.mioa_thread_start_v1(handleClientEntry, context, &thread_handle);
+        if (status != ThreadApi.MIOA_THREAD_OK) {
+            std.debug.print("[WS Server] Thread spawn error: {}\n", .{status});
+            std.heap.page_allocator.destroy(context);
+            _ = std.c.close(client);
+            continue;
+        }
+        ThreadApi.mioa_thread_detach_v1(&thread_handle);
     }
+}
+
+const ClientContext = struct {
+    client: posix.socket_t,
+};
+
+fn handleClientEntry(opaque_context: ?*anyopaque) callconv(.c) void {
+    const context: *ClientContext = @ptrCast(@alignCast(opaque_context.?));
+    defer std.heap.page_allocator.destroy(context);
+    handleClient(context.client);
 }
 
 fn handleClient(client: posix.socket_t) void {

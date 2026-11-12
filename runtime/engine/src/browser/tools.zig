@@ -2622,6 +2622,14 @@ fn execGetUrl(session: *lp.Session) ToolError![]const u8 {
 fn execGetCookies(arena: std.mem.Allocator, session: *lp.Session, arguments: ?std.json.Value) ToolError![]const u8 {
     const Params = struct { url: ?[]const u8 = null, all: bool = false };
     const args = try parseArgsOrDefault(Params, arena, arguments);
+    if (session.cookie_jar.profile_client) |client| {
+        const url: ?[]const u8 = if (args.url) |u| u else if (session.currentFrame()) |frame| frame.url else null;
+        const reply = client.request(arena, "cookies.tool_get", .{ .url = url, .all = args.all }) catch return ToolError.InternalError;
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return ToolError.InternalError;
+        if (result != .string) return ToolError.InternalError;
+        return arena.dupe(u8, result.string) catch ToolError.InternalError;
+    }
 
     const cookies = session.cookie_jar.cookies.items;
     if (cookies.len == 0) return "No cookies.";

@@ -212,6 +212,7 @@ fn tick(self: *const Driver) !bool {
         // in a shutting-down state.
         self.browser.http_client.drainTerminal() catch |err| switch (err) {
             error.ClientDisconnected => return false,
+            else => return err,
         };
 
         // Anything else means someone decided this browser must die (e.g.
@@ -242,7 +243,11 @@ fn tick(self: *const Driver) !bool {
 
     // No active page yet (or a teardown is in flight). Fall back to ticking
     // the http client directly so commands still get dispatched.
-    _ = self.browser.http_client.tick(wait_ms) catch |err| switch (err) {
+    const tick_result = if (self.browser.session) |*session| blk: {
+        var runner = session.runner(.{});
+        break :blk runner.tickNetwork(wait_ms);
+    } else self.browser.http_client.tick(wait_ms);
+    _ = tick_result catch |err| switch (err) {
         error.ClientDisconnected => return false,
         else => {
             log.err(self.scope, "http tick", .{ .err = err });

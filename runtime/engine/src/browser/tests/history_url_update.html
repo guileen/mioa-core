@@ -17,3 +17,37 @@
     history.replaceState(null, '', originalUrl);
   }
 </script>
+
+<script id=reject_unauthorized_url_without_mutation>
+  {
+    const original = location.href;
+    const originalDocument = document;
+    history.replaceState({marker: 'retained'}, '', original);
+    const otherPort = new URL(original);
+    otherPort.port = otherPort.port === '9583' ? '9584' : '9583';
+    const otherScheme = new URL(original);
+    otherScheme.protocol = otherScheme.protocol === 'http:' ? 'https:' : 'http:';
+    const credentials = new URL(original);
+    credentials.username = 'different-user';
+    for (const method of ['pushState', 'replaceState']) {
+      for (const url of ['https://other.example/account', otherPort.href, otherScheme.href, credentials.href, 'http://[']) {
+        const length = history.length;
+        const entry = navigation.currentEntry;
+        testing.withError((error) => {
+          testing.expectTrue(error instanceof DOMException);
+          testing.expectEqual('SecurityError', error.name);
+        }, () => history[method]({marker: 'rejected'}, '', url));
+        testing.expectEqual(original, location.href);
+        testing.expectEqual(length, history.length);
+        testing.expectEqual({marker: 'retained'}, history.state);
+        testing.expectTrue(document === originalDocument);
+        testing.expectTrue(navigation.currentEntry === entry);
+      }
+    }
+    history.pushState({marker: 'allowed'}, '', '/same-origin?q=1#section');
+    testing.expectEqual('/same-origin', location.pathname);
+    testing.expectEqual('?q=1', location.search);
+    testing.expectEqual('#section', location.hash);
+    history.replaceState(null, '', original);
+  }
+</script>

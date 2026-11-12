@@ -116,22 +116,22 @@ pub fn finish(self: *Base64Writer) Writer.Error!void {
     self.pending_len = 0;
 }
 
-const testing = @import("testing.zig");
-test "Base64Writer: matches std for every chunking" {
-    var input: [1000]u8 = undefined;
+const testing = std.testing;
+test "Base64Writer: matches std across chunk and bulk boundaries" {
+    var input: [9218]u8 = undefined;
     for (&input, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
 
     inline for (.{ Codec.standard, Codec.standard_no_pad, Codec.url_safe, Codec.url_safe_no_pad }) |codec| {
         const enc = codec.encoder();
-        for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 100, 999, 1000 }) |len| {
+        for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 100, 999, 1000, 3071, 3072, 3073, 6143, 6144, 6145, 9216, 9217, 9218 }) |len| {
             const expected = try testing.allocator.alloc(u8, enc.calcSize(len));
             defer testing.allocator.free(expected);
             _ = enc.encode(expected, input[0..len]);
 
-            for ([_]usize{ 1, 2, 3, 4, 5, 7, 64, 3071, 3072, 3073, 4096 }) |chunk| {
+            for ([_]usize{ 1, 2, 3, 4, 5, 7, 64, 3071, 3072, 3073, 4096, input.len }) |chunk| {
                 const got = try testEncode(codec, input[0..len], chunk);
                 defer testing.allocator.free(got);
-                try testing.expectEqual(expected, got);
+                try testing.expectEqualStrings(expected, got);
             }
         }
     }
@@ -145,7 +145,7 @@ test "Base64Writer: writer helpers" {
     try b64.writer.print("{s}-{d}", .{ "hello", 42 });
     try b64.writer.splatByteAll('!', 5);
     try b64.finish();
-    try testing.expectEqual("aGVsbG8tNDIhISEhIQ==", aw.written());
+    try testing.expectEqualStrings("aGVsbG8tNDIhISEhIQ==", aw.written());
 }
 
 fn testEncode(codec: Codec, input: []const u8, chunk: usize) ![]const u8 {

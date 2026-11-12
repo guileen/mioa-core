@@ -136,7 +136,7 @@ fn setHash(self: *const Location, hash: []const u8, frame: *Frame) !void {
 
     return target.scheduleNavigation(target_url, .{
         .reason = .script,
-        .kind = .{ .replace = null },
+        .kind = .{ .push = null },
     }, .{ .script = target });
 }
 

@@ -189,7 +189,7 @@ pub fn setValue(self: *Input, value: []const u8, frame: *Frame) !void {
     self._value = try frame.dupeString(sanitized);
     self._user_edited = false;
     if (changed) {
-        frame.styleChanged();
+        if (self.asElement().ownerFrame(frame)) |owner| owner.styleChanged();
     }
 
     // move the text entry cursor position to the end of the text control
@@ -803,6 +803,7 @@ fn changeType(self: *Input, new_type: Type, frame: *Frame) !void {
 }
 
 pub fn reset(self: *Input, frame: *Frame) !void {
+    defer if (self.asElement().ownerFrame(frame)) |owner| owner.styleChanged();
     self._value_dirty = false;
     self._checked_dirty = false;
     self._user_edited = false;
@@ -813,7 +814,6 @@ pub fn reset(self: *Input, frame: *Frame) !void {
     if (self._files != null) {
         try self.replaceFiles(&.{}, frame);
     }
-    frame.styleChanged();
 }
 
 // The value of a non-dirty control in value mode is its sanitized value attribute
@@ -1717,6 +1717,24 @@ test "WebApi: HTML.Input" {
     try testing.htmlRunner("element/html/input_file.html", .{});
     try testing.htmlRunner("element/html/input-value-as.html", .{});
     try testing.htmlRunner("element/html/input-value-mode.html", .{});
+}
+
+test "Input: live values and reset invalidate the owning frame" {
+    const owner = try testing.createFrame();
+    const caller = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const element = try owner.document.createElement("input", null, owner);
+    const input = element.as(Input);
+    const caller_before = caller.page.visual_generation.load(.acquire);
+    const before = owner.page.visual_generation.load(.acquire);
+    try input.setValue("edited", caller);
+    try testing.expect(owner.page.visual_generation.load(.acquire) > before);
+    try testing.expectEqual(caller_before, caller.page.visual_generation.load(.acquire));
+    const edited = owner.page.visual_generation.load(.acquire);
+    try input.reset(caller);
+    try testing.expectEqual("", input.getValue());
+    try testing.expect(owner.page.visual_generation.load(.acquire) > edited);
+    try testing.expectEqual(caller_before, caller.page.visual_generation.load(.acquire));
 }
 
 test "isValidFloatingPoint" {

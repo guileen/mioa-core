@@ -337,7 +337,8 @@ class NativeContext:
         if method == "Target.targetCreated" and params.get("targetInfo", {}).get("type") == "page":
             self.cdp._task(self._adopt(params["targetInfo"]))
         elif method == "Target.targetDestroyed":
-            page = self._pages.get(params.get("targetId"))
+            target_id = params.get("targetId")
+            page = self._pages.get(target_id)
             if page:
                 page._discard_frames()
                 page._closed = True
@@ -1261,7 +1262,11 @@ class NativeMouse:
                 await asyncio.sleep(delay / 1000)
             await self.up(button=button, click_count=count)
 
-    async def wheel(self, delta_x: float, delta_y: float) -> None:
+    async def wheel(self, delta_x: float, delta_y: float, *, x: float | None = None, y: float | None = None) -> None:
+        if (x is None) != (y is None):
+            raise NativeError("invalid_config", "mouse wheel coordinates must be provided together")
+        if x is not None:
+            self.x, self.y = x, y
         await self.page._send("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": self.x, "y": self.y, "deltaX": delta_x, "deltaY": delta_y, "modifiers": self.page.keyboard.modifiers})
 
 

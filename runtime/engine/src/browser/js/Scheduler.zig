@@ -83,6 +83,8 @@ const AddOpts = struct {
     name: []const u8 = "",
     front: bool = false, // run before any other tasks, multi-fronts are FIFO amongst themselves
     blocks_done: bool = true,
+    repeat_blocks_done: bool = false, // retain completion blocking across repeats
+    repeat_failure: ?*const fn (*anyopaque, anyerror) void = null,
     finalizer: ?Finalizer = null,
 };
 pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts: AddOpts) !void {
@@ -103,6 +105,8 @@ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts
         .key = self.nextKey(run_at),
         .finalizer = opts.finalizer,
         .blocks_done = opts.blocks_done,
+        .repeat_blocks_done = opts.repeat_blocks_done,
+        .repeat_failure = opts.repeat_failure,
     };
 
     if (opts.front) {
@@ -127,6 +131,11 @@ pub fn run(self: *Scheduler) !void {
 
     while (self.popReady(start)) |task_| {
         var task = task_;
+        @import("../TaskGate.zig").enter() catch |err| {
+            if (task.finalizer) |finalizer| finalizer(task.ctx);
+            return err;
+        };
+        defer @import("../TaskGate.zig").exit();
         if (comptime lp.IS_DEBUG) {
             log.debug(.scheduler, "scheduler.runTask", .{ .name = task.name });
         }
@@ -153,11 +162,20 @@ pub fn run(self: *Scheduler) !void {
                 if (comptime lp.IS_DEBUG) {
                     std.debug.assert(ms != 0);
                 }
-                // A task that endlessly reschedules itself would keep the page
-                // alive forever, so repeats never block completion.
-                task.blocks_done = false;
+                // Ordinary repeating tasks do not keep the page alive forever.
+                // Finite asynchronous operations may opt in to retaining their
+                // completion blocker until they finish or are cancelled.
+                task.blocks_done = task.blocks_done and task.repeat_blocks_done;
                 task.key = self.nextKey(now + ms);
-                try self.timed.push(self.allocator, task);
+                self.timed.push(self.allocator, task) catch |err| {
+                    if (task.repeat_failure) |func| {
+                        func(task.ctx, err);
+                    } else if (task.finalizer) |func| {
+                        func(task.ctx);
+                    }
+                    return err;
+                };
+                if (task.blocks_done) self.blocking += 1;
             }
         }
 
@@ -256,6 +274,8 @@ const Task = struct {
     ctx: *anyopaque,
     name: []const u8,
     blocks_done: bool,
+    repeat_blocks_done: bool = false,
+    repeat_failure: ?*const fn (*anyopaque, anyerror) void = null,
     callback: Callback,
     finalizer: ?Finalizer,
 

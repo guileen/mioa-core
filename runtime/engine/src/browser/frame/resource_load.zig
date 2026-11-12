@@ -140,6 +140,7 @@ const ImageLoad = struct {
         if (ok and self.generation == self.image._generation) {
             try self.frame._render_resources.put(self.frame.page_arena, self.url, self.bytes.items);
             _ = self.frame._render_resource_version.fetchAdd(1, .release);
+            self.frame.page.visualChanged();
         }
         self.settle(if (ok) .load else .@"error");
     }

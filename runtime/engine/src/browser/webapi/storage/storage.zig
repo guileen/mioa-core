@@ -20,6 +20,7 @@ const std = @import("std");
 const js = @import("../../js/js.zig");
 const Sqlite = @import("../../../storage/sqlite/Sqlite.zig");
 const Persistence = @import("Persistence.zig");
+const ProfileIpc = @import("ProfileIpc.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -32,6 +33,9 @@ pub const Cookie = @import("Cookie.zig");
 pub const Shed = struct {
     _origins: std.StringHashMapUnmanaged(*Bucket) = .empty,
     path: ?[]const u8 = null,
+    // Installed only by a qualified shared-Profile runtime. Session storage
+    // remains local to its top-level browsing context.
+    profile_client: ?*ProfileIpc.Client = null,
 
     pub fn deinit(self: *Shed, allocator: Allocator) void {
         var it = self._origins.iterator();
@@ -52,7 +56,11 @@ pub const Shed = struct {
         errdefer allocator.destroy(bucket);
         bucket.* = .init(allocator);
         errdefer bucket.deinit();
-        if (self.path) |dir| {
+        if (self.profile_client) |client| {
+            bucket.local._profile_origin = try allocator.dupe(u8, origin);
+            bucket.local._profile_client = client;
+            try bucket.local.refreshProfile();
+        } else if (self.path) |dir| {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(origin, &digest, .{});
             const path = try allocator.printSentinel("{s}/local-{s}.sqlite", .{ dir, std.fmt.bytesToHex(digest, .lower) }, 0);
@@ -128,11 +136,14 @@ pub const Lookup = struct {
     _size: usize = 0,
     _allocator: Allocator,
     _conn: ?Sqlite.Conn = null,
+    _profile_client: ?*ProfileIpc.Client = null,
+    _profile_origin: ?[]const u8 = null,
 
     const max_size = 5 * 1024 * 1024;
 
     pub fn deinit(self: *Lookup) void {
         if (self._conn) |conn| conn.close();
+        if (self._profile_origin) |origin| self._allocator.free(origin);
         var it = self._data.iterator();
         while (it.next()) |entry| {
             self._allocator.free(entry.key_ptr.*);
@@ -142,11 +153,139 @@ pub const Lookup = struct {
         self._size = 0;
     }
 
+    const profile_chunk_size = 192 * 1024;
+
+    fn resultObject(response: std.json.Value) !std.json.ObjectMap {
+        if (response != .object) return error.ProfileProtocolError;
+        const result = response.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .object) return error.ProfileProtocolError;
+        return result.object;
+    }
+
+    fn profileToken(response: std.json.Value) ![]const u8 {
+        const fields = try resultObject(response);
+        const token = fields.get("token") orelse return error.ProfileProtocolError;
+        if (token != .string or token.string.len == 0) return error.ProfileProtocolError;
+        return token.string;
+    }
+
+    // A snapshot is frozen by the service before it is transferred. Only a
+    // complete, validated replacement becomes visible to the JS bindings.
+    fn refreshProfile(self: *Lookup) !void {
+        const client = self._profile_client orelse return;
+        const origin = self._profile_origin.?;
+        const begin = try client.request(self._allocator, "local.snapshot.begin", .{ .origin = origin });
+        defer begin.deinit();
+        const token = try profileToken(begin.value);
+        defer {
+            const end = client.request(self._allocator, "local.snapshot.end", .{ .origin = origin, .token = token }) catch null;
+            if (end) |response| response.deinit();
+        }
+        const fields = try resultObject(begin.value);
+        const count_value = fields.get("count") orelse return error.ProfileProtocolError;
+        if (count_value != .integer or count_value.integer < 0) return error.ProfileProtocolError;
+        const record_count = std.math.cast(usize, count_value.integer) orelse return error.ProfileProtocolError;
+        var replacement = Lookup{ ._allocator = self._allocator };
+        errdefer replacement.deinit();
+        for (0..record_count) |_| {
+            const next = try client.request(self._allocator, "local.snapshot.next", .{ .origin = origin, .token = token });
+            defer next.deinit();
+            const record = try resultObject(next.value);
+            const key_length = record.get("key_length") orelse return error.ProfileProtocolError;
+            const value_length = record.get("value_length") orelse return error.ProfileProtocolError;
+            if (key_length != .integer or value_length != .integer or key_length.integer < 0 or value_length.integer < 0) return error.ProfileProtocolError;
+            const key_len = std.math.cast(usize, key_length.integer) orelse return error.ProfileProtocolError;
+            const value_len = std.math.cast(usize, value_length.integer) orelse return error.ProfileProtocolError;
+            const total = std.math.add(usize, key_len, value_len) catch return error.ProfileProtocolError;
+            if (value_len > max_size - replacement._size) return error.ProfileProtocolError;
+            try replacement._data.ensureUnusedCapacity(self._allocator, 1);
+            const key_bytes = try self._allocator.alloc(u8, key_len);
+            errdefer self._allocator.free(key_bytes);
+            const value = try self._allocator.alloc(u8, value_len);
+            errdefer self._allocator.free(value);
+            var offset: usize = 0;
+            while (offset < total) {
+                const part_response = try client.request(self._allocator, "local.snapshot.read", .{ .origin = origin, .token = token, .offset = offset });
+                defer part_response.deinit();
+                const part = (try resultObject(part_response.value)).get("data") orelse return error.ProfileProtocolError;
+                if (part != .string) return error.ProfileProtocolError;
+                const decoder = std.base64.standard.Decoder;
+                const size = decoder.calcSizeForSlice(part.string) catch return error.ProfileProtocolError;
+                if (size == 0 or size > profile_chunk_size or size > total - offset) return error.ProfileProtocolError;
+                const decoded = try self._allocator.alloc(u8, size);
+                defer self._allocator.free(decoded);
+                decoder.decode(decoded, part.string) catch return error.ProfileProtocolError;
+                const key_part = if (offset < key_len) @min(size, key_len - offset) else 0;
+                if (key_part != 0) @memcpy(key_bytes[offset .. offset + key_part], decoded[0..key_part]);
+                if (key_part < size) {
+                    const value_offset = offset + key_part - key_len;
+                    @memcpy(value[value_offset .. value_offset + size - key_part], decoded[key_part..]);
+                }
+                offset += size;
+            }
+            if (replacement._data.contains(key_bytes)) return error.ProfileProtocolError;
+            replacement._data.putAssumeCapacity(key_bytes, value);
+            replacement._size += value_len;
+        }
+        var old = Lookup{ ._allocator = self._allocator, ._data = self._data, ._size = self._size };
+        self._data = replacement._data;
+        self._size = replacement._size;
+        old.deinit();
+    }
+
+    // Stage bytes under a principal-bound token; only commit changes storage.
+    // The key and value are streamed together without constructing a second
+    // full-sized copy, and even a failed transfer is explicitly discarded.
+    fn mutateProfile(self: *Lookup, kind: []const u8, key_bytes: []const u8, value: []const u8) !void {
+        const client = self._profile_client.?;
+        const origin = self._profile_origin.?;
+        const begin = try client.request(self._allocator, "local.mutation.begin", .{
+            .origin = origin,
+            .kind = kind,
+            .key_length = key_bytes.len,
+            .value_length = value.len,
+        });
+        defer begin.deinit();
+        const token = try profileToken(begin.value);
+        var committed = false;
+        defer if (!committed) {
+            const abort = client.request(self._allocator, "local.mutation.abort", .{ .origin = origin, .token = token }) catch null;
+            if (abort) |response| response.deinit();
+        };
+        var offset: usize = 0;
+        for ([_][]const u8{ key_bytes, value }) |segment| {
+            var pos: usize = 0;
+            while (pos < segment.len) {
+                const end = pos + @min(profile_chunk_size, segment.len - pos);
+                const part = segment[pos..end];
+                const encoded = try self._allocator.alloc(u8, std.base64.standard.Encoder.calcSize(part.len));
+                defer self._allocator.free(encoded);
+                _ = std.base64.standard.Encoder.encode(encoded, part);
+                const response = try client.request(self._allocator, "local.mutation.chunk", .{
+                    .origin = origin,
+                    .token = token,
+                    .offset = offset,
+                    .data = encoded,
+                });
+                response.deinit();
+                offset += part.len;
+                pos = end;
+            }
+        }
+        const response = try client.request(self._allocator, "local.mutation.commit", .{ .origin = origin, .token = token });
+        response.deinit();
+        committed = true;
+    }
+
     pub fn getItem(self: *const Lookup, k: []const u8) ?[]const u8 {
         return self._data.get(k);
     }
 
     pub fn setItem(self: *Lookup, k: []const u8, value: []const u8) !void {
+        // The service makes the quota decision atomically with the mutation.
+        if (self._profile_client != null) {
+            return self.mutateProfile("set", k, value);
+        }
         const old_len = if (self._data.get(k)) |old| old.len else 0;
         std.debug.assert(old_len <= self._size);
         if (self._size - old_len + value.len > max_size) {
@@ -175,6 +314,9 @@ pub const Lookup = struct {
     }
 
     pub fn removeItem(self: *Lookup, k: []const u8) !void {
+        if (self._profile_client != null) {
+            return self.mutateProfile("remove", k, "");
+        }
         if (self._conn) |conn| try conn.exec("delete from entries where key=?1", .{k});
         const kv = self._data.fetchRemove(k) orelse return;
         self._size -= kv.value.len;
@@ -183,6 +325,11 @@ pub const Lookup = struct {
     }
 
     pub fn clear(self: *Lookup) !void {
+        if (self._profile_client) |client| {
+            const response = try client.request(self._allocator, "local.clear", .{ .origin = self._profile_origin.? });
+            response.deinit();
+            return;
+        }
         if (self._conn) |conn| try conn.exec("delete from entries", .{});
         var it = self._data.iterator();
         while (it.next()) |entry| {
@@ -213,7 +360,8 @@ pub const Lookup = struct {
         return self._data.contains(k);
     }
 
-    pub fn keys(self: *const Lookup, exec: *const js.Execution) !js.Array {
+    pub fn keys(self: *Lookup, exec: *const js.Execution) !js.Array {
+        try self.refreshProfile();
         const local = exec.js.local.?;
         var arr = local.newArray(self.getLength());
         var it = self._data.keyIterator();
@@ -232,18 +380,35 @@ pub const Lookup = struct {
             pub var class_id: bridge.ClassId = undefined;
         };
 
-        pub const length = bridge.accessor(Lookup.getLength, null, .{});
-        pub const getItem = bridge.function(Lookup.getItem, .{});
+        fn get(self: *Lookup, k: []const u8) !?[]const u8 {
+            try self.refreshProfile();
+            return self.getItem(k);
+        }
+        fn getLengthRemote(self: *Lookup) !u32 {
+            try self.refreshProfile();
+            return self.getLength();
+        }
+        fn getKeyRemote(self: *Lookup, index: u32) !?[]const u8 {
+            try self.refreshProfile();
+            return self.key(index);
+        }
+        pub const length = bridge.accessor(Lookup.JsApi.getLengthRemote, null, .{});
+        pub const getItem = bridge.function(Lookup.JsApi.get, .{});
         pub const setItem = bridge.function(Lookup.setItem, .{});
         pub const removeItem = bridge.function(Lookup.removeItem, .{});
         pub const clear = bridge.function(Lookup.clear, .{});
-        pub const key = bridge.function(Lookup.key, .{});
-        pub const @"[str]" = bridge.namedIndexed(Lookup.getItem, Lookup.setItem, Lookup.removeItem, Lookup.keys, Lookup.hasItem, .{ .null_as_undefined = true });
+        pub const key = bridge.function(Lookup.JsApi.getKeyRemote, .{});
+        pub const @"[str]" = bridge.namedIndexed(Lookup.JsApi.get, Lookup.setItem, Lookup.removeItem, Lookup.keys, Lookup.JsApi.has, .{ .null_as_undefined = true });
+        fn has(self: *Lookup, k: []const u8) !bool {
+            try self.refreshProfile();
+            return self.hasItem(k);
+        }
         pub const @"[int]" = bridge.indexedReadWrite(_getByIndex, _setByIndex, _removeByIndex, _indexHas, null, .{ .null_as_undefined = true });
 
         // v8 routes storage[9] to the indexed interceptor, so we need to do the
         // int -> string conversion
-        fn _getByIndex(self: *const Lookup, idx: u32) ?[]const u8 {
+        fn _getByIndex(self: *Lookup, idx: u32) !?[]const u8 {
+            try self.refreshProfile();
             var buf: [10]u8 = undefined;
             return self._data.get(std.mem.print(&buf, "{d}", .{idx}) catch unreachable);
         }
@@ -258,7 +423,8 @@ pub const Lookup = struct {
             try self.removeItem(std.mem.print(&buf, "{d}", .{idx}) catch unreachable);
         }
 
-        fn _indexHas(self: *const Lookup, idx: u32) bool {
+        fn _indexHas(self: *Lookup, idx: u32) !bool {
+            try self.refreshProfile();
             var buf: [10]u8 = undefined;
             return self._data.contains(std.mem.print(&buf, "{d}", .{idx}) catch unreachable);
         }
