@@ -37,6 +37,12 @@ _state: NavigationState,
 // created by pushState/replaceState or a fragment navigation share their
 // document's id; traversing between them stays in that document.
 _document_id: u32,
+_form_snapshot: ?*@import("FormSnapshot.zig") = null,
+
+pub fn clearFormSnapshot(self: *NavigationHistoryEntry) void {
+    if (self._form_snapshot) |snapshot| snapshot.destroy();
+    self._form_snapshot = null;
+}
 
 pub fn asEventTarget(self: *NavigationHistoryEntry) *EventTarget {
     return self._proto;

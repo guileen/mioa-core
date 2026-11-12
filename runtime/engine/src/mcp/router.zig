@@ -52,10 +52,19 @@ fn idleUntilInput(server: anytype, reader: *std.Io.Reader, file: std.Io.File) vo
     while (std.mem.findScalar(u8, reader.buffered(), '\n') == null and
         reader.bufferedLen() < reader.buffer.len)
     {
-        const wait_ms = server.idle();
-        var fds = [_]std.posix.pollfd{.{ .fd = file.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&fds, wait_ms) catch return;
-        if (ready > 0) return;
+        var wait_ms: u31 = server.idle();
+        if (@hasDecl(@TypeOf(server.*), "profileAsyncTimeout")) {
+            if (server.profileAsyncTimeout()) |remaining| wait_ms = @intCast(@min(wait_ms, remaining));
+        }
+        const event_fd = if (@hasDecl(@TypeOf(server.*), "profileEventFd")) server.profileEventFd() else null;
+        const async_fd = if (@hasDecl(@TypeOf(server.*), "profileAsyncPollFd")) server.profileAsyncPollFd() else null;
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = file.handle, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = event_fd orelse -1, .events = std.posix.POLL.IN, .revents = 0 },
+            async_fd orelse .{ .fd = -1, .events = 0, .revents = 0 },
+        };
+        _ = std.posix.poll(&fds, wait_ms) catch return;
+        if (fds[0].revents != 0) return;
     }
 }
 

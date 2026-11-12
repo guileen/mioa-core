@@ -19,8 +19,10 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 const log = lp.log;
+const ThreadApi = @import("thread_api");
 const ansi = @import("ansi.zig");
 const truncateUtf8 = @import("../string.zig").truncateUtf8;
+extern "c" fn mioa_terminal_stderr_columns_v1() u32;
 
 const Spinner = @This();
 
@@ -78,7 +80,7 @@ paused: bool = false,
 tool_calls: u32 = 0,
 turn_started_ms: u64 = 0,
 
-thread: ?std.Thread = null,
+thread: ?*anyopaque = null,
 should_exit: bool = false,
 
 last_render_buf: [frame_buf_bytes]u8 = undefined,
@@ -93,13 +95,12 @@ pub inline fn isEnabled(self: *const Spinner) bool {
 }
 
 pub fn deinit(self: *Spinner) void {
-    if (self.thread) |t| {
+    if (self.thread != null) {
         self.mu.lockUncancelable(lp.io);
         self.should_exit = true;
         self.cv.signal(lp.io);
         self.mu.unlock(lp.io);
-        t.join();
-        self.thread = null;
+        ThreadApi.mioa_thread_join_v1(&self.thread);
     }
 }
 
@@ -119,13 +120,13 @@ pub fn start(self: *Spinner) void {
 
 fn ensureWorkerLocked(self: *Spinner) void {
     if (self.thread == null) {
-        self.thread = std.Thread.spawn(.{}, workerLoop, .{self}) catch |err| blk: {
-            log.warn(.app, "spinner thread spawn failed", .{ .err = @errorName(err) });
+        const status = ThreadApi.mioa_thread_start_v1(workerEntry, self, &self.thread);
+        if (status != ThreadApi.MIOA_THREAD_OK) {
+            log.warn(.app, "spinner thread spawn failed", .{ .status = status });
             self.enabled.store(false, .monotonic);
             self.state = .idle;
             self.last_render_len = 0;
-            break :blk null;
-        };
+        }
     }
 }
 
@@ -244,6 +245,11 @@ pub fn emitAbove(self: *Spinner, text: []const u8) bool {
     return true;
 }
 
+fn workerEntry(context: ?*anyopaque) callconv(.c) void {
+    const self: *Spinner = @ptrCast(@alignCast(context.?));
+    workerLoop(self);
+}
+
 fn workerLoop(self: *Spinner) void {
     self.mu.lockUncancelable(lp.io);
     defer self.mu.unlock(lp.io);
@@ -310,19 +316,12 @@ fn renderLocked(self: *Spinner) void {
     _ = std.c.write(std.posix.STDERR_FILENO, (written).ptr, (written).len);
 }
 
-/// Current terminal width in columns, queried via TIOCGWINSZ on stderr.
-/// Null when stderr isn't a tty, the ioctl fails, or the kernel reports 0
-/// (some pseudo-ttys leave the field unset). Cheap enough to call per render
-/// frame; picks up resizes without SIGWINCH plumbing.
-fn columns() ?u16 {
-    var ws: std.posix.winsize = undefined;
-    // bitcast via c_uint: on archs where `_IOR` sets the direction bit
-    // (MIPS/PPC/SPARC), `IOCGWINSZ` exceeds i32 range, so a plain @intCast
-    // panics; the bitcast preserves the bit pattern.
-    const req: c_int = @bitCast(@as(c_uint, std.posix.T.IOCGWINSZ));
-    const rc = std.c.ioctl(std.posix.STDERR_FILENO, req, &ws);
-    if (rc != 0 or ws.col == 0) return null;
-    return ws.col;
+/// Current Host stderr terminal width; null when unavailable.
+/// Queried per render so terminal resizes are observed without signal plumbing.
+fn columns() ?usize {
+    const width = mioa_terminal_stderr_columns_v1();
+    if (width == 0) return null;
+    return @intCast(width);
 }
 
 /// Returns the byte length of `bytes` that fits in `max_cells` cells, rounded

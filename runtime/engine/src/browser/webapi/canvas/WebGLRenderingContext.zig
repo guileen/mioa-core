@@ -8,7 +8,6 @@ const Execution = js.Execution;
 const Bytes = @import("../../graphics_bytes.zig").Bytes;
 const WebGLRenderingContext = @This();
 pub const Backend = opaque {};
-_backend: *Backend,
 _canvas: CanvasOwner,
 _surface: *Surface,
 _error: u32 = 0,
@@ -116,10 +115,8 @@ fn initialize(owner: CanvasOwner, exec: *Execution) !?*WebGLRenderingContext {
         .html => |canvas| canvas.surface(exec),
         .offscreen => |canvas| canvas.surface(exec),
     };
-    const backend = lp_gl_new(owner.width(), owner.height()) orelse return null;
-    errdefer lp_gl_free(backend);
-    const context = try exec._factory.create(WebGLRenderingContext{ ._backend = backend, ._canvas = owner, ._surface = surface });
-    try surface.attachGl(backend);
+    const context = try exec._factory.create(WebGLRenderingContext{ ._canvas = owner, ._surface = surface });
+    _ = (try surface.initializeGl()) orelse return null;
     return context;
 }
 pub fn release(backend: *Backend) void {
@@ -130,10 +127,20 @@ fn write(ctx: *anyopaque, data: [*]const u8, len: usize) callconv(.c) bool {
     writer.writeAll(data[0..len]) catch return false;
     return true;
 }
+fn commandMutates(comptime method: []const u8) bool {
+    return !(std.mem.startsWith(u8, method, "get") or
+        std.mem.startsWith(u8, method, "is") or
+        std.mem.eql(u8, method, "checkFramebufferStatus") or
+        std.mem.eql(u8, method, "contextStatus") or
+        std.mem.eql(u8, method, "finish") or
+        std.mem.eql(u8, method, "flush"));
+}
 fn rawCommand(self: *WebGLRenderingContext, comptime method: []const u8, args: anytype, exec: *Execution) ![]const u8 {
     const request = try std.json.Stringify.valueAlloc(exec.local_arena, .{ .method = method, .args = args }, .{});
     var result: std.Io.Writer.Allocating = .init(exec.local_arena);
-    if (!lp_gl_command(self._backend, request.ptr, request.len, &result.writer, write)) return error.InvalidOperationError;
+    const access = try self._surface.beginGlAccess(comptime commandMutates(method));
+    defer access.end();
+    if (!lp_gl_command(access.backend, request.ptr, request.len, &result.writer, write)) return error.InvalidOperationError;
     return result.written();
 }
 fn command(self: *WebGLRenderingContext, comptime method: []const u8, args: anytype, exec: *Execution) !js.Value {
@@ -247,7 +254,9 @@ fn readPixels(self: *WebGLRenderingContext, x: i32, y: i32, width: i32, height: 
     if (!pixels.isArrayBufferView()) return error.TypeError;
     _ = exec;
     const target = @constCast(try pixels.toStringSmart());
-    if (!lp_gl_read_pixels(self._backend, x, y, width, height, format, kind, target.ptr, target.len)) self._error = 0x0502;
+    const access = try self._surface.beginGlAccess(false);
+    defer access.end();
+    if (!lp_gl_read_pixels(access.backend, x, y, width, height, format, kind, target.ptr, target.len)) self._error = 0x0502;
 }
 fn bufferData(self: *WebGLRenderingContext, target: u32, data: js.Value, usage: u32, exec: *Execution) !void {
     if (data.isArrayBuffer() or data.isArrayBufferView()) {
@@ -256,10 +265,11 @@ fn bufferData(self: *WebGLRenderingContext, target: u32, data: js.Value, usage: 
         _ = try self.command("bufferData", .{ target, try data.toU32(), usage }, exec);
     }
 }
-extern "c" fn lp_gl_new(u32, u32) ?*Backend;
+pub extern "c" fn lp_gl_new(u32, u32) ?*Backend;
 extern "c" fn lp_gl_free(*Backend) void;
 extern "c" fn lp_gl_command(*Backend, [*]const u8, usize, *anyopaque, *const fn (*anyopaque, [*]const u8, usize) callconv(.c) bool) bool;
 pub extern "c" fn lp_gl_readback(*Backend, [*]u8, usize) bool;
+pub extern "c" fn lp_gl_finish(*Backend) bool;
 pub fn resize(self: *WebGLRenderingContext) !void {
     try self._surface.resize(self._canvas.width(), self._canvas.height());
 }
@@ -510,7 +520,9 @@ fn texImage2D(self: *WebGLRenderingContext, target: u32, level: i32, internal: i
         self._error = 0x0502;
         return;
     };
-    if (!lp_gl_tex_image(self._backend, &parameters, if (data) |v| v.ptr else null, if (data) |v| v.len else 0)) self._error = 0x0502;
+    const access = try self._surface.beginGlAccess(true);
+    defer access.end();
+    if (!lp_gl_tex_image(access.backend, &parameters, if (data) |v| v.ptr else null, if (data) |v| v.len else 0)) self._error = 0x0502;
 }
 fn texSubImage2D(self: *WebGLRenderingContext, target: u32, level: i32, x: i32, y: i32, width_or_format: u32, height_or_kind: u32, format_or_source: js.Value, kind: ?u32, pixels: ?js.Value, exec: *Execution) !void {
     var width: i32 = undefined;
@@ -545,7 +557,9 @@ fn texSubImage2D(self: *WebGLRenderingContext, target: u32, level: i32, x: i32, 
         self._error = 0x0502;
         return;
     };
-    if (!lp_gl_tex_sub_image(self._backend, target, level, x, y, width, height, format, pixel_kind, data.ptr, data.len)) self._error = 0x0502;
+    const access = try self._surface.beginGlAccess(true);
+    defer access.end();
+    if (!lp_gl_tex_sub_image(access.backend, target, level, x, y, width, height, format, pixel_kind, data.ptr, data.len)) self._error = 0x0502;
 }
 extern "c" fn lp_gl_tex_image(*Backend, *const TextureParameters, ?[*]const u8, usize) bool;
 extern "c" fn lp_gl_tex_sub_image(*Backend, u32, i32, i32, i32, i32, i32, u32, u32, [*]const u8, usize) bool;
@@ -987,4 +1001,13 @@ test "WebApi: native WebGL shader arrays textures and readback" {
 }
 test "WebApi: native GL identity extensions and separate contexts" {
     try testing.htmlRunner("canvas/webgl_rendering_context.html", .{});
+}
+
+test "WebGL backing commands acquire writers while queries only lock" {
+    inline for (.{ "clear", "drawArrays", "drawElements", "copyTexImage2D", "copyTexSubImage2D", "texImage2D", "texSubImage2D", "bufferData", "bufferSubData", "renderbufferStorage", "generateMipmap", "deleteTexture", "bindFramebuffer" }) |method| {
+        try std.testing.expect(commandMutates(method));
+    }
+    inline for (.{ "getParameter", "getError", "getShaderInfoLog", "isTexture", "checkFramebufferStatus", "contextStatus", "finish", "flush" }) |method| {
+        try std.testing.expect(!commandMutates(method));
+    }
 }

@@ -18,6 +18,17 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+const app_data = struct {
+    const mioa_app_data_path_v1 = extern struct {
+        path: [*c]u8,
+        length: usize,
+    };
+    const MIOA_APP_DATA_CREATE_DIRECTORY_V1: u32 = 1;
+    const MIOA_APP_DATA_OK: c_int = 0;
+    const MIOA_APP_DATA_NO_MEMORY: c_int = 3;
+    extern "c" fn mioa_app_data_directory_v1([*c]const u8, u32, *mioa_app_data_path_v1) c_int;
+    extern "c" fn mioa_app_data_path_release_v1(*mioa_app_data_path_v1) void;
+};
 
 const Regex = @import("Regex.zig");
 const Config = @import("Config.zig");
@@ -94,6 +105,7 @@ pub fn init(allocator: Allocator, config: *const Config) !*App {
     errdefer app.network.deinit();
 
     app.app_dir_path = getAndMakeAppDir(allocator);
+    errdefer if (app.app_dir_path) |path| allocator.free(path);
 
     app.telemetry = try Telemetry.init(app);
     errdefer app.telemetry.deinit(allocator);
@@ -134,36 +146,34 @@ fn getAndMakeAppDir(allocator: Allocator) ?[]const u8 {
     if (lp.IS_TEST) {
         return allocator.dupe(u8, "/tmp") catch unreachable;
     }
-    const app_dir_path = getAppDataDir(allocator, "lightpanda") catch |err| {
-        log.warn(.app, "get data dir", .{ .err = err });
+    return getAppDataDirWithOptions(
+        allocator,
+        "lightpanda",
+        app_data.MIOA_APP_DATA_CREATE_DIRECTORY_V1,
+    ) catch |err| {
+        log.warn(.app, "prepare data dir", .{ .err = err });
         return null;
     };
+}
 
-    std.Io.Dir.cwd().createDirPath(lp.io, app_dir_path) catch |err| switch (err) {
-        else => {
-            allocator.free(app_dir_path);
-            log.warn(.app, "create data dir", .{ .err = err, .path = app_dir_path });
-            return null;
-        },
-    };
-    return app_dir_path;
+fn getAppDataDirWithOptions(
+    allocator: Allocator,
+    appname: []const u8,
+    options: u32,
+) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, appname, 0) != null) return error.AppDataDirUnavailable;
+    const terminated_appname = try allocator.dupeSentinel(u8, appname, 0);
+    defer allocator.free(terminated_appname);
+
+    var result: app_data.mioa_app_data_path_v1 = .{ .path = null, .length = 0 };
+    const status = app_data.mioa_app_data_directory_v1(terminated_appname.ptr, options, &result);
+    if (status != app_data.MIOA_APP_DATA_OK) {
+        return if (status == app_data.MIOA_APP_DATA_NO_MEMORY) error.OutOfMemory else error.AppDataDirUnavailable;
+    }
+    defer app_data.mioa_app_data_path_release_v1(&result);
+    return allocator.dupe(u8, result.path[0..result.length]);
 }
 
 pub fn getAppDataDir(allocator: Allocator, appname: []const u8) ![]const u8 {
-    switch (@import("builtin").os.tag) {
-        .macos, .ios => {
-            const home = std.c.getenv("HOME") orelse return error.AppDataDirUnavailable;
-            return std.fs.path.join(allocator, &.{ std.mem.span(home), "Library", "Application Support", appname });
-        },
-        else => {
-            if (std.c.getenv("XDG_DATA_HOME")) |xdg| {
-                const x = std.mem.span(xdg);
-                if (x.len > 0) {
-                    return std.fs.path.join(allocator, &.{ x, appname });
-                }
-            }
-            const home = std.c.getenv("HOME") orelse return error.AppDataDirUnavailable;
-            return std.fs.path.join(allocator, &.{ std.mem.span(home), ".local", "share", appname });
-        },
-    }
+    return getAppDataDirWithOptions(allocator, appname, 0);
 }

@@ -54,7 +54,15 @@ pub fn init(opts: Options) !Platform {
     // 0 - threadpool size, 0 == let v8 decide
     // 1 - idle_task_support, 1 == enabled
     const handle = v8.v8__Platform__NewDefaultPlatform(0, 1).?;
-    v8.v8__V8__InitializePlatform(handle);
+    if (@import("lightpanda").RuntimeMemory.isManaged()) {
+        if (!@import("build_config").accounted_clone) return error.NativeHeapHooksMissing;
+        if (!lp_runtime_v8_install(handle)) {
+            v8.v8__Platform__DELETE(handle);
+            return error.NativeHeapAdmissionFailed;
+        }
+    } else {
+        v8.v8__V8__InitializePlatform(handle);
+    }
     v8.v8__V8__Initialize();
     return .{ .handle = handle };
 }
@@ -62,7 +70,10 @@ pub fn init(opts: Options) !Platform {
 pub fn deinit(self: Platform) void {
     _ = v8.v8__V8__Dispose();
     v8.v8__V8__DisposePlatform();
+    if (@import("build_config").accounted_clone) lp_runtime_v8_dispose();
     v8.v8__Platform__DELETE(self.handle);
 }
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, override: c_int) c_int;
+extern "c" fn lp_runtime_v8_install(*v8.Platform) bool;
+extern "c" fn lp_runtime_v8_dispose() void;

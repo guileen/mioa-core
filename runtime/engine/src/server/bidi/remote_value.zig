@@ -330,7 +330,7 @@ pub const Serializer = struct {
         ExecutionTerminated,
         MethodNotFound,
         DeadFunctionHandle,
-    };
+    } || @import("../../browser/TaskGate.zig").Error;
 
     fn remote(self: *Serializer, value: js.Value, depth: u32, own: bool) Error!Remote {
         var handle_id: ?u32 = null;

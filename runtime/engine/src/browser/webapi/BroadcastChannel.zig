@@ -85,8 +85,8 @@ pub fn postMessage(self: *BroadcastChannel, message: js.Value, exec: *Execution)
         try_catch.init(&ls.local);
         defer try_catch.deinit();
 
-        const cloned = message.structuredCloneTo(&ls.local) catch {
-            return error.DataClone;
+        const cloned = message.structuredCloneTo(&ls.local) catch |err| {
+            return if (err == error.JsException) error.DataClone else err;
         };
         break :blk try cloned.persist();
     };

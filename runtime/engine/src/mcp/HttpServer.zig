@@ -68,6 +68,9 @@ const Queue = struct {
     head: ?*Job = null,
     tail: ?*Job = null,
     closed: bool = false,
+    // While the worker waits in curl for a Profile event, queue producers
+    // wake the same multi handle. Protected by mutex, including teardown.
+    wake_client: ?*@import("../network/HttpClient.zig") = null,
 
     /// Callers push only to a listed worker, whose queue is still open.
     fn push(self: *Queue, job: *Job) void {
@@ -78,6 +81,7 @@ const Queue = struct {
         if (self.tail) |t| t.next = job else self.head = job;
         self.tail = job;
         self.cond.signal(lp.io);
+        if (self.wake_client) |client| client.handles.wakeup() catch {};
     }
 
     const Pop = union(enum) { job: *Job, timeout, closed };
@@ -111,6 +115,13 @@ const Queue = struct {
         defer self.mutex.unlock(lp.io);
         self.closed = true;
         self.cond.signal(lp.io);
+        if (self.wake_client) |client| client.handles.wakeup() catch {};
+    }
+
+    fn setWakeClient(self: *Queue, client: ?*@import("../network/HttpClient.zig")) void {
+        self.mutex.lockUncancelable(lp.io);
+        defer self.mutex.unlock(lp.io);
+        self.wake_client = client;
     }
 };
 
@@ -447,6 +458,11 @@ fn runWorker(worker: *Worker, start: ?*Start) void {
     };
     defer if (server) |s| s.deinit();
     if (server) |s| s.directory = self;
+    if (server) |s| {
+        if (s.profileEventFd() != null or s.active_session.session.profile_async_client != null)
+            worker.queue.setWakeClient(&s.active_session.session.browser.http_client);
+    }
+    defer worker.queue.setWakeClient(null);
     if (start) |st| {
         st.ok = server != null;
         st.done.set(lp.io);
@@ -460,19 +476,24 @@ fn runWorker(worker: *Worker, start: ?*Start) void {
     // throughput.
     var wait_ms: u64 = 0;
     while (true) {
-        const job = switch (worker.queue.pop(wait_ms)) {
+        const event_wait = if (server) |s| s.profileEventFd() != null or s.profileAsyncPollFd() != null else false;
+        const job = switch (worker.queue.pop(if (event_wait) 0 else wait_ms)) {
             .job => |job| job,
             .timeout => {
                 wait_ms = if (server) |s| s.idle() else 0;
-                const timeout = timeout_ms orelse continue;
-                const now = lp.datetime.milliTimestamp(.boot);
-                const idle_for = now -| idle_since;
-                if (idle_for < timeout) {
-                    wait_ms = @min(wait_ms, timeout - idle_for);
-                } else if (self.reap(worker)) {
-                    wait_ms = 0;
-                } else {
-                    idle_since = now;
+                if (timeout_ms) |timeout| {
+                    const now = lp.datetime.milliTimestamp(.boot);
+                    const idle_for = now -| idle_since;
+                    if (idle_for < timeout) {
+                        wait_ms = @min(wait_ms, timeout - idle_for);
+                    } else if (self.reap(worker)) {
+                        wait_ms = 0;
+                    } else {
+                        idle_since = now;
+                    }
+                }
+                if (event_wait and wait_ms > 0) {
+                    if (server) |s| s.waitProfileEvents(@intCast(@min(wait_ms, std.math.maxInt(u32))));
                 }
                 continue;
             },

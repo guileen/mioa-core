@@ -99,6 +99,7 @@ pub fn updateHoverTarget(frame: *Frame, to: ?*Element, emitter: anytype) void {
         return;
     }
     page.input_hover_target = to;
+    frame.hoverChanged();
     const from_owner = if (from) |el| el.ownerFrame(frame) else null;
     const to_owner = if (to) |el| el.ownerFrame(frame) else null;
     if (from_owner == to_owner) {
@@ -389,6 +390,7 @@ pub const PointerButtons = struct {
         const starts_gesture = self.held & ~bit == 0;
         self.down_target = target;
         self.held |= bit;
+        frame.styleChanged();
 
         var pg = g;
         pg.buttons_down = self.held;
@@ -405,7 +407,7 @@ pub const PointerButtons = struct {
         const click_target = if (self.down_target) |down| commonClickTarget(frame, down, target) else null;
         const was_suppressed = self.mousedown_suppressed;
         const was_pressed = self.down_target != null;
-        self.releaseButton(g.button);
+        self.releaseButton(frame, g.button);
 
         var rg = g;
         rg.buttons_down = self.held;
@@ -419,17 +421,19 @@ pub const PointerButtons = struct {
 
     /// Every release consumes the latest press, even if it hit no element.
     /// The last held button releasing also clears the gesture's suppression.
-    fn releaseButton(self: *PointerButtons, button: i32) void {
+    fn releaseButton(self: *PointerButtons, frame: *Frame, button: i32) void {
         self.down_target = null;
         self.held &= ~buttonsBitmask(button);
         if (self.held == 0) {
             self.mousedown_suppressed = false;
         }
+        frame.styleChanged();
     }
 
     /// Discards an in-progress gesture (a press that hit no element).
-    pub fn reset(self: *PointerButtons) void {
+    pub fn reset(self: *PointerButtons, frame: *Frame) void {
         self.* = .{};
+        frame.styleChanged();
     }
 };
 
@@ -659,7 +663,7 @@ pub fn triggerMousePress(frame: *Frame, x: f64, y: f64, button: i32, click_count
     setKeyboardModality(frame, false);
     const target = hit.target orelse {
         // Don't leave a prior gesture's state for the next message to misread.
-        frame.page.input_pointer.reset();
+        frame.page.input_pointer.reset(frame);
         return;
     };
     if (comptime lp.IS_DEBUG) {
@@ -708,11 +712,11 @@ pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_cou
     // A release that misses every element still lets go of the button, so
     // the next message doesn't read it as held.
     const hit = mouseHitTest(frame, x, y) catch |err| {
-        pointer.releaseButton(button);
+        pointer.releaseButton(frame, button);
         return err;
     };
     const target = hit.target orelse {
-        pointer.releaseButton(button);
+        pointer.releaseButton(frame, button);
         return;
     };
     if (comptime lp.IS_DEBUG) {
@@ -1132,11 +1136,12 @@ pub fn forgetFrame(frame: *Frame) void {
     if (page.input_hover_target) |el| {
         if (el.ownerFrame(frame) == frame) {
             page.input_hover_target = null;
+            frame.hoverChanged();
         }
     }
     if (page.input_pointer.down_target) |el| {
         if (el.ownerFrame(frame) == frame) {
-            page.input_pointer.reset();
+            page.input_pointer.reset(frame);
         }
     }
     const touch = &page.input_touch;

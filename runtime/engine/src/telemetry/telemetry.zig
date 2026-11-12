@@ -1,5 +1,6 @@
 const std = @import("std");
 const lp = @import("lightpanda");
+const EnvironmentApi = @import("environment_api");
 
 const App = @import("../App.zig");
 const uuidv4 = @import("../id.zig").uuidv4;
@@ -8,12 +9,21 @@ const log = lp.log;
 const IID_FILE = "iid";
 const Allocator = std.mem.Allocator;
 
-pub fn isDisabled() bool {
-    if (lp.IS_DEBUG or lp.IS_TEST) {
-        return true;
-    }
+fn disabledForEnvironment(status: c_int, present: c_int) bool {
+    return status != EnvironmentApi.MIOA_ENVIRONMENT_OK or present != 0;
+}
 
-    return std.c.getenv("LIGHTPANDA_DISABLE_TELEMETRY") != null;
+pub fn isDisabled() bool {
+    if (lp.IS_DEBUG or lp.IS_TEST) return true;
+    var present: c_int = 0;
+    const status = EnvironmentApi.mioa_environment_has_v1("LIGHTPANDA_DISABLE_TELEMETRY", &present);
+    return disabledForEnvironment(status, present);
+}
+
+test "telemetry opt-out is present-only and fails closed" {
+    try std.testing.expect(!disabledForEnvironment(EnvironmentApi.MIOA_ENVIRONMENT_OK, 0));
+    try std.testing.expect(disabledForEnvironment(EnvironmentApi.MIOA_ENVIRONMENT_OK, 1));
+    try std.testing.expect(disabledForEnvironment(EnvironmentApi.MIOA_ENVIRONMENT_INVALID, 0));
 }
 
 pub const Telemetry = TelemetryT(@import("lightpanda.zig"));

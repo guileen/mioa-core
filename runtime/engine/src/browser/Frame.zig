@@ -30,6 +30,7 @@ const ScriptManager = @import("ScriptManager.zig");
 const StyleManager = @import("StyleManager.zig");
 
 const Parser = @import("parser/Parser.zig");
+const NavigationParser = @import("parser/NavigationParser.zig");
 const h5e = @import("parser/html5ever.zig");
 
 const CustomElementReactions = @import("CustomElementReactions.zig");
@@ -101,6 +102,11 @@ _loader_id: u32,
 // over so that document's other history entries stay same-document with it.
 _history_document_id: u32,
 
+// A redirected response must never receive form data from a history entry.
+_history_restore_allowed: bool = false,
+// Network HTML commits history before the first script, not again at EOF.
+_navigation_restore_form: ?bool = null,
+
 page: *Page,
 
 _session: *Session,
@@ -149,6 +155,8 @@ _layout_digest: [32]u8 = undefined,
 _render_resources: std.StringHashMapUnmanaged([]const u8) = .empty,
 _render_resource_version: std.atomic.Value(u64) = .init(0),
 _native_render_revision: ?u64 = null,
+_native_guard_history: ?*@import("ExactVisualGuard.zig").History = null,
+_native_fingerprint_cache: ?@import("native_layout.zig").FingerprintCache = null,
 _site_icon: @import("frame/site_icon.zig").State = .{},
 _canvas_surfaces: std.ArrayList(*@import("webapi/canvas/context2d.zig").Surface) = .empty,
 _embedding_viewport: ?@import("Viewport.zig") = null,
@@ -228,6 +236,7 @@ _load_state: LoadState = .waiting,
 // navigation commits. null means the text/html default.
 _pending_content_type: ?[]const u8 = null,
 _parse_state: ParseState = .pre,
+_mime_prefix: std.ArrayList(u8) = .empty,
 
 /// `frameErrorCallback` swallows the failure into a placeholder page;
 /// callers that need to detect it read this.
@@ -927,6 +936,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
         .data_callback = frameDataCallback,
         .done_callback = frameDoneCallback,
         .error_callback = frameErrorCallback,
+        .streaming = true,
         // The frame tracks its navigation by id (_req_id), never by pointer.
         .shutdown_callback = HttpClient.noopShutdown,
     }, &self._http_owner);
@@ -1263,6 +1273,7 @@ pub fn discard(self: *Frame) !void {
         if (std.mem.findScalar(*Frame, parent.child_frames.items, self)) |idx| {
             // ordered, to keep child_frames_sorted valid
             _ = parent.child_frames.orderedRemove(idx);
+            parent.styleChanged();
         }
         self._session.notification.dispatch(.frame_child_frame_detached, &.{
             .parent_id = parent._frame_id,
@@ -1299,7 +1310,8 @@ fn neuter(self: *Frame) void {
     self.abortDocumentLoad();
     self.cancelQueuedNavigation();
     user_input.forgetFrame(self);
-    self._session.idb.detachContext(self.js);
+    if (self.window._cookie_store) |cs| cs.detach();
+    self.js.detachProfile();
     self.js.scheduler.reset();
     self.window._timers.reset();
 }
@@ -1320,6 +1332,9 @@ pub fn stopLoading(self: *Frame) void {
     // document.write until then.
     if (self.parserIsRunning()) {
         self.document._active_parser_aborted = true;
+        if (self._parse_state.html.stream) |stream| {
+            stream.parser.parser.terminated = true;
+        }
     } else if (self.document._script_created_parser) |parser| {
         if (parser.handle != null) self.document._active_parser_aborted = true;
     }
@@ -1342,9 +1357,8 @@ pub fn abortDocumentLoad(self: *Frame) void {
     self.document._load_aborted = true;
 }
 
-// The navigation parser is on the stack, i.e. an inline script is running from
-// inside parser.parse(). Narrower than `_load_state == .parsing`, which stays
-// true through deferred and async scripts.
+// A navigation parser remains active between network chunks as well as while
+// feeding inline scripts. It is distinct from deferred/async script loading.
 fn parserIsRunning(self: *const Frame) bool {
     return switch (self._parse_state) {
         .html => true,
@@ -1647,6 +1661,7 @@ fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.
         try self._session.commitPendingPage(self.page);
     }
 
+    self._history_restore_allowed = (transfer.redirectCount() orelse 1) == 0;
     const response_url = transfer.req.url;
     if (std.mem.eql(u8, response_url, self.url) == false) {
         // would be different than self.url in the case of a redirect
@@ -1879,8 +1894,22 @@ fn urlBasename(arena: Allocator, url: []const u8) !?[]const u8 {
 }
 
 fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
-    var self: *Frame = @ptrCast(@alignCast(transfer.req.ctx));
+    const self: *Frame = @ptrCast(@alignCast(transfer.req.ctx));
+    if (self._parse_state == .pre and transfer.contentType() == null and
+        (self._mime_prefix.items.len != 0 or (data.len < 512 and Mime.sniff(data) == null)))
+    {
+        const count = @min(512 - self._mime_prefix.items.len, data.len);
+        try self._mime_prefix.appendSlice(self.page_arena, data[0..count]);
+        if (self._mime_prefix.items.len < 512 and Mime.sniff(self._mime_prefix.items) == null) return;
+        try self.parseFrameData(transfer, self._mime_prefix.items);
+        self._mime_prefix.clearRetainingCapacity();
+        if (count != data.len) try self.parseFrameData(transfer, data[count..]);
+        return;
+    }
+    try self.parseFrameData(transfer, data);
+}
 
+fn parseFrameData(self: *Frame, transfer: *HttpClient.Transfer, data: []const u8) !void {
     if (self._parse_state == .pre) {
         // we lazily do this, because we might need the first chunk of data
         // to sniff the content type
@@ -1941,9 +1970,14 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
                     const name = info.name();
                     self.charset = if (html_prescan_found_charset and info.isUtf16()) "UTF-8" else name;
                 }
+                const arena = try self.getArena(.large, "Frame.navigate");
+                errdefer arena.release();
+                const stream = try arena.allocator().create(NavigationParser);
+                stream.* = NavigationParser.init(arena.allocator(), self, mime.is_default_charset and !html_prescan_found_charset);
                 self._parse_state = .{ .html = .{
                     .buffer = .empty,
-                    .arena = try self.getArena(.large, "Frame.navigate"),
+                    .arena = arena,
+                    .stream = stream,
                 } };
             },
             .text_xml, .other_xml => {
@@ -1957,6 +1991,7 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
                     .buffer = .empty,
                     .arena = try self.getArena(.large, "Frame.navigate"),
                     .xml = true,
+                    .xml_default_charset = mime.is_default_charset,
                 } };
             },
             .application_json, .text_javascript, .text_css, .text_plain, .text_markdown => {
@@ -1974,7 +2009,14 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
     }
 
     switch (self._parse_state) {
-        .html => |*html| try html.buffer.appendSlice(html.arena.allocator(), data),
+        .html => |*html| {
+            if (html.stream) |stream| {
+                _ = try self.commitNavigationForParse();
+                try stream.read(data);
+            } else {
+                try html.buffer.appendSlice(html.arena.allocator(), data);
+            }
+        },
         .text => |*buf| {
             // The payload is text, not markup: `&` has to be escaped too, or
             // the parser turns a literal "&#9733;" in the body into a star.
@@ -2013,15 +2055,31 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
     }
 }
 
+fn commitNavigationForParse(self: *Frame) !bool {
+    if (self._navigation_restore_form) |restore| return restore;
+    const navigation = self._session.navigationFor(self);
+    const restore = self.parent == null and self._history_restore_allowed and
+        self._last_navigate_error == null and
+        (if (navigation._current_navigation_kind) |kind| kind == .traverse else false);
+    try navigation.commitNavigation(self);
+    self._navigation_restore_form = restore;
+    return restore;
+}
+
 fn frameDoneCallback(ctx: *anyopaque) !void {
     var self: *Frame = @ptrCast(@alignCast(ctx));
+    if (self._parse_state == .pre and self._mime_prefix.items.len != 0) {
+        const transfer = self._session.browser.http_client.findTransfer(self._req_id) orelse return error.MissingTransfer;
+        try self.parseFrameData(transfer, self._mime_prefix.items);
+        self._mime_prefix.clearRetainingCapacity();
+    }
 
     if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "navigate done", .{ .type = self._type, .url = self.url });
     }
 
-    //We need to handle different navigation types differently.
-    try self._session.navigationFor(self).commitNavigation(self);
+    const navigation = self._session.navigationFor(self);
+    const restore_form = try self.commitNavigationForParse();
 
     if (self._pending_content_type) |content_type| {
         self.document._content_type = content_type;
@@ -2049,26 +2107,34 @@ fn frameDoneCallback(ctx: *anyopaque) !void {
                     self._parse_state = .complete;
                 }
 
-                const raw_html = html.buffer.items;
-
-                preload.prescan(self, raw_html);
-
-                if (html.xml) {
-                    const encoding = h5e.EncodingInfo.forLabel(self.charset) orelse h5e.EncodingInfo.utf8();
-                    const xml = try h5e.validUtf8(html.arena.allocator(), encoding, raw_html);
-                    if (Parser.isWellFormedXML(xml)) {
-                        parser.parseXML(xml);
-                    } else {
-                        log.info(.frame, "malformed xml parsed as html", .{ .url = self.url });
-                        // try to pass it through the HTML parser
-                        parser.parse(xml);
-                    }
-                } else if (std.mem.eql(u8, self.charset, "UTF-8")) {
-                    parser.parse(raw_html);
+                if (html.stream) |stream| {
+                    defer stream.deinit();
+                    try stream.done();
                 } else {
-                    parser.parseWithEncoding(raw_html, self.charset);
+                    const raw_html = html.buffer.items;
+                    preload.prescan(self, raw_html);
+                    if (html.xml) {
+                        if (html.xml_default_charset) {
+                            if (h5e.EncodingInfo.forLabel(Mime.xmlDeclarationEncoding(raw_html))) |info| {
+                                self.charset = info.name();
+                            }
+                        }
+                        const encoding = h5e.EncodingInfo.forLabel(self.charset) orelse h5e.EncodingInfo.utf8();
+                        const xml = try h5e.validUtf8(html.arena.allocator(), encoding, raw_html);
+                        if (Parser.isWellFormedXML(xml)) {
+                            parser.parseXML(xml);
+                        } else {
+                            log.info(.frame, "malformed xml parsed as html", .{ .url = self.url });
+                            parser.parse(xml);
+                        }
+                    } else if (std.mem.eql(u8, self.charset, "UTF-8")) {
+                        parser.parse(raw_html);
+                    } else {
+                        parser.parseWithEncoding(raw_html, self.charset);
+                    }
                 }
             }
+            if (restore_form and self._last_navigate_error == null) navigation.restoreTraversedForm(self);
             self._script_manager.staticScriptsDone();
         },
         .text => |*buf| {
@@ -2148,6 +2214,14 @@ fn frameDoneCallback(ctx: *anyopaque) !void {
 
 fn frameErrorCallback(ctx: *anyopaque, err: anyerror) void {
     var self: *Frame = @ptrCast(@alignCast(ctx));
+    // Stopping a progressively parsed document preserves its visible prefix.
+    // Delivery defers this callback until an active parser feed has unwound.
+    if (err == error.TransferCanceled and self._parse_state == .html and self._parse_state.html.stream != null) {
+        frameDoneCallback(ctx) catch |e| {
+            log.err(.browser, "stopped document", .{ .err = e, .url = self.url });
+        };
+        return;
+    }
 
     self._last_navigate_error = err;
     log.debug(.frame, "navigate failed", .{ .err = err, .type = self._type, .url = self.url });
@@ -2364,6 +2438,7 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
     // (about:blank, blob:) and the notifications they dispatch can see this
     // frame in self.child_frames.
     try self.child_frames.append(self.page_arena, new_frame);
+    self.styleChanged();
 
     // navigate() may run JS that reads window[N]; flag the list unsorted until
     // we've verified ordering post-navigate.
@@ -2389,6 +2464,7 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
         // (which I don't think is possible)
         if (std.mem.findScalar(*Frame, self.child_frames.items, new_frame)) |idx| {
             _ = self.child_frames.swapRemove(idx);
+            self.styleChanged();
         }
         log.debug(.frame, "iframe navigate failure", .{ .url = url, .err = err });
         if (delays_load) {
@@ -2437,9 +2513,8 @@ const OpenPopupOpts = struct {
     opener: ?*Window,
 };
 
-// Create a new top-level browsing context as a sibling of the root frame.
-// The popup shares the Page's arena, factory, and identity map, but has no
-// parent and is not attached to the frame tree — it lives in page.popups.
+// Noopener contexts own an independent Page/target. Opener-bearing popups keep
+// stable Window pointers in the creator's Page until WindowProxy is supported.
 pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
     const page = self.page;
     const session = self._session;
@@ -2463,6 +2538,15 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
         };
         break :blk try URL.resolve(self.call_arena, frame_base, opts.url, .{ .encoding = self.charset });
     };
+
+    if (opts.opener == null) {
+        const handle = try session.createAuxiliaryPage();
+        errdefer handle.close();
+        const popup = handle.frame().?;
+        popup.window._name = try popup.page.arena.dupe(u8, opts.name);
+        try popup.navigate(resolved_url, .{ .reason = .script, .initiator_origin = self.origin });
+        return popup;
+    }
 
     const popup = try page.arena.create(Frame);
     errdefer page.arena.destroy(popup);
@@ -2523,6 +2607,19 @@ pub fn renderingChanged(self: *Frame) void {
 /// result, including non-tree state that live collections never see.
 pub fn styleChanged(self: *Frame) void {
     self.page.style_version += 1;
+    self.page.visualChanged();
+}
+
+/// A hover-target change. It can only alter computed styles through a `:hover`
+/// selector, so with no such rule loaded the document-wide relayout+repaint the
+/// cascade bump forces would be pure waste. Hover state reaching the tree by
+/// other means (inline style writes, class mutations) still goes through
+/// styleChanged on its own.
+pub fn hoverChanged(self: *Frame) void {
+    if (self.page.hover_style == .absent) {
+        return;
+    }
+    self.styleChanged();
 }
 
 fn getIdMap(frame: *Frame, node: *Node) *IdMap {
@@ -2842,6 +2939,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     sheet._href = try self.page_arena.dupe(u8, resolved);
     try self._render_resources.put(self.page_arena, try self.page_arena.dupe(u8, resolved), try self.page_arena.dupe(u8, response.body.items));
     _ = self._render_resource_version.fetchAdd(1, .release);
+    self.page.visualChanged();
 
     try self.queueLinkEvent(link, .load, generation);
 }
@@ -3797,6 +3895,8 @@ const ParseState = union(enum) {
     html: struct {
         arena: *lp.Arena,
         xml: bool = false,
+        xml_default_charset: bool = false,
+        stream: ?*NavigationParser = null,
         buffer: std.ArrayList(u8),
     },
     text: std.ArrayList(u8),
@@ -3807,7 +3907,10 @@ const ParseState = union(enum) {
 
     fn deinit(self: *ParseState, _: *Frame) void {
         switch (self.*) {
-            .html => |html| html.arena.release(),
+            .html => |html| {
+                if (html.stream) |stream| stream.deinit();
+                html.arena.release();
+            },
             // Only reached when a frame is torn down mid-download (the normal
             // completion path in frameDoneCallback already closes the file and
             // transitions to .complete).
@@ -4248,6 +4351,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         }
         break :blk form_element.getAttributeInterned("action") orelse self.url;
     };
+    if (action.len == 0) action = self.url;
 
     var opts = NavigateOpts{
         .reason = .form,

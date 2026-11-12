@@ -68,6 +68,13 @@ fn getCookies(cmd: *CDP.Command) !void {
             return error.UnknownBrowserContextId;
         }
     }
+    if (bc.session.cookie_jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.cdp_get", .{ .urls = @as(?[]const []const u8, null) });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .array) return error.ProfileProtocolError;
+        return cmd.sendResult(.{ .cookies = result }, .{});
+    }
     try bc.session.cookie_jar.removeExpired(null);
     const writer = CookieWriter{ .cookies = bc.session.cookie_jar.cookies.items };
     try cmd.sendResult(.{ .cookies = writer }, .{});
@@ -151,6 +158,15 @@ pub fn setCdpCookies(cookie_jar: *CookieJar, params: []const CdpCookie) !usize {
 
     for (params) |param| {
         cookies.appendAssumeCapacity(try buildCdpCookie(cookie_jar.allocator, param));
+    }
+    if (cookie_jar.profile_client) |client| {
+        for (cookies.items) |*cookie| cookie.deinit();
+        added = cookies.items.len;
+        const reply = try client.request(cookie_jar.allocator, "cookies.cdp_set", .{ .cookies = params });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .integer or result.integer < 0) return error.ProfileProtocolError;
+        return @intCast(result.integer);
     }
 
     const now = lp.datetime.timestamp(.real);

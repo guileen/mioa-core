@@ -20,6 +20,16 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 pub const c = @import("sqlite3");
+// Preserve SQLite's real copy sentinel behind a C ABI adapter, without giving
+// Zig an invalidly aligned function pointer.
+extern "c" fn lp_sqlite_bind_blob_copy(*c.sqlite3_stmt, c_int, ?*const anyopaque, c_int) c_int;
+extern "c" fn lp_sqlite_bind_text_copy(*c.sqlite3_stmt, c_int, [*]const u8, c_int) c_int;
+extern "c" fn lp_sqlite_runtime_memory_init() c_int;
+
+pub fn installRuntimeAllocator() !void {
+    if (!lp.RuntimeMemory.isManaged()) return;
+    if (lp_sqlite_runtime_memory_init() != c.SQLITE_OK) return error.SqliteAllocatorInitializationFailed;
+}
 
 const log = lp.log;
 
@@ -84,6 +94,8 @@ pub const Migrations = struct {
 
 pub const Conn = struct {
     conn: *c.sqlite3,
+    // Streaming owner RPCs cannot retain the caller's short-lived input.
+    copy_rows: bool = false,
 
     pub fn open(path: [:0]const u8) !Conn {
         var conn: ?*c.sqlite3 = null;
@@ -93,6 +105,16 @@ pub const Conn = struct {
             if (conn) |connection| {
                 _ = c.sqlite3_close_v2(connection);
             }
+            return errorFromCode(rc);
+        }
+        return .{ .conn = conn.? };
+    }
+
+    pub fn openReadOnly(path: [:0]const u8) !Conn {
+        var conn: ?*c.sqlite3 = null;
+        const rc = c.sqlite3_open_v2(path.ptr, &conn, c.SQLITE_OPEN_READONLY, null);
+        if (rc != c.SQLITE_OK) {
+            if (conn) |connection| _ = c.sqlite3_close_v2(connection);
             return errorFromCode(rc);
         }
         return .{ .conn = conn.? };
@@ -150,7 +172,7 @@ pub const Conn = struct {
     pub fn rows(self: Conn, sql: []const u8, values: anytype) !Rows {
         const stmt = try self.prepare(sql);
         errdefer stmt.deinit();
-        try stmt.bind(values);
+        if (self.copy_rows) try stmt.bindCopy(values) else try stmt.bind(values);
         return .{ .stmt = stmt };
     }
 
@@ -210,7 +232,12 @@ const Statement = struct {
     pub fn bind(self: Statement, values: anytype) !void {
         const stmt = self.stmt;
         inline for (values, 0..) |value, i| {
-            try _bind(@TypeOf(value), stmt, value, i + 1);
+            try _bind(@TypeOf(value), stmt, value, i + 1, false);
+        }
+    }
+    fn bindCopy(self: Statement, values: anytype) !void {
+        inline for (values, 0..) |value, i| {
+            try _bind(@TypeOf(value), self.stmt, value, i + 1, true);
         }
     }
 
@@ -289,7 +316,7 @@ const Statement = struct {
         }
     }
 
-    fn _bind(comptime T: type, stmt: *c.sqlite3_stmt, value: anytype, bind_index: c_int) !void {
+    fn _bind(comptime T: type, stmt: *c.sqlite3_stmt, value: anytype, bind_index: c_int, copy: bool) !void {
         var rc: c_int = 0;
 
         switch (@typeInfo(T)) {
@@ -305,7 +332,7 @@ const Statement = struct {
             },
             .@"struct" => {
                 if (T == Blob) {
-                    rc = c.sqlite3_bind_blob(stmt, bind_index, value.data.ptr, @intCast(value.data.len), c.SQLITE_STATIC);
+                    rc = if (copy) lp_sqlite_bind_blob_copy(stmt, bind_index, value.data.ptr, @intCast(value.data.len)) else c.sqlite3_bind_blob(stmt, bind_index, value.data.ptr, @intCast(value.data.len), c.SQLITE_STATIC);
                 } else {
                     bindError(T);
                 }
@@ -315,7 +342,7 @@ const Statement = struct {
                     .one => switch (@typeInfo(ptr.child)) {
                         .array => |arr| {
                             if (arr.child == u8) {
-                                rc = c.sqlite3_bind_text(stmt, bind_index, value.ptr, @intCast(value.len), c.SQLITE_STATIC);
+                                rc = if (copy) lp_sqlite_bind_text_copy(stmt, bind_index, value.ptr, @intCast(value.len)) else c.sqlite3_bind_text(stmt, bind_index, value.ptr, @intCast(value.len), c.SQLITE_STATIC);
                             } else {
                                 bindError(T);
                             }
@@ -323,7 +350,7 @@ const Statement = struct {
                         else => bindError(T),
                     },
                     .slice => switch (ptr.child) {
-                        u8 => rc = c.sqlite3_bind_text(stmt, bind_index, value.ptr, @intCast(value.len), c.SQLITE_STATIC),
+                        u8 => rc = if (copy) lp_sqlite_bind_text_copy(stmt, bind_index, value.ptr, @intCast(value.len)) else c.sqlite3_bind_text(stmt, bind_index, value.ptr, @intCast(value.len), c.SQLITE_STATIC),
                         else => bindError(T),
                     },
                     else => bindError(T),
@@ -340,7 +367,7 @@ const Statement = struct {
             },
             .optional => |opt| {
                 if (value) |v| {
-                    return _bind(opt.child, stmt, v, bind_index);
+                    return _bind(opt.child, stmt, v, bind_index, copy);
                 } else {
                     rc = c.sqlite3_bind_null(stmt, bind_index);
                 }
@@ -358,7 +385,7 @@ const Statement = struct {
     }
 };
 
-const Row = struct {
+pub const Row = struct {
     stmt: Statement,
 
     pub fn deinit(self: Row) void {

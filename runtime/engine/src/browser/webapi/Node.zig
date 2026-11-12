@@ -1378,6 +1378,7 @@ fn _normalize(self: *Node, allocator: Allocator, buffer: *std.ArrayList(u8), fra
         };
 
         if (text_node.asCData().getData().len == 0) {
+            if (self.ownerFrame(frame)) |owner| owner.domChanged();
             frame.removeNode(self, current_node, .{ .reconnect_to = null });
             child = next_node;
             continue;
@@ -1385,6 +1386,7 @@ fn _normalize(self: *Node, allocator: Allocator, buffer: *std.ArrayList(u8), fra
 
         if (next_node) |next| {
             if (next.is(CData.Text)) |_| {
+                if (self.ownerFrame(frame)) |owner| owner.domChanged();
                 try buffer.appendSlice(allocator, text_node.ownData());
 
                 while (next_node) |node_to_merge| {
@@ -2019,4 +2021,22 @@ test "Node: text chain slot size" {
     const Text = @import("cdata/Text.zig");
     const slot = comptime Factory.chainOffsetOf(Text, Text) + @sizeOf(Text);
     try testing.expectEqual(if (comptime lp.IS_DEBUG) 104 else 73, slot);
+}
+
+test "Node: normalization and empty shadow roots advance visual state" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const host = try frame.document.createElement("div", null, frame);
+    _ = try frame.document.asNode().appendChild(host.asNode(), frame);
+    const first = try Frame.node_factory.createTextNode(frame.document, "first");
+    const second = try Frame.node_factory.createTextNode(frame.document, "second");
+    _ = try host.asNode().appendChild(first, frame);
+    _ = try host.asNode().appendChild(second, frame);
+    const before = frame.page.visual_generation.load(.acquire);
+    try host.asNode().normalize(frame);
+    try testing.expect(frame.page.visual_generation.load(.acquire) > before);
+    try testing.expectEqual("firstsecond", first.getData().str());
+    const normalized = frame.page.visual_generation.load(.acquire);
+    _ = try host.attachShadow(.{ .mode = .closed }, frame);
+    try testing.expect(frame.page.visual_generation.load(.acquire) > normalized);
 }

@@ -30,6 +30,8 @@ local: *const js.Local,
 handle: *const v8.Script,
 
 pub fn run(self: Script) !js.Value {
+    try @import("../TaskGate.zig").enter();
+    defer @import("../TaskGate.zig").exit();
     // See Function._tryCallWithThis for why a pending termination blocks V8
     // entry and is distinct from a JS throw.
     const env = self.local.ctx.env;

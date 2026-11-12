@@ -23,6 +23,8 @@ const builtin = @import("builtin");
 const App = @import("../App.zig");
 const Config = @import("../Config.zig");
 const sys_net = @import("../sys/net.zig");
+const EnvironmentApi = @import("environment_api");
+const ThreadApi = @import("thread_api");
 
 const CDP = @import("cdp/CDP.zig");
 const BiDi = @import("bidi/BiDi.zig");
@@ -62,6 +64,7 @@ app: *App,
 io_engine: IOEngine,
 listener: posix.socket_t,
 unix_path: ?[:0]const u8,
+trusted_cdp_host: ?TrustedCdpHost,
 
 listener_paused: bool,
 
@@ -135,9 +138,60 @@ pub const Address = union(enum) {
     unix: [:0]const u8, // Absolute path, validated by Config
 };
 
+const TrustedCdpHost = struct { pid: i32, uid: u32, version: i32 };
+extern "c" fn lp_trusted_cdp_peer(c_int, i32, u32, i32) bool;
+
+fn environmentSnapshot(name: [*:0]const u8) !?EnvironmentApi.mioa_environment_value_v1 {
+    var value: EnvironmentApi.mioa_environment_value_v1 = .{ .value = null, .length = 0 };
+    switch (EnvironmentApi.mioa_environment_get_v1(name, &value)) {
+        EnvironmentApi.MIOA_ENVIRONMENT_OK => return value,
+        EnvironmentApi.MIOA_ENVIRONMENT_MISSING => return null,
+        EnvironmentApi.MIOA_ENVIRONMENT_NO_MEMORY => return error.OutOfMemory,
+        else => return error.InvalidEnvironment,
+    }
+}
+
+fn releaseEnvironmentSnapshot(value: *?EnvironmentApi.mioa_environment_value_v1) void {
+    if (value.*) |*snapshot| EnvironmentApi.mioa_environment_value_release_v1(snapshot);
+    value.* = null;
+}
+
+fn parseTrustedCdpHostValues(
+    pid: ?[]const u8,
+    uid: ?[]const u8,
+    version: ?[]const u8,
+) !?TrustedCdpHost {
+    if (pid == null and uid == null and version == null) return null;
+    const pid_text = pid orelse return error.InvalidTrustedCdpHost;
+    const uid_text = uid orelse return error.InvalidTrustedCdpHost;
+    const version_text = version orelse return error.InvalidTrustedCdpHost;
+    const parsed_pid = std.fmt.parseInt(i32, pid_text, 10) catch return error.InvalidTrustedCdpHost;
+    const parsed_uid = std.fmt.parseInt(u32, uid_text, 10) catch return error.InvalidTrustedCdpHost;
+    const parsed_version = std.fmt.parseInt(i32, version_text, 10) catch return error.InvalidTrustedCdpHost;
+    if (parsed_pid <= 0) return error.InvalidTrustedCdpHost;
+    return .{ .pid = parsed_pid, .uid = parsed_uid, .version = parsed_version };
+}
+
+fn trustedCdpHost(address: Address) !?TrustedCdpHost {
+    var pid_env = try environmentSnapshot("MIOA_TRUSTED_RASTER_HOST_PID");
+    defer releaseEnvironmentSnapshot(&pid_env);
+    var uid_env = try environmentSnapshot("MIOA_TRUSTED_RASTER_HOST_UID");
+    defer releaseEnvironmentSnapshot(&uid_env);
+    var version_env = try environmentSnapshot("MIOA_TRUSTED_RASTER_HOST_VERSION");
+    defer releaseEnvironmentSnapshot(&version_env);
+    const pid = if (pid_env) |value| value.value[0..value.length] else null;
+    const uid = if (uid_env) |value| value.value[0..value.length] else null;
+    const version = if (version_env) |value| value.value[0..value.length] else null;
+    if (pid == null and uid == null and version == null) return null;
+    if (comptime builtin.os.tag != .macos) return error.UnsupportedTrustedCdp;
+    if (address != .unix) return error.TrustedCdpRequiresUnixSocket;
+    return parseTrustedCdpHostValues(pid, uid, version);
+}
+
 pub fn init(app: *App, address: Address) !*Server {
     const config = app.config;
     const allocator = app.allocator;
+    const trusted_cdp_host = try trustedCdpHost(address);
 
     const io_engine = try IOEngine.init();
     errdefer io_engine.deinit();
@@ -222,6 +276,7 @@ pub fn init(app: *App, address: Address) !*Server {
         .io_engine = io_engine,
         .listener = listener,
         .unix_path = unix_path,
+        .trusted_cdp_host = trusted_cdp_host,
         .listener_paused = false,
         .scratch = scratch,
         .request_arena = std.heap.ArenaAllocator.init(allocator),
@@ -432,6 +487,14 @@ fn accept(self: *Server, now: u64) !void {
             }
         };
         errdefer sys_net.close(socket);
+        if (comptime builtin.os.tag == .macos) {
+            if (self.trusted_cdp_host) |host| {
+                if (!lp_trusted_cdp_peer(socket, host.pid, host.uid, host.version)) {
+                    sys_net.close(socket);
+                    continue;
+                }
+            }
+        }
         // A Unix socket has neither TCP options nor a peer IP.
         var peer: sys_net.IpAddress = .{ .ip4 = .unspecified(0) };
         if (self.unix_path == null) {
@@ -611,6 +674,7 @@ pub fn spawnWorker(self: *Server, protocol: Driver.Protocol, origin: Worker.Orig
             .socket => null,
             .session => |id| id,
         },
+        .spawn_origin = origin,
     };
     self.workers.append(&worker.node);
     if (origin == .session) {
@@ -623,13 +687,16 @@ pub fn spawnWorker(self: *Server, protocol: Driver.Protocol, origin: Worker.Orig
     lp.metrics.serve_active_connections.incr(protocol);
 
     self.worker_wg.start();
-    const thread = std.Thread.spawn(.{}, Worker.start, .{ worker, origin }) catch |err| {
-        // cleanup what we just did prior to spawning.
+    const status = ThreadApi.mioa_thread_start_detached_v1(Worker.startEntry, @ptrCast(worker));
+    if (status != ThreadApi.MIOA_THREAD_OK) {
         self.worker_wg.finish();
         self.releaseWorkerSlot(worker);
-        return err;
-    };
-    thread.detach();
+        return switch (status) {
+            ThreadApi.MIOA_THREAD_NO_MEMORY => error.OutOfMemory,
+            ThreadApi.MIOA_THREAD_START_FAILED => error.ThreadStartFailed,
+            else => unreachable,
+        };
+    }
     return worker;
 }
 
@@ -1395,6 +1462,9 @@ pub const Worker = struct {
     // HTTP WebDriver session id, null for cdp and bidi-only workers.
     session_id: ?[36]u8 = null,
 
+    // Startup input is independent of session_id, which the loop may clear.
+    spawn_origin: Origin = undefined,
+
     // A HTTP session without a link is reaped at this time, and threads
     // `idle_sessions` until then. Null while a link is attached (TCP
     // keepalive covers a dead peer then).
@@ -1460,6 +1530,11 @@ pub const Worker = struct {
     }
 
     // -- Worker thread from here down --
+
+    fn startEntry(context: ?*anyopaque) callconv(.c) void {
+        const worker: *Worker = @ptrCast(@alignCast(context.?));
+        worker.start(worker.spawn_origin);
+    }
 
     // The origin travels as an argument: the loop owns session_id and may
     // clear it while the thread starts up.
@@ -1570,6 +1645,19 @@ const WorkerRequest = struct {
 };
 
 const testing = @import("../testing.zig");
+test "server: trusted raster host metadata requires a complete valid tuple" {
+    try testing.expect((try parseTrustedCdpHostValues(null, null, null)) == null);
+    try testing.expectError(error.InvalidTrustedCdpHost, parseTrustedCdpHostValues("42", null, "1"));
+    try testing.expectError(error.InvalidTrustedCdpHost, parseTrustedCdpHostValues("", "501", "1"));
+    try testing.expectError(error.InvalidTrustedCdpHost, parseTrustedCdpHostValues("not-pid", "501", "1"));
+    try testing.expectError(error.InvalidTrustedCdpHost, parseTrustedCdpHostValues("0", "501", "1"));
+
+    const host = (try parseTrustedCdpHostValues("42", "501", "1")) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i32, 42), host.pid);
+    try testing.expectEqual(@as(u32, 501), host.uid);
+    try testing.expectEqual(@as(i32, 1), host.version);
+}
+
 test "server: buildJSONVersionResponse" {
     const res = try http.buildJSONVersionResponse(testing.test_app, "ws://127.0.0.1:9222/");
     defer testing.test_app.allocator.free(res);

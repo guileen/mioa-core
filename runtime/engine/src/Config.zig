@@ -19,6 +19,19 @@
 const std = @import("std");
 const zenai = @import("zenai");
 const lp = @import("lightpanda");
+pub const EnvironmentApi = @import("environment_api");
+const ProcessApi = @import("process_api");
+
+pub const ExecutablePathApi = struct {
+    pub const mioa_executable_path_value_v1 = extern struct {
+        path: [*c]u8,
+        length: usize,
+    };
+    pub const MIOA_EXECUTABLE_PATH_OK: c_int = 0;
+    pub const MIOA_EXECUTABLE_PATH_NO_MEMORY: c_int = 3;
+    pub extern "c" fn mioa_executable_path_get_v1(*mioa_executable_path_value_v1) c_int;
+    pub extern "c" fn mioa_executable_path_value_release_v1(*mioa_executable_path_value_v1) void;
+};
 
 const cli = @import("cli.zig");
 const string = @import("string.zig");
@@ -610,9 +623,13 @@ fn fileSha256Hex(path: []const u8, minimum_bytes: u64) ![64]u8 {
 fn validateAssets(allocator: Allocator, e: *Environment) !void {
     // Bind the receipt to the executable actually running, not a claimed
     // runtime.binary path or a syntactically valid but unverified digest.
-    const executable = try std.process.executablePathAlloc(lp.io, allocator);
-    defer allocator.free(executable);
-    const executable_hex = try fileSha256Hex(executable, 1);
+    var executable: ExecutablePathApi.mioa_executable_path_value_v1 = .{ .path = null, .length = 0 };
+    const executable_status = ExecutablePathApi.mioa_executable_path_get_v1(&executable);
+    if (executable_status != ExecutablePathApi.MIOA_EXECUTABLE_PATH_OK) {
+        return if (executable_status == ExecutablePathApi.MIOA_EXECUTABLE_PATH_NO_MEMORY) error.OutOfMemory else error.invalid_config;
+    }
+    defer ExecutablePathApi.mioa_executable_path_value_release_v1(&executable);
+    const executable_hex = try fileSha256Hex(executable.path[0..executable.length], 1);
     if (!std.mem.eql(u8, e.runtime.artifact_sha256, &executable_hex)) return error.invalid_config;
     const Font = struct { path: []const u8, sha256: []const u8 };
     const fonts = try allocator.alloc(Font, e.asset_paths.fonts.len);
@@ -712,8 +729,13 @@ pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
                     }
                     const terminated = try allocator.dupeSentinel(u8, name, 0);
                     defer allocator.free(terminated);
-                    const value = std.c.getenv(terminated.ptr) orelse return error.invalid_config;
-                    opts.http_proxy = try allocator.dupeSentinel(u8, std.mem.span(value), 0);
+                    var environment_value: EnvironmentApi.mioa_environment_value_v1 = .{ .value = null, .length = 0 };
+                    const status = EnvironmentApi.mioa_environment_get_v1(terminated.ptr, &environment_value);
+                    if (status != EnvironmentApi.MIOA_ENVIRONMENT_OK) {
+                        return if (status == EnvironmentApi.MIOA_ENVIRONMENT_NO_MEMORY) error.OutOfMemory else error.invalid_config;
+                    }
+                    defer EnvironmentApi.mioa_environment_value_release_v1(&environment_value);
+                    opts.http_proxy = try allocator.dupeSentinel(u8, environment_value.value[0..environment_value.length], 0);
                 }
                 if (opts.http_proxy) |proxy| {
                     for (proxy) |character| if (character <= 0x20 or character == 0x7f) return error.invalid_config;
@@ -1410,12 +1432,12 @@ pub fn printUsageAndExit(self: *const Config, allocator: Allocator, help_for: Ru
     defer allocator.free(text);
 
     if (success) {
-        printPaged(allocator, text);
-        return std.process.cleanExit(lp.io);
+        printPaged(text);
+        return ProcessApi.mioa_process_flush_v1();
     }
     var stderr = std.Io.File.stderr().writerStreaming(lp.io, &.{});
     stderr.interface.writeAll(text) catch {};
-    std.process.exit(1);
+    ProcessApi.mioa_process_exit_v1(1);
 }
 
 fn printPlain(text: []const u8) void {
@@ -1425,51 +1447,56 @@ fn printPlain(text: []const u8) void {
 
 /// Pages explicitly requested help through $PAGER (fallback: less) when
 /// stdout is an interactive terminal; prints plainly otherwise.
-fn printPaged(allocator: Allocator, text: []const u8) void {
+fn printPaged(text: []const u8) void {
     const is_tty = std.Io.File.stdout().isTty(lp.io) catch false;
     if (!is_tty) {
         return printPlain(text);
     }
-    const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else "";
+    var term_value: EnvironmentApi.mioa_environment_value_v1 = .{ .value = null, .length = 0 };
+    const term_status = EnvironmentApi.mioa_environment_get_v1("TERM", &term_value);
+    defer EnvironmentApi.mioa_environment_value_release_v1(&term_value);
+    if (term_status != EnvironmentApi.MIOA_ENVIRONMENT_OK and term_status != EnvironmentApi.MIOA_ENVIRONMENT_MISSING) {
+        return printPlain(text);
+    }
+    const term = if (term_status == EnvironmentApi.MIOA_ENVIRONMENT_OK)
+        term_value.value[0..term_value.length]
+    else
+        "";
     if (term.len == 0 or std.mem.eql(u8, term, "dumb")) {
         return printPlain(text);
     }
 
-    const pager = if (std.c.getenv("PAGER")) |p| std.mem.span(p) else "";
-    const argv: []const []const u8 = if (pager.len > 0)
-        &.{ "/bin/sh", "-c", pager }
+    var pager_value: EnvironmentApi.mioa_environment_value_v1 = .{ .value = null, .length = 0 };
+    const pager_status = EnvironmentApi.mioa_environment_get_v1("PAGER", &pager_value);
+    defer EnvironmentApi.mioa_environment_value_release_v1(&pager_value);
+    if (pager_status != EnvironmentApi.MIOA_ENVIRONMENT_OK and pager_status != EnvironmentApi.MIOA_ENVIRONMENT_MISSING) {
+        return printPlain(text);
+    }
+    const pager = if (pager_status == EnvironmentApi.MIOA_ENVIRONMENT_OK)
+        pager_value.value[0..pager_value.length]
     else
-        &.{ "less", "-FIRX" };
+        "";
 
-    // Pass the real environment so the pager sees TERM/LESS.
-    var environ_map = lp.environMap(allocator) catch return printPlain(text);
-    defer environ_map.deinit();
-
-    // lp.io cannot spawn children: failing allocator, empty environ (no PATH).
-    var pager_threaded: std.Io.Threaded = .init(allocator, .{ .environ = lp.environ() });
-    defer pager_threaded.deinit();
-    const pager_io = pager_threaded.io();
-
-    var child = std.process.spawn(pager_io, .{
-        .argv = argv,
-        .environ_map = &environ_map,
-        .stdin = .pipe,
-    }) catch return printPlain(text);
-
-    if (child.stdin) |stdin| {
-        var writer = stdin.writerStreaming(pager_io, &.{});
-        // A write error here is the pager exiting early (user quit, or the
-        // command failed) — wait() below decides which.
-        writer.interface.writeAll(text) catch {};
-        stdin.close(pager_io);
-        child.stdin = null;
+    var argv_storage: [3][*c]const u8 = undefined;
+    var argc: usize = 0;
+    if (pager.len > 0) {
+        argv_storage[0] = "/bin/sh";
+        argv_storage[1] = "-c";
+        argv_storage[2] = pager_value.value;
+        argc = 3;
+    } else {
+        argv_storage[0] = "less";
+        argv_storage[1] = "-FIRX";
+        argc = 2;
     }
 
-    const term_result = child.wait(pager_io) catch return printPlain(text);
-    const clean_exit = term_result == .exited and term_result.exited == 0;
-    // Quitting the pager early is still exit 0; a non-zero exit means the
-    // pager failed (e.g. $PAGER not found) and the help was never shown.
-    if (!clean_exit) {
+    const status = ProcessApi.mioa_process_run_with_stdin_v1(
+        argv_storage[0..argc].ptr,
+        argc,
+        text.ptr,
+        text.len,
+    );
+    if (status != ProcessApi.MIOA_PROCESS_OK) {
         printPlain(text);
     }
 }

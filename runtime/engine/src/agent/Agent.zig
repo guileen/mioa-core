@@ -19,6 +19,7 @@
 const std = @import("std");
 const zenai = @import("zenai");
 const lp = @import("lightpanda");
+const EnvironmentApi = lp.Config.EnvironmentApi;
 const browser_tools = lp.tools;
 const BrowserTool = browser_tools.Tool;
 const ProviderTool = zenai.provider.Tool;
@@ -153,6 +154,8 @@ ai_client: ?zenai.provider.Client,
 /// The active LLM credential (null = LLM disabled). The AI client borrows
 /// its key, so deinit only after the client is gone.
 credential: ?settings.Credential,
+/// OS-owned environment snapshot borrowed by `ai_client`; release after teardown.
+hf_bill_to: ?EnvironmentApi.mioa_environment_value_v1,
 /// App data dir (owned by `App`, which outlives the agent), used to cache the
 /// models.dev catalog. Null when no data dir is available.
 app_dir: ?[]const u8,
@@ -375,7 +378,9 @@ pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent
         .one_shot_save = opts.save,
         .one_shot_attachments = if (opts.attach.items.len == 0) null else opts.attach.items,
         .available_providers = available_providers,
+        .hf_bill_to = null,
     };
+    errdefer releaseHfBillTo(&self.hf_bill_to);
     errdefer self.terminal.deinit();
     errdefer self.conversation.deinit();
     self.terminal.installLogSink();
@@ -383,8 +388,9 @@ pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent
 
     try self.ts.init(app);
     errdefer self.ts.deinit();
+    if (self.credential) |c| self.hf_bill_to = try acquireHfBillTo(c.provider);
 
-    self.ai_client = if (self.credential) |*c| try zenai.provider.Client.init(lp.io, allocator, c.provider, c.keySlice(), .{ .base_url = opts.base_url, .retry_policy = .long_running, .bill_to = hfBillTo(c.provider), .environ = lp.environ(), .account_id = c.accountId() }) else null;
+    self.ai_client = if (self.credential) |*c| try zenai.provider.Client.init(lp.io, allocator, c.provider, c.keySlice(), .{ .base_url = opts.base_url, .retry_policy = .long_running, .bill_to = hfBillToSlice(self.hf_bill_to), .environ = lp.environ(), .account_id = c.accountId() }) else null;
     errdefer if (self.ai_client) |c| c.deinit(allocator);
 
     if (opts.trace) |path| {
@@ -427,6 +433,7 @@ pub fn deinit(self: *Agent) void {
     self.model_completion_arena.deinit();
     self.ts.deinit();
     if (self.ai_client) |ai_client| ai_client.deinit(self.allocator);
+    releaseHfBillTo(&self.hf_bill_to);
     if (self.credential) |*c| c.deinit(self.allocator);
     self.allocator.free(self.model);
     self.allocator.free(self.available_providers);
@@ -1102,6 +1109,7 @@ fn promptStoredSubscription(self: *Agent, desc: *const auth.Descriptor, stored: 
 fn disableProvider(self: *Agent) void {
     if (self.ai_client) |client| client.deinit(self.allocator);
     self.ai_client = null;
+    releaseHfBillTo(&self.hf_bill_to);
     if (self.credential) |*c| c.deinit(self.allocator);
     self.credential = null;
     self.model_completions = null;
@@ -1109,25 +1117,43 @@ fn disableProvider(self: *Agent) void {
     self.reportSaved("provider", provider_off_keyword);
 }
 
-/// `HF_BILL_TO` org for routed requests; null for non-HF providers. Without it,
-/// requests bill the token owner's personal account instead of the org.
-fn hfBillTo(provider: Config.AiProvider) ?[]const u8 {
+/// Acquire the caller-owned environment snapshot for the active HF client.
+fn acquireHfBillTo(provider: Config.AiProvider) !?EnvironmentApi.mioa_environment_value_v1 {
     if (provider != .huggingface) return null;
-    const v = std.c.getenv("HF_BILL_TO") orelse return null;
-    return std.mem.span(v);
+    var value: EnvironmentApi.mioa_environment_value_v1 = .{ .value = null, .length = 0 };
+    const status = EnvironmentApi.mioa_environment_get_v1("HF_BILL_TO", &value);
+    if (status == EnvironmentApi.MIOA_ENVIRONMENT_MISSING) return null;
+    if (status == EnvironmentApi.MIOA_ENVIRONMENT_NO_MEMORY) return error.OutOfMemory;
+    if (status != EnvironmentApi.MIOA_ENVIRONMENT_OK) return error.InvalidEnvironment;
+    return value;
+}
+
+fn hfBillToSlice(value: ?EnvironmentApi.mioa_environment_value_v1) ?[]const u8 {
+    const snapshot = value orelse return null;
+    return snapshot.value[0..snapshot.length];
+}
+
+fn releaseHfBillTo(value: *?EnvironmentApi.mioa_environment_value_v1) void {
+    if (value.*) |*snapshot| EnvironmentApi.mioa_environment_value_release_v1(snapshot);
+    value.* = null;
 }
 
 /// `credential` transfers ownership of its key resources on success; on error
 /// the caller still owns them. The previous credential is released only after
 /// the old client is gone.
 fn setProvider(self: *Agent, credential: settings.Credential) !void {
-    const new_client = try zenai.provider.Client.init(lp.io, self.allocator, credential.provider, credential.keySlice(), .{ .base_url = self.model_base_url, .retry_policy = .long_running, .bill_to = hfBillTo(credential.provider), .environ = lp.environ(), .account_id = credential.accountId() });
+    var new_hf_bill_to = try acquireHfBillTo(credential.provider);
+    errdefer releaseHfBillTo(&new_hf_bill_to);
+    const new_client = try zenai.provider.Client.init(lp.io, self.allocator, credential.provider, credential.keySlice(), .{ .base_url = self.model_base_url, .retry_policy = .long_running, .bill_to = hfBillToSlice(new_hf_bill_to), .environ = lp.environ(), .account_id = credential.accountId() });
     errdefer new_client.deinit(self.allocator);
 
     // A same-provider re-select (vertex token refresh) must not reset the model.
     const same_provider = if (self.credential) |c| c.provider == credential.provider else false;
     const new_model = try self.allocator.dupe(u8, if (same_provider) self.model else zenai.provider.defaultModel(credential.provider));
     if (self.ai_client) |client| client.deinit(self.allocator);
+    releaseHfBillTo(&self.hf_bill_to);
+    self.hf_bill_to = new_hf_bill_to;
+    new_hf_bill_to = null;
     if (self.credential) |*c| c.deinit(self.allocator);
     self.credential = credential;
     new_client.setInterrupt(&self.http_interrupt);

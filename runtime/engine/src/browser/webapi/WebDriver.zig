@@ -70,7 +70,7 @@ const WebDriverCookie = struct {
     secure: bool,
     httpOnly: bool,
     sameSite: []const u8,
-    expiry: ?f64,
+    expiry: ?f64 = null,
 };
 
 // Unlike the script-facing CookieStore, WebDriver can see HttpOnly cookies.
@@ -79,6 +79,17 @@ fn getNamedCookie(_: *const WebDriver, name: []const u8, frame: *Frame) !?WebDri
     const target = Cookie.PreparedUri.init(frame.url);
     if (target.host.len == 0) {
         return null;
+    }
+    if (jar.profile_client) |client| {
+        const reply = try client.request(frame.local_arena, "cookies.associated_get", .{ .url = frame.url, .name = name });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .array) return error.ProfileProtocolError;
+        if (result.array.items.len == 0) return null;
+        const parsed = try std.json.parseFromValue(WebDriverCookie, frame.local_arena, result.array.items[0], .{ .allocate = .alloc_always });
+        var cookie = parsed.value;
+        if (cookie.domain.len > 0 and cookie.domain[0] == '.') cookie.domain = cookie.domain[1..];
+        return cookie;
     }
 
     try jar.removeExpired(null);

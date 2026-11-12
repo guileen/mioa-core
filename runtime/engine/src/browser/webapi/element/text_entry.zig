@@ -468,6 +468,7 @@ pub fn TextEntry(comptime T: type) type {
         }
 
         fn dispatchSelectionChangeEvent(self: *T, frame: *Frame) !void {
+            if (self.asElement().ownerFrame(frame)) |owner| owner.page.visualChanged();
             const event = try Event.init("selectionchange", .{ .bubbles = true }, frame.page);
             try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
         }

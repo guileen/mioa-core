@@ -398,3 +398,42 @@
     testing.expectEqual('TypeError: value is required', results[1]);
   });
 </script>
+
+<script id=utf8-size-boundaries type=module>
+  const state = await testing.async();
+  const names = ['size-ascii-' + 'a'.repeat(4084),
+                 'size-unicode-' + 'é'.repeat(2041)];
+  const events = [];
+  const listener = e => {
+    for (const cookie of e.changed) {
+      if (cookie.name.startsWith('size-')) events.push(cookie.name);
+    }
+  };
+  cookieStore.addEventListener('change', listener);
+  const values = [];
+  let rejected = 0;
+  for (const name of names) {
+    // Both names occupy 4095 UTF-8 bytes, not 4095 JS code units.
+    await cookieStore.set(name, 'v');
+    values.push((await cookieStore.get(name)).value);
+    try { await cookieStore.set(name, 'vv'); } catch (_) { rejected++; }
+    values.push((await cookieStore.get(name)).value);
+  }
+  const tooLong = 'size-rejected-' + 'é'.repeat(2042);
+  try { await cookieStore.set(tooLong, 'v'); } catch (_) { rejected++; }
+  const absent = await cookieStore.get(tooLong);
+  document.cookie = 'size-http-' + 'h'.repeat(4086) + '=v; Path=/';
+  const httpAbsent = await cookieStore.get('size-http-' + 'h'.repeat(4086));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  cookieStore.removeEventListener('change', listener);
+  for (const name of names) await cookieStore.delete(name);
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual(3, rejected);
+    testing.expectEqual(null, absent);
+    testing.expectEqual(null, httpAbsent);
+    testing.expectEqual('v,v,v,v', values.join(','));
+    testing.expectEqual(2, events.length);
+    testing.expectEqual(true, names.every(name => events.includes(name)));
+  });
+</script>

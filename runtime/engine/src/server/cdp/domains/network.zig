@@ -311,6 +311,16 @@ fn deleteCookies(cmd: *CDP.Command) !void {
     }
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    if (bc.session.cookie_jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.delete", .{
+            .name = params.name,
+            .url = params.url,
+            .domain = params.domain,
+            .path = params.path,
+        });
+        defer reply.deinit();
+        return cmd.sendResult(null, .{});
+    }
     const cookies = &bc.session.cookie_jar.cookies;
 
     var index = cookies.items.len;
@@ -393,6 +403,13 @@ fn getCookies(cmd: *CDP.Command) !void {
     // If not specified, use the URLs of the page and all of its subframes. TODO subframes
     const frame_url = if (bc.mainFrame()) |frame| frame.url else null;
     const param_urls = params.urls orelse &[_][:0]const u8{frame_url orelse return error.InvalidParams};
+    if (bc.session.cookie_jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.cdp_get", .{ .urls = param_urls });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .array) return error.ProfileProtocolError;
+        return cmd.sendResult(.{ .cookies = result }, .{});
+    }
 
     var urls = try std.ArrayList(CdpStorage.PreparedUri).initCapacity(cmd.arena, param_urls.len);
     for (param_urls) |url| {
@@ -411,6 +428,13 @@ fn getAllCookies(cmd: *CDP.Command) !void {
     // the latter's browserContextId filter, since Network commands are scoped
     // to the current browser context already).
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    if (bc.session.cookie_jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.cdp_get", .{ .urls = @as(?[]const []const u8, null) });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .array) return error.ProfileProtocolError;
+        return cmd.sendResult(.{ .cookies = result }, .{});
+    }
     var jar = &bc.session.cookie_jar;
     try jar.removeExpired(null);
     const writer = CdpStorage.CookieWriter{ .cookies = jar.cookies.items };

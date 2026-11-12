@@ -23,6 +23,7 @@ const Inbox = @import("../Inbox.zig");
 const Watchdog = @import("../Watchdog.zig");
 const ArenaPool = @import("../ArenaPool.zig");
 const Notification = @import("../Notification.zig");
+const libcurl = @import("../sys/libcurl.zig");
 const Driver = @import("../server/Driver.zig");
 
 const URL = @import("../browser/URL.zig");
@@ -783,14 +784,21 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
 
 pub fn tick(self: *Client, timeout_ms: u32) !bool {
     self.processGraveyard();
-    return self._tick(timeout_ms, .all);
+    return self._tick(timeout_ms, .all, &.{});
+}
+
+// External descriptors participate in the same wait as network and CDP
+// traffic. Their owner consumes them after this tick, on the browser thread.
+pub fn tickWithExternalFds(self: *Client, timeout_ms: u32, fds: []libcurl.CurlWaitFd) !bool {
+    self.processGraveyard();
+    return self._tick(timeout_ms, .all, fds);
 }
 
 pub fn tickSync(self: *Client, timeout_ms: u32) !void {
     if (self.hasPendingTeardown()) {
         return error.SyncWaitInterrupted;
     }
-    _ = try self._tick(timeout_ms, .sync_wait);
+    _ = try self._tick(timeout_ms, .sync_wait, &.{});
 }
 
 fn hasPendingTeardown(self: *Client) bool {
@@ -807,7 +815,7 @@ fn hasPendingTeardown(self: *Client) bool {
 // Returns false iff the tick was a no-op. When false is returned, immediately
 // calling this again will almost [instantly] return false again, potentially
 // causing a spin.
-pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
+pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode, extra_fds: []libcurl.CurlWaitFd) !bool {
     if (self.disconnected) {
         return error.ClientDisconnected;
     }
@@ -825,12 +833,14 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
     if (dispatched == false and processed == false and self.dispatch_queue.first == null and self.ws_dispatch_queue.first == null) {
         // Nothing was dispatched, no messages were processed and nothing is
         // waiting for dispatch. We need to wait for I/O.
-        if (running > 0 or self.driver != null or self.delayed_queue.first != null) {
+        if (running > 0 or self.driver != null or self.delayed_queue.first != null or extra_fds.len != 0) {
             {
+                const suspended = @import("../browser/TaskGate.zig").pauseForWait();
+                defer @import("../browser/TaskGate.zig").resumeAfterWait(suspended);
                 self.heartbeat.enterWait();
                 defer self.heartbeat.exitWait();
                 // The network layer will wake this up if there's acticity.
-                try self.handles.poll(&.{}, @intCast(self.clampToDelayed(timeout_ms)));
+                try self.handles.poll(extra_fds, @intCast(self.clampToDelayed(timeout_ms)));
             }
             // poll only waits, so we do the perform -> process dance again
             _ = try self.handles.perform();
@@ -928,6 +938,8 @@ fn dispatchCompleted(self: *Client, mode: DrainMode) bool {
             self.gated_queue.append(n);
             continue;
         }
+        @import("../browser/TaskGate.zig").enterOrExit();
+        defer @import("../browser/TaskGate.zig").exit();
         self.dispatch_count -= 1;
         transfer._dispatch_queued = false;
         transfer.deliver();
@@ -937,6 +949,8 @@ fn dispatchCompleted(self: *Client, mode: DrainMode) bool {
     if (mode == .all) {
         while (self.ws_dispatch_queue.popFirst()) |n| {
             const ws: *WebSocket = @fieldParentPtr("_dispatch_node", n);
+            @import("../browser/TaskGate.zig").enterOrExit();
+            defer @import("../browser/TaskGate.zig").exit();
             self.ws_dispatch_count -= 1;
             ws._dispatch_queued = false;
             ws.deliverEvents();
@@ -1645,6 +1659,14 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
         } orelse return;
 
         defer msg.deinit();
+        // Terminal cleanup must not wait for a new application CPU grant after
+        // revoke. Only messages capable of running application work enter it.
+        const application_work = mode != .terminal and switch (msg.payload) {
+            .cdp, .bidi, .bidi_http => true,
+            else => false,
+        };
+        if (application_work) try @import("../browser/TaskGate.zig").enter();
+        defer if (application_work) @import("../browser/TaskGate.zig").exit();
 
         const done = switch (msg.payload) {
             .cdp, .bidi => blk: {
@@ -2212,8 +2234,7 @@ pub const Request = struct {
     sync: bool = false,
 
     // Deliver the response body progressively: data_callback can fire multiple
-    // times. Currently, streaming request always bypass the cache as they are only
-    // used for EventSource.
+    // times. Streaming navigation and EventSource requests bypass the cache.
     streaming: bool = false,
 
     // When false, the caller does not guarantee that the body outlives the
@@ -4190,6 +4211,21 @@ pub const Transfer = struct {
             const status = conn.getResponseCode() catch return chunk_len;
             if (status >= 200) {
                 conn.transport.http.res.headers_complete = true;
+                const transfer = conn.transport.http;
+                if (transfer.req.streaming and transfer.req.resource_type == .document) {
+                    // Only the final navigation response may commit before body
+                    // bytes. Auth and CORS keep their completed-response gates.
+                    if (status == 401 or status == 407 or
+                        (transfer._cors_cross_origin and transfer.req.request_mode == .cors))
+                    {
+                        transfer.req.streaming = false;
+                    } else if (!(isRedirectStatus(status) and conn.getResponseHeader("location", 0) != null) and status != 304) {
+                        transfer.streamChunk(conn, &.{}) catch |err| {
+                            transfer.res.callback_error = err;
+                            return http.writefunc_error;
+                        };
+                    }
+                }
             }
             return chunk_len;
         }
@@ -4280,7 +4316,9 @@ pub const Transfer = struct {
                     // and `cl * 3` or something, but that's just a guess.
                     // I prefer to leave this simple; easier for someone to come
                     // up with a good solution.
-                    res.buffer.ensureTotalCapacityPrecise(transfer.arena.allocator(), cl) catch {};
+                    if (!transfer.req.streaming) {
+                        res.buffer.ensureTotalCapacityPrecise(transfer.arena.allocator(), cl) catch {};
+                    }
                 }
             }
         }
@@ -4360,11 +4398,13 @@ pub const Transfer = struct {
             self._events.appendAssumeCapacity(.header);
             res.stream.started = true;
         }
-        // append the data to whatever data we already have (but haven't delivered)
-        try res.buffer.appendSlice(self.arena.allocator(), chunk);
-        if (res.stream.data_queued == false) {
-            res.stream.data_queued = true;
-            try self._events.append(self.arena.allocator(), .stream_data);
+        if (chunk.len > 0) {
+            // Header-only commit queues no artificial data callback.
+            try res.buffer.appendSlice(self.arena.allocator(), chunk);
+            if (res.stream.data_queued == false) {
+                res.stream.data_queued = true;
+                try self._events.append(self.arena.allocator(), .stream_data);
+            }
         }
 
         switch (self.state) {

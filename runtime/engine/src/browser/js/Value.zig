@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const js = @import("js.zig");
 const TaggedOpaque = @import("TaggedOpaque.zig");
+const CloneSerializer = @import("CloneSerializer.zig");
 
 const v8 = js.v8;
 const bridge = js.bridge;
@@ -496,18 +497,23 @@ pub fn structuredCloneToWithTransfer(self: Value, target: *const js.Local, optio
     return result;
 }
 
-// A structured-serialized value: a V8-owned byte buffer. Caller must free it
-// and must dupe the bytes if they want it to outlive the current local scope.
+// A structured-serialized value. The qualified native path owns the admitted
+// allocator/capacity; the ordinary V8 path retains its original free contract.
 pub const Serialized = struct {
     data: [*c]u8,
     size: usize,
+    allocator: ?Allocator = null,
+    capacity: usize = 0,
 
     pub fn bytes(self: Serialized) []const u8 {
         return self.data[0..self.size];
     }
 
     pub fn deinit(self: Serialized) void {
-        v8.v8__ValueSerializer__FreeBuffer(self.data);
+        if (self.allocator) |allocator| {
+            const retained: [*]align(16) u8 = @ptrCast(@alignCast(self.data));
+            allocator.free(retained[0..self.capacity]);
+        } else v8.v8__ValueSerializer__FreeBuffer(self.data);
     }
 };
 
@@ -518,32 +524,35 @@ pub fn serialize(self: Value) !Serialized {
 }
 
 fn serializeWithTransfers(self: Value, transfers: []const CanvasTransfer) !Serialized {
+    var memory = try CloneSerializer.Memory.init();
     var delegate_ctx = CloneDelegate.SerializeContext{
         .local = self.local,
         .serializer = undefined,
         .transfers = transfers,
     };
-    const serializer = v8.v8__ValueSerializer__New(self.local.isolate.handle, &.{
+    const serializer = CloneSerializer.create(self.local.isolate.handle, &.{
         .data = &delegate_ctx,
         .get_shared_array_buffer_id = CloneDelegate.getSharedArrayBufferId,
         .write_host_object = CloneDelegate.writeHostObject,
         .throw_data_clone_error = CloneDelegate.throwDataCloneError,
-    }) orelse return error.JsException;
-    defer v8.v8__ValueSerializer__DELETE(serializer);
+    }, &memory) orelse return if (memory.failed) error.QuotaExceeded else error.JsException;
+    defer CloneSerializer.destroy(serializer);
 
     // the delegate callbacks only fire during WriteValue, after this is set
     delegate_ctx.serializer = serializer;
 
     var write_result: v8.MaybeBool = undefined;
-    v8.v8__ValueSerializer__WriteHeader(serializer);
-    v8.v8__ValueSerializer__WriteValue(serializer, self.local.handle, self.handle, &write_result);
+    CloneSerializer.header(serializer);
+    CloneSerializer.write(serializer, self.local.handle, self.handle, &write_result);
+    if (memory.failed) return error.QuotaExceeded;
     if (!write_result.has_value or !write_result.value) {
         return error.JsException;
     }
 
     var size: usize = undefined;
-    const data = v8.v8__ValueSerializer__Release(serializer, &size) orelse return error.JsException;
-    return .{ .data = data, .size = size };
+    var capacity: usize = 0;
+    const data = CloneSerializer.release(serializer, &size, &capacity) orelse return error.JsException;
+    return .{ .data = data, .size = size, .capacity = capacity, .allocator = if (CloneSerializer.enabled) memory.allocator else null };
 }
 
 // Deserialize a structured-serialized buffer (from `serialize`) into a value in
@@ -613,17 +622,17 @@ pub const StructuredWriter = struct {
     serializer: *v8.ValueSerializer,
 
     pub fn writeUint32(self: *const StructuredWriter, value: u32) void {
-        v8.v8__ValueSerializer__WriteUint32(self.serializer, value);
+        CloneSerializer.writeUint32(self.serializer, value);
     }
 
     pub fn writeUint64(self: *const StructuredWriter, value: u64) void {
-        v8.v8__ValueSerializer__WriteUint64(self.serializer, value);
+        CloneSerializer.writeUint64(self.serializer, value);
     }
 
     pub fn writeBytes(self: *const StructuredWriter, bytes: []const u8) void {
-        v8.v8__ValueSerializer__WriteUint32(self.serializer, @intCast(bytes.len));
+        CloneSerializer.writeUint32(self.serializer, @intCast(bytes.len));
         if (bytes.len > 0) {
-            v8.v8__ValueSerializer__WriteRawBytes(self.serializer, bytes.ptr, bytes.len);
+            CloneSerializer.writeBytes(self.serializer, bytes);
         }
     }
 };
@@ -691,8 +700,8 @@ const CloneDelegate = struct {
             if (tao.as(OffscreenCanvas)) |canvas| {
                 for (ctx.transfers, 0..) |transfer, index| {
                     if (transfer.source != canvas) continue;
-                    v8.v8__ValueSerializer__WriteUint32(ctx.serializer, canvas_transfer_tag);
-                    v8.v8__ValueSerializer__WriteUint32(ctx.serializer, @intCast(index));
+                    CloneSerializer.writeUint32(ctx.serializer, canvas_transfer_tag);
+                    CloneSerializer.writeUint32(ctx.serializer, @intCast(index));
                     return .{ .has_value = true, .value = true };
                 }
                 break :blk;
@@ -713,7 +722,7 @@ const CloneDelegate = struct {
     }
 
     fn writeCloneable(ctx: *SerializeContext, tag: u32, instance: anytype) v8.MaybeBool {
-        v8.v8__ValueSerializer__WriteUint32(ctx.serializer, tag);
+        CloneSerializer.writeUint32(ctx.serializer, tag);
         var writer = StructuredWriter{ .local = ctx.local, .serializer = ctx.serializer };
         instance.structuredSerialize(&writer) catch {
             throwDataCloneException(ctx.local, null);
@@ -1257,4 +1266,27 @@ test "Value: jsonStringify maps unserializable JS values to null" {
         defer testing.allocator.free(out);
         try testing.expectEqualSlices(u8, case.expected, out);
     }
+}
+
+test "Value: clone wrapper admission failure throws QuotaExceededError to JavaScript" {
+    if (!CloneSerializer.enabled) return error.SkipZigTest;
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    // Fail the genuine C++ serializer-wrapper allocation before any V8
+    // serialization call: no pending JS exception exists to rethrow.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    CloneSerializer.TestAllocator.override = failing.allocator();
+    defer CloneSerializer.TestAllocator.override = null;
+    const result = try ls.local.exec(
+        \\(() => {
+        \\  try { structuredClone({value: 1}); return false; }
+        \\  catch (error) { return error.name === "QuotaExceededError"; }
+        \\})()
+    , null);
+    try testing.expect(result.isTrue());
+    try testing.expect(failing.has_induced_failure);
 }

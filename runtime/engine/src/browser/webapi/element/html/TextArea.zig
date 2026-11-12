@@ -85,7 +85,7 @@ pub fn setValue(self: *TextArea, raw_value: []const u8, frame: *Frame) !void {
 
     // move the text entry cursor position to the end of the text control
     if (changed) {
-        frame.styleChanged();
+        if (self.asElement().ownerFrame(frame)) |owner| owner.styleChanged();
         self._selection_start = @intCast(owned.len);
         self._selection_end = @intCast(owned.len);
         self._selection_direction = .none;
@@ -115,9 +115,13 @@ fn normalizeNewlines(value: []const u8, arena: std.mem.Allocator) ![]const u8 {
     return result[0..i];
 }
 
-pub fn reset(self: *TextArea) void {
+pub fn reset(self: *TextArea, frame: *Frame) void {
+    const changed = !std.mem.eql(u8, self.getValue(), self.getDefaultValue());
     self._value = null;
     self._user_edited = false;
+    if (changed) {
+        if (self.asElement().ownerFrame(frame)) |owner| owner.styleChanged();
+    }
 }
 
 pub fn setUserValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
@@ -152,7 +156,7 @@ fn setDefaultValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
     const node = self.asNode();
     if (node.firstChild()) |child| {
         if (child.is(Node.CData.Text)) |txt| {
-            txt.asCData()._data = try frame.dupeSSO(value);
+            try txt.asCData().setData(value, frame);
             return;
         }
     }
@@ -350,4 +354,31 @@ const testing = @import("../../../../testing.zig");
 test "WebApi: HTML.TextArea" {
     try testing.htmlRunner("element/html/textarea.html", .{});
     try testing.htmlRunner("element/html/textarea-validity.html", .{});
+}
+
+test "TextArea: reset and default text changes invalidate the owning frame" {
+    const owner = try testing.createFrame();
+    const caller = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const element = try owner.document.createElement("textarea", null, owner);
+    const textarea = element.as(TextArea);
+    try textarea.setDefaultValue("default", owner);
+    try textarea.setValue("edited", owner);
+    const owner_before = owner.page.visual_generation.load(.acquire);
+    const caller_before = caller.page.visual_generation.load(.acquire);
+    textarea.reset(caller);
+    try testing.expectEqual("default", textarea.getValue());
+    try testing.expect(owner.page.visual_generation.load(.acquire) > owner_before);
+    try testing.expectEqual(caller_before, caller.page.visual_generation.load(.acquire));
+    const reset_generation = owner.page.visual_generation.load(.acquire);
+    textarea.reset(caller);
+    try testing.expectEqual(reset_generation, owner.page.visual_generation.load(.acquire));
+    try textarea.setDefaultValue("updated default", caller);
+    try testing.expectEqual("updated default", textarea.getValue());
+    try testing.expect(owner.page.visual_generation.load(.acquire) > reset_generation);
+    try testing.expectEqual(caller_before, caller.page.visual_generation.load(.acquire));
+    const updated = owner.page.visual_generation.load(.acquire);
+    try textarea.setValue("live", caller);
+    try testing.expect(owner.page.visual_generation.load(.acquire) > updated);
+    try testing.expectEqual(caller_before, caller.page.visual_generation.load(.acquire));
 }

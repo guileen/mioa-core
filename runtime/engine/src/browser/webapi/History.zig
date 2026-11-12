@@ -53,15 +53,46 @@ fn setScrollRestoration(self: *History, str: []const u8) void {
     }
 }
 
+fn prefixUntil(url: []const u8, delimiters: []const u8) []const u8 {
+    for (url, 0..) |c, i| {
+        if (std.mem.findScalar(u8, delimiters, c) != null) return url[0..i];
+    }
+    return url;
+}
+
+// Both inputs are serialized URLs. Compare authority including credentials;
+// opaque URLs may change only their fragment, file URLs only query/fragment.
+fn canRewriteUrl(current: []const u8, next: []const u8) bool {
+    const colon = std.mem.findScalar(u8, current, ':') orelse return false;
+    if (!std.mem.startsWith(u8, next, current[0 .. colon + 1])) return false;
+    const scheme = current[0..colon];
+    if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https")) {
+        const start = colon + 3;
+        if (current.len < start or next.len < start) return false;
+        return std.mem.eql(u8, current[0 .. start + prefixUntil(current[start..], "/?#").len], next[0 .. start + prefixUntil(next[start..], "/?#").len]);
+    }
+    const delimiters = if (std.mem.eql(u8, scheme, "file")) "?#" else "#";
+    return std.mem.eql(u8, prefixUntil(current, delimiters), prefixUntil(next, delimiters));
+}
+
+fn resolveStateUrl(target: *Frame, input: ?[]const u8) ![:0]const u8 {
+    const arena = target._session.arena.allocator();
+    const value = input orelse return arena.dupeSentinel(u8, target.url, 0);
+    if (value.len == 0) return arena.dupeSentinel(u8, target.url, 0);
+    const url = @import("../URL.zig").resolve(arena, target.navigationBase(), value, .{}) catch |err| switch (err) {
+        error.TypeError => return error.SecurityError,
+        else => return err,
+    };
+    if (!canRewriteUrl(target.url, url)) return error.SecurityError;
+    return url;
+}
+
 pub fn pushState(self: *History, state: js.Value, _: ?[]const u8, _url: ?[]const u8) !void {
     // The URL resolves against this history's document, not the caller's.
     const target = self._frame;
     const session = target._session;
     const arena = session.arena;
-    const url = if (_url) |u|
-        try @import("../URL.zig").resolve(arena.allocator(), target.url, u, .{})
-    else
-        try arena.dupeSentinel(u8, target.url, 0);
+    const url = try resolveStateUrl(target, _url);
 
     const json = state.toJson(arena.allocator()) catch return error.DataClone;
     _ = try session.navigationFor(target).pushEntry(url, .{ .source = .history, .value = json }, target, true);
@@ -84,10 +115,7 @@ fn replaceState(self: *History, state: js.Value, _: ?[]const u8, _url: ?[]const 
     const target = self._frame;
     const session = target._session;
     const arena = session.arena;
-    const url = if (_url) |u|
-        try @import("../URL.zig").resolve(arena.allocator(), target.url, u, .{})
-    else
-        try arena.dupeSentinel(u8, target.url, 0);
+    const url = try resolveStateUrl(target, _url);
 
     const json = state.toJson(arena.allocator()) catch return error.DataClone;
     _ = try session.navigationFor(target).replaceEntry(url, .{ .source = .history, .value = json }, target, true);
@@ -176,4 +204,23 @@ test "WebApi: History" {
     try testing.htmlRunner("history.html", .{});
     try testing.htmlRunner("history_url_update.html", .{});
     try testing.htmlRunner("history_traverse.html", .{});
+}
+
+test "History: URL rewrite authority" {
+    const cases = [_]struct { current: []const u8, next: []const u8, allowed: bool }{
+        .{ .current = "https://a.test/a", .next = "https://a.test/b?q=1#x", .allowed = true },
+        .{ .current = "https://a.test/a", .next = "https://b.test/a", .allowed = false },
+        .{ .current = "https://a.test/a", .next = "http://a.test/a", .allowed = false },
+        .{ .current = "https://a.test/a", .next = "https://a.test:8443/a", .allowed = false },
+        .{ .current = "https://a.test/a", .next = "https://user@a.test/a", .allowed = false },
+        .{ .current = "https://user:one@a.test/a", .next = "https://user:two@a.test/a", .allowed = false },
+        .{ .current = "file:///a", .next = "file:///a?q=1#x", .allowed = true },
+        .{ .current = "file:///a", .next = "file:///b", .allowed = false },
+        .{ .current = "about:blank", .next = "about:blank#x", .allowed = true },
+        .{ .current = "about:blank", .next = "about:blank?q=1", .allowed = false },
+        .{ .current = "about:blank", .next = "https://a.test/a", .allowed = false },
+        .{ .current = "data:text/html,one", .next = "data:text/html,one#x", .allowed = true },
+        .{ .current = "data:text/html,one", .next = "data:text/html,two", .allowed = false },
+    };
+    for (cases) |case| try testing.expectEqual(case.allowed, canRewriteUrl(case.current, case.next));
 }

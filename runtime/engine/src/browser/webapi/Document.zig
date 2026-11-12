@@ -300,6 +300,22 @@ pub fn setCookie(self: *Document, cookie_str: []const u8, frame: *Frame) ![]cons
     if (self.isCookieAverse(frame)) {
         return cookie_str;
     }
+    if (frame._session.cookie_jar.profile_client) |client| {
+        const origin_url: ?[]const u8 = switch (frame.siteForCookies()) {
+            .none => null,
+            .url => |url| url,
+        };
+        const reply = try client.request(frame.local_arena, "cookies.set", .{
+            .url = frame.url,
+            .header = cookie_str,
+            .is_http = false,
+            .origin_url = origin_url,
+        });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .bool) return error.ProfileProtocolError;
+        return if (result.bool) cookie_str else "";
+    }
     // we use the cookie jar's allocator to parse the cookie because it
     // outlives the frame's arena.
     const Cookie = @import("storage/Cookie.zig");

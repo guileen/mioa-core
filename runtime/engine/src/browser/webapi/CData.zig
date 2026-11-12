@@ -357,7 +357,7 @@ pub fn isEqualNode(self: *const CData, other: *const CData) bool {
 /// Text data can flip `:empty` but never a live collection, so only the style
 /// stamp moves.
 fn dataChanged(self: *CData, old: String, frame: *Frame) void {
-    frame.styleChanged();
+    if (self.asNode().ownerFrame(frame)) |owner| owner.styleChanged();
     Frame.observers.notifyCharacterDataChange(frame, self.asNode(), old);
 }
 

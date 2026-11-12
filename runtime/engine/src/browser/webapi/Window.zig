@@ -110,10 +110,9 @@ _cross_origin_wrapper: CrossOriginWindow,
 // we're still alive. Only valid if `!_opener.?._closed`.
 _opener: ?*Window = null,
 
-// True after window.close. The Frame itself stays alive (parked in
-// page.closed_frames until Page.deinit) so cached references to this Window
-// don't dangle, but the popup is neutered: dropped from page.popups, its
-// transfers aborted, scheduler reset, and unreachable for events / name lookup.
+// True after window.close. Opener-bearing Frames remain in page.closed_frames
+// for cached JS references; independent auxiliary Pages retire after the current
+// JS invocation unwinds.
 _closed: bool = false,
 
 // Popup name (owned by page.arena)
@@ -584,14 +583,9 @@ pub fn getComputedStyle(_: *const Window, element: *Element, pseudo_element: ?[]
     return gop.value_ptr.*;
 }
 
-// window.open(url?, target?, features?) — v1 scope:
-//   * Always creates a new popup Frame on the Page (sibling to the root).
-//   * Honors `noopener` / `noreferrer` tokens in `features` (opener=null,
-//     return value=null). Geometry (width, height, ...) ignored.
-//   * `target` values `_self` / `_parent` / `_top` navigate the current frame.
-//     Any other value is treated as a popup name; reusing a live name
-//     navigates the existing popup instead of spawning a new one.
-//   * `url` empty or missing opens about:blank.
+// Noopener opens an independent Page and returns null; other auxiliary windows
+// retain stable Window references in the creator's Page. Geometry is ignored.
+// Only opener-bearing named windows reuse an existing context.
 pub fn open(self: *Window, url_: ?[]const u8, target_: ?[]const u8, features_: ?[]const u8, frame: *Frame) !?Access {
     const raw_url = url_ orelse "";
     const target = target_ orelse "";
@@ -633,7 +627,7 @@ pub fn open(self: *Window, url_: ?[]const u8, target_: ?[]const u8, features_: ?
 
     // Name-based reuse: if a popup with this name already exists, reuse it.
     // `_blank` is reserved and never reuses.
-    const is_named = target.len > 0 and !std.ascii.eqlIgnoreCase(target, "_blank");
+    const is_named = !no_opener and target.len > 0 and !std.ascii.eqlIgnoreCase(target, "_blank");
     if (is_named) {
         if (page.findPopupByName(target)) |existing| {
             if (raw_url.len > 0) {
@@ -649,10 +643,10 @@ pub fn open(self: *Window, url_: ?[]const u8, target_: ?[]const u8, features_: ?
         }
     }
 
-    // Spawn a new popup Frame as a sibling of the root.
+    // Noopener treats non-special target names as _blank.
     const popup = try frame.openPopup(.{
         .url = raw_url,
-        .name = target,
+        .name = if (no_opener) "" else target,
         .opener = if (no_opener) null else self,
     });
 
@@ -667,9 +661,15 @@ pub fn close(self: *Window) void {
         return;
     }
 
-    // Per spec, close() is only honored on script-opened windows. That
-    // maps exactly to membership in page.popups.
+    // Independent auxiliary Pages survive their creator and root replacements.
     const frame = self._frame;
+    if (frame == &frame.page.frame and frame._session.navigationFor(frame)._script_closable) {
+        self._closed = true;
+        // Session drains this context-owned intent after JS, before navigation.
+        // A document scheduler would lose it when this document is replaced.
+        frame._session.navigationFor(frame)._close_requested = true;
+        return;
+    }
     if (std.mem.findScalar(*Frame, frame.page.popups.items, frame) == null) {
         return;
     }
@@ -716,8 +716,8 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
         try_catch.init(&ls.local);
         defer try_catch.deinit();
 
-        const c = message.structuredCloneTo(&ls.local) catch {
-            return error.DataClone;
+        const c = message.structuredCloneTo(&ls.local) catch |err| {
+            return if (err == error.JsException) error.DataClone else err;
         };
         break :blk try c.persist();
     };
@@ -752,8 +752,8 @@ fn atob(_: *const Window, input: base64.BinInput, frame: *Frame) !js.String.OneB
 }
 
 pub fn structuredClone(_: *const Window, value: js.Value) !js.Value {
-    // the serializer already threw (e.g. a DataCloneError); keep it
-    return value.structuredClone() catch error.TryCatchRethrow;
+    // Only JsException proves that V8 has a pending exception to rethrow.
+    return value.structuredClone() catch |err| return if (err == error.JsException) error.TryCatchRethrow else err;
 }
 
 fn getFrame(self: *Window, idx: usize) !?*Window {
@@ -833,6 +833,7 @@ pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Fram
     self._scroll_pos.x = new_x;
     self._scroll_pos.y = new_y;
     self._scroll_pos.state = .scroll;
+    self._frame.page.visualChanged();
 
     // We dispatch scroll event asynchronously after 10ms. So we can throttle
     // them.

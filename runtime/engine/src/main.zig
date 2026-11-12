@@ -18,6 +18,70 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+const EnvironmentApi = @import("environment_api");
+
+const CookieOwnerBootstrap = struct {
+    fd: std.posix.fd_t,
+    database: [:0]const u8,
+};
+
+const IndexedDbOwnerBootstrap = struct {
+    fd: std.posix.fd_t,
+    grant_fd: std.posix.fd_t,
+    directory: []const u8,
+};
+
+fn environmentSnapshot(name: [*:0]const u8) !?EnvironmentApi.mioa_environment_value_v1 {
+    var value: EnvironmentApi.mioa_environment_value_v1 = .{ .value = null, .length = 0 };
+    switch (EnvironmentApi.mioa_environment_get_v1(name, &value)) {
+        EnvironmentApi.MIOA_ENVIRONMENT_OK => return value,
+        EnvironmentApi.MIOA_ENVIRONMENT_MISSING => return null,
+        EnvironmentApi.MIOA_ENVIRONMENT_NO_MEMORY => return error.OutOfMemory,
+        else => return error.InvalidEnvironment,
+    }
+}
+
+fn releaseEnvironmentSnapshot(value: *?EnvironmentApi.mioa_environment_value_v1) void {
+    if (value.*) |*snapshot| EnvironmentApi.mioa_environment_value_release_v1(snapshot);
+    value.* = null;
+}
+
+fn environmentPresent(name: [*:0]const u8) !bool {
+    var present: c_int = 0;
+    const status = EnvironmentApi.mioa_environment_has_v1(name, &present);
+    if (status != EnvironmentApi.MIOA_ENVIRONMENT_OK) return error.InvalidEnvironment;
+    return present != 0;
+}
+
+fn ownerDescriptor(raw: []const u8) !std.posix.fd_t {
+    const fd = std.fmt.parseInt(std.posix.fd_t, raw, 10) catch return error.InvalidProfileOwner;
+    if (fd < 0) return error.InvalidProfileOwner;
+    return fd;
+}
+
+fn cookieOwnerBootstrap(fd_raw: ?[]const u8, database: ?[:0]const u8) !?CookieOwnerBootstrap {
+    const raw_fd = fd_raw orelse return null;
+    const path = database orelse return error.InvalidProfileOwner;
+    return .{ .fd = try ownerDescriptor(raw_fd), .database = path };
+}
+
+fn indexedDbOwnerBootstrap(
+    fd_raw: ?[]const u8,
+    directory: ?[]const u8,
+    grant_raw: ?[]const u8,
+) !?IndexedDbOwnerBootstrap {
+    const raw_fd = fd_raw orelse return null;
+    const raw_directory = directory orelse return error.InvalidProfileOwner;
+    const raw_grant = grant_raw orelse return error.InvalidProfileOwner;
+    const fd = try ownerDescriptor(raw_fd);
+    const grant_fd = try ownerDescriptor(raw_grant);
+    if (fd == grant_fd) return error.InvalidProfileOwner;
+    return .{ .fd = fd, .grant_fd = grant_fd, .directory = raw_directory };
+}
+
+fn profileOwnerConflictsWithCookieFiles(owner_present: bool, cookie_file: bool, cookie_jar_file: bool) bool {
+    return owner_present and (cookie_file or cookie_jar_file);
+}
 const Allocator = std.mem.Allocator;
 
 const log = lp.log;
@@ -31,20 +95,52 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main(init: std.process.Init) !void {
-    // allocator
-    // - in Debug mode we use the SafeAllocator to detect memory leaks
-    // - in Release mode we use the c allocator
+    // Standalone CLI keeps its original debug/C allocator. Managed application
+    // objects use the shared native allocator over admitted page backing.
     var gpa_instance: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 10 });
-    const gpa = if (lp.IS_DEBUG) gpa_instance.allocator() else std.heap.c_allocator;
+    const initial_gpa = if (lp.IS_DEBUG) gpa_instance.allocator() else std.heap.c_allocator;
+    // Install admitted backing before any application arena or native engine.
+    const gpa = try lp.RuntimeMemory.allocator(initial_gpa);
 
     defer if (lp.IS_DEBUG) {
         if (gpa_instance.deinit() != 0) std.process.exit(1);
     };
+    defer lp.RuntimeMemory.shutdown();
+    // SQLite configuration must precede every connection and owner-mode branch.
+    // Ungoverned owner helpers keep their existing default SQLite allocator.
+    try lp.Sqlite.installRuntimeAllocator();
 
     // arena for main-specific allocations
     var main_arena_instance = std.heap.ArenaAllocator.init(gpa);
     const main_arena = main_arena_instance.allocator();
     defer main_arena_instance.deinit();
+
+    // Only the Profile lease owner supplies this connected capability to its
+    // dedicated child. Ordinary runtime processes must never inherit it.
+    var cookie_fd_env = try environmentSnapshot("MIOA_COOKIE_OWNER_FD");
+    defer releaseEnvironmentSnapshot(&cookie_fd_env);
+    if (cookie_fd_env) |fd_value| {
+        var cookie_db_env = try environmentSnapshot("MIOA_COOKIE_OWNER_DB");
+        defer releaseEnvironmentSnapshot(&cookie_db_env);
+        const raw_db = if (cookie_db_env) |value| value.value[0..value.length :0] else null;
+        const owner = (try cookieOwnerBootstrap(fd_value.value[0..fd_value.length], raw_db)) orelse unreachable;
+        try lp.CookieOwner.serve(gpa, owner.fd, owner.database);
+        return;
+    }
+
+    var idb_fd_env = try environmentSnapshot("MIOA_IDB_OWNER_FD");
+    defer releaseEnvironmentSnapshot(&idb_fd_env);
+    if (idb_fd_env) |fd_value| {
+        var idb_dir_env = try environmentSnapshot("MIOA_IDB_OWNER_DIR");
+        defer releaseEnvironmentSnapshot(&idb_dir_env);
+        var idb_grant_env = try environmentSnapshot("MIOA_IDB_GRANT_FD");
+        defer releaseEnvironmentSnapshot(&idb_grant_env);
+        const raw_directory = if (idb_dir_env) |value| value.value[0..value.length] else null;
+        const raw_grant = if (idb_grant_env) |value| value.value[0..value.length] else null;
+        const owner = (try indexedDbOwnerBootstrap(fd_value.value[0..fd_value.length], raw_directory, raw_grant)) orelse unreachable;
+        try lp.IndexedDBOwner.serve(gpa, owner.fd, owner.grant_fd, owner.directory);
+        return;
+    }
 
     run(gpa, main_arena, init.minimal.args) catch |err| {
         if (err == error.UserCancelled) std.process.exit(130);
@@ -75,6 +171,13 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
         else => return err,
     };
     defer args.deinit(main_arena);
+
+    // Cookie-file imports/exports operate on a local jar and must never be
+    // combined with the authoritative shared Profile connection.
+    const profile_owner_present = try environmentPresent("MIOA_PROFILE_SERVICE_FD");
+    if (profileOwnerConflictsWithCookieFiles(profile_owner_present, args.cookieFile() != null, args.cookieJarFile() != null)) {
+        return error.InvalidProfileOwner;
+    }
 
     switch (args.mode) {
         .help => |tag| return args.printUsageAndExit(main_arena, tag, true),
@@ -443,4 +546,37 @@ fn logConfigTips(config: *const Config) void {
         tips[count] = .init("meta", "use '--log-filter note' to silence this message");
         log.logKVs(.note, .note, "config tips", tips[0 .. count + 1]);
     }
+}
+test "cookie owner bootstrap validates presence and descriptor" {
+    try std.testing.expect(try cookieOwnerBootstrap(null, null) == null);
+    try std.testing.expectError(error.InvalidProfileOwner, cookieOwnerBootstrap("5", null));
+    try std.testing.expectError(error.InvalidProfileOwner, cookieOwnerBootstrap("", "/profile/cookies.db"));
+    try std.testing.expectError(error.InvalidProfileOwner, cookieOwnerBootstrap("bad", "/profile/cookies.db"));
+    try std.testing.expectError(error.InvalidProfileOwner, cookieOwnerBootstrap("-1", "/profile/cookies.db"));
+
+    const owner = (try cookieOwnerBootstrap("0", "/profile/cookies.db")).?;
+    try std.testing.expectEqual(@as(std.posix.fd_t, 0), owner.fd);
+    try std.testing.expectEqualStrings("/profile/cookies.db", owner.database);
+}
+
+test "indexed db owner bootstrap requires distinct valid descriptors and fields" {
+    try std.testing.expect(try indexedDbOwnerBootstrap(null, null, null) == null);
+    try std.testing.expectError(error.InvalidProfileOwner, indexedDbOwnerBootstrap("5", null, "6"));
+    try std.testing.expectError(error.InvalidProfileOwner, indexedDbOwnerBootstrap("5", "/profile", null));
+    try std.testing.expectError(error.InvalidProfileOwner, indexedDbOwnerBootstrap("", "/profile", "6"));
+    try std.testing.expectError(error.InvalidProfileOwner, indexedDbOwnerBootstrap("-1", "/profile", "6"));
+    try std.testing.expectError(error.InvalidProfileOwner, indexedDbOwnerBootstrap("5", "/profile", "bad"));
+    try std.testing.expectError(error.InvalidProfileOwner, indexedDbOwnerBootstrap("5", "/profile", "5"));
+
+    const owner = (try indexedDbOwnerBootstrap("5", "/profile", "6")).?;
+    try std.testing.expectEqual(@as(std.posix.fd_t, 5), owner.fd);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 6), owner.grant_fd);
+    try std.testing.expectEqualStrings("/profile", owner.directory);
+}
+
+test "profile owner conflicts only with cookie file options" {
+    try std.testing.expect(!profileOwnerConflictsWithCookieFiles(false, true, true));
+    try std.testing.expect(!profileOwnerConflictsWithCookieFiles(true, false, false));
+    try std.testing.expect(profileOwnerConflictsWithCookieFiles(true, true, false));
+    try std.testing.expect(profileOwnerConflictsWithCookieFiles(true, false, true));
 }

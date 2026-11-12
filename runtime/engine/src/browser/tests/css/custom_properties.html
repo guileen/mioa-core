@@ -36,9 +36,29 @@
   /* Nearest ancestor wins over a more specific rule further up. */
   #outer.outer.outer { --nearest: far; }
   .inner { --nearest: near; }
+  .computed-style { padding-left: 10px; }
+  #computed-style { background: #123456; color: rgb(1, 2, 3); padding-left: 12px; }
+  #computed-style-important { color: blue !important; }
+  #computed-style-special { display: flex; visibility: collapse; pointer-events: visible; }
+#computed-style-inherited-parent { visibility: collapse; pointer-events: visible; color: rgb(9, 8, 7); line-height: 1.5; margin-left: 20px; }
+/* CSS-wide keywords inherit only when specified by default or explicitly. */
+#computed-style-unset-color { color: unset; }
+#computed-style-inherit-margin { margin-left: inherit; }
+#computed-style-unset-margin { margin-left: unset; }
 </style>
 
 <body>
+  <div class="computed-style" id="computed-style" style="color: green">computed style</div>
+  <div id="computed-style-important" style="color: red">important</div>
+  <div id="computed-style-special">special computed properties</div>
+  <div id="computed-style-inherited-parent">
+    <span id="computed-style-inherited">inherited</span>
+    <span id="computed-style-inherited-explicit">explicit inherited</span>
+    <span id="computed-style-unset-color">unset inherited color</span>
+    <span id="computed-style-inherit-margin">explicit non-inherited inheritance</span>
+    <span id="computed-style-unset-margin">non-inherited unset</span>
+    <span id="computed-style-initial-color" style="color: initial">initial color</span>
+  </div>
   <div class="card" id="card" style="--inline: 8px; --pad: inline-wins">card</div>
   <div class="card">plain card</div>
   <div id="case">case</div>
@@ -139,16 +159,18 @@
 {
   // The CSSOM path (addRule) has to agree with the raw-text path (addRawRule).
   const sheet = $('#dyn').sheet;
-  sheet.insertRule('#plain { --Om: om-upper; --om: om-lower }', 0);
+  sheet.insertRule('#plain { --Om: om-upper; --om: om-lower; color: orange }', 0);
 
   const plain = $('#plain');
   testing.expectEqual('om-upper', getComputedStyle(plain).getPropertyValue('--Om'));
   testing.expectEqual('om-lower', getComputedStyle(plain).getPropertyValue('--om'));
-
-  // Mutating the rule's declaration must not leave us serving a freed value.
+  testing.expectEqual('orange', getComputedStyle(plain).getPropertyValue('color'));
+  // Mutating the rule's declarations must rebuild indexed values and avoid freed strings.
   sheet.cssRules[0].style.setProperty('--Om', 'x');
+  sheet.cssRules[0].style.setProperty('color', 'purple');
+  testing.expectEqual('purple', getComputedStyle(plain).getPropertyValue('color'));
   sheet.insertRule('#nothing-matches { color: red }', 0);
-  testing.expectEqual('x', getComputedStyle(plain).getPropertyValue('--Om'));
+  testing.expectEqual('purple', getComputedStyle(plain).getPropertyValue('color'));
 
   sheet.deleteRule(0);
   sheet.deleteRule(0);
@@ -197,5 +219,32 @@
   testing.expectEqual('--brand', rule.style.item(0));
   testing.expectEqual('--brand: #336699; --theme: light;', rule.style.cssText);
   testing.expectEqual('', rule.style.getPropertyValue('--pad'));
+}
+</script>
+<script id=stylesheet_computed_properties>
+{
+  const computed = getComputedStyle($('#computed-style'));
+  testing.expectEqual('#123456', computed.getPropertyValue('background'));
+  testing.expectEqual('rgb(1, 2, 3)', computed.getPropertyValue('color'));
+  testing.expectEqual('12px', computed.getPropertyValue('padding-left'));
+  const special = getComputedStyle($('#computed-style-special'));
+  testing.expectEqual('flex', special.getPropertyValue('display'));
+  testing.expectEqual('collapse', special.getPropertyValue('visibility'));
+  testing.expectEqual('visible', special.getPropertyValue('pointer-events'));
+  const inherited = getComputedStyle($('#computed-style-inherited'));
+  testing.expectEqual('collapse', inherited.getPropertyValue('visibility'));
+  testing.expectEqual('visible', inherited.getPropertyValue('pointer-events'));
+  const explicit = getComputedStyle($('#computed-style-inherited-explicit'));
+  testing.expectEqual('collapse', explicit.getPropertyValue('visibility'));
+  testing.expectEqual('visible', explicit.getPropertyValue('pointer-events'));
+  testing.expectEqual('rgb(9, 8, 7)', inherited.getPropertyValue('color'));
+  testing.expectEqual('1.5', inherited.getPropertyValue('line-height'));
+  testing.expectEqual('rgb(9, 8, 7)', getComputedStyle($('#computed-style-unset-color')).getPropertyValue('color'));
+  testing.expectEqual('20px', getComputedStyle($('#computed-style-inherit-margin')).getPropertyValue('margin-left'));
+  testing.expectEqual('0px', getComputedStyle($('#computed-style-unset-margin')).getPropertyValue('margin-left'));
+  testing.expectEqual('rgb(0, 0, 0)', getComputedStyle($('#computed-style-initial-color')).getPropertyValue('color'));
+
+  // Stylesheet !important outranks a normal inline declaration.
+  testing.expectEqual('blue', getComputedStyle($('#computed-style-important')).getPropertyValue('color'));
 }
 </script>

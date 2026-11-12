@@ -473,6 +473,25 @@ pub fn sendEvent(self: *CDP, method: []const u8, p: anytype, opts: SendEventOpts
 }
 
 pub const BrowserContext = struct {
+    pub const NativeCapture = struct { generation: u64 = 0, loader: u32 = 0, guard: @import("../../browser/ExactVisualGuard.zig").Capture = .{} };
+    pub const NativeInputChannel = struct {
+        id: u64 = 0,
+        ready: bool = false,
+        frame: usize = 0,
+        loader: u32 = 0,
+        focus_frame: usize = 0,
+        focus_loader: u32 = 0,
+        focus_element: usize = 0,
+        viewport: @import("../../browser/Viewport.zig") = .{ .width = 0, .height = 0 },
+        mouse: bool = false,
+        x: f64 = 0,
+        y: f64 = 0,
+        button: i32 = 0,
+        click_count: i32 = 0,
+        keys: [8][100]u8 = @splat(@splat(0)),
+        key_lengths: [8]usize = @splat(0),
+        key_count: usize = 0,
+    };
     const Node = @import("Node.zig");
     const AXNode = @import("AXNode.zig");
     const NodeRegistry = @import("../../NodeRegistry.zig");
@@ -580,6 +599,14 @@ pub const BrowserContext = struct {
     // A cancelled text-less keyDown drops the char message that follows it
     // (chromedp's keyDown/char/keyUp split), as Chrome does.
     suppress_next_char: bool = false,
+
+    native_capture_generation: u64 = 0,
+    native_captures: [8]NativeCapture = @splat(.{}),
+    native_displayed_capture: NativeCapture = .{},
+    native_displayed_scene: u64 = 0,
+    // Independent of the consumed displayed guard; never evicted while active.
+    native_input_channels: [16]NativeInputChannel = @splat(.{}),
+    native_input_high_water: [16]u64 = @splat(0),
 
     security_origin: []const u8,
     page_life_cycle_events: bool,
@@ -703,6 +730,7 @@ pub const BrowserContext = struct {
         }
 
         try notification.register(.frame_remove, self, onFrameRemove);
+        try notification.register(.page_closed, self, onPageClosed);
         try notification.register(.frame_created, self, onFrameCreated);
         try notification.register(.frame_navigate, self, onFrameNavigate);
         try notification.register(.frame_navigated, self, onFrameNavigated);
@@ -904,8 +932,11 @@ pub const BrowserContext = struct {
     pub fn ownsFrame(self: *const BrowserContext, frame_id: u32) bool {
         const handle = self.page_handle orelse return false;
         if (handle.frame_id == frame_id) return true;
-        const frame = self.session.findFrameByFrameId(frame_id) orelse return false;
-        return frame.page.frame._frame_id == handle.frame_id;
+        var frame = self.session.findFrameByFrameId(frame_id) orelse return false;
+        // Creator-owned popups are separate top-level contexts, not child
+        // frames of this target, even while they share its Page allocation.
+        while (frame.parent) |parent| frame = parent;
+        return frame._frame_id == handle.frame_id;
     }
 
     fn ownsTransfer(self: *const BrowserContext, transfer: *const HttpClient.Transfer) bool {
@@ -1037,6 +1068,7 @@ pub const BrowserContext = struct {
         self.detachAllSessions();
 
         try cdp.sendEvent("Target.targetDestroyed", .{ .targetId = target_id }, .{});
+        self.target_id = null;
 
         if (self.page_handle) |handle| {
             handle.close();
@@ -1047,7 +1079,6 @@ pub const BrowserContext = struct {
             world.deinit();
         }
         self.isolated_worlds.clearRetainingCapacity();
-        self.target_id = null;
         self.retired_target = true;
     }
 
@@ -1203,6 +1234,11 @@ pub const BrowserContext = struct {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
         if (!self.ownsFrame(msg.frame_id)) return;
         @import("domains/page.zig").frameRemove(self);
+    }
+
+    fn onPageClosed(ctx: *anyopaque, frame_id: u32) !void {
+        const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        if (self.ownsFrame(frame_id)) try self.closeTarget();
     }
 
     fn onFrameCreated(ctx: *anyopaque, frame: *Frame) !void {

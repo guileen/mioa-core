@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+const EnvironmentApi = @import("environment_api");
 
 const truncateUtf8 = @import("string.zig").truncateUtf8;
 
@@ -90,12 +91,17 @@ pub var opts = Opts{};
 var color_enabled_cached: bool = undefined;
 var color_enabled_once = lp.once(initColorEnabled);
 
+fn noColorDisables(value: ?[]const u8) bool {
+    return if (value) |text| text.len != 0 else false;
+}
+
 fn initColorEnabled() void {
-    if (std.c.getenv("NO_COLOR")) |val| {
-        if (std.mem.span(val).len > 0) {
-            color_enabled_cached = false;
-            return;
-        }
+    var value: EnvironmentApi.mioa_environment_value_v1 = .{ .value = null, .length = 0 };
+    const status = EnvironmentApi.mioa_environment_get_v1("NO_COLOR", &value);
+    defer EnvironmentApi.mioa_environment_value_release_v1(&value);
+    if (status == EnvironmentApi.MIOA_ENVIRONMENT_OK and noColorDisables(value.value[0..value.length])) {
+        color_enabled_cached = false;
+        return;
     }
     color_enabled_cached = std.Io.File.stderr().isTty(lp.io) catch false;
 }
@@ -769,6 +775,12 @@ test "log: colored" {
     aw.clearRetainingCapacity();
     try writeValue(.pretty, green("--wait-ms"), &aw.writer);
     try testing.expectEqual("\x1b[0;32m--wait-ms\x1b[0m", aw.written());
+}
+
+test "log: NO_COLOR requires a nonempty value" {
+    try testing.expect(!noColorDisables(null));
+    try testing.expect(!noColorDisables(""));
+    try testing.expect(noColorDisables("1"));
 }
 
 test "log: color disabled (NO_COLOR / non-tty)" {

@@ -30,6 +30,7 @@ const reflect = @import("../reflect.zig");
 const HtmlElement = @import("../webapi/element/Html.zig");
 
 const v8 = js.v8;
+extern "c" fn lp_runtime_v8_configure_code_range(*v8.CreateParams) void;
 const log = lp.log;
 const JsApis = bridge.JsApis;
 const PageJsApis = bridge.PageJsApis;
@@ -145,6 +146,9 @@ pub fn create() !Snapshot {
     params.array_buffer_allocator = v8.v8__ArrayBuffer__Allocator__NewDefaultAllocator(4 * 1024 * 1024 * 1024);
     defer v8.v8__ArrayBuffer__Allocator__DELETE(params.array_buffer_allocator.?);
     params.external_references = external_references;
+
+    if (lp.RuntimeMemory.isManaged() and @import("build_config").accounted_clone)
+        lp_runtime_v8_configure_code_range(&params);
 
     const snapshot_creator = v8.v8__SnapshotCreator__CREATE(&params);
     defer v8.v8__SnapshotCreator__DESTRUCT(snapshot_creator);

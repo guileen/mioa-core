@@ -1,6 +1,7 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 const Frame = @import("Frame.zig");
+const ExactVisualGuard = @import("ExactVisualGuard.zig");
 const Node = @import("webapi/Node.zig");
 const Element = @import("webapi/Element.zig");
 const DOMRect = @import("webapi/DOMRect.zig");
@@ -185,18 +186,8 @@ fn surface(context: *anyopaque, key: usize, pixel_width: *u32, pixel_height: *u3
     return bytes.ptr;
 }
 
-fn controlSelectionFocus(control: anytype) usize {
-    return @min(control.getValue().len, if (control._selection_direction == .backward) control._selection_start else control._selection_end);
-}
-const SelectionFocus = struct { node: *Node, offset: usize };
-fn selectionFocus(frame: *Frame) ?SelectionFocus {
-    const selection = &frame.document._selection;
-    const range = (selection._range orelse return null).asAbstractRange();
-    const backward = selection._direction == .backward;
-    const node = if (backward) range.getStartContainer() else range.getEndContainer();
-    if (!node.isConnected() or node.ownerFrame(frame) != frame) return null;
-    return .{ .node = node, .offset = if (backward) range.getStartOffset() else range.getEndOffset() };
-}
+const controlSelectionFocus = ExactVisualGuard.controlSelectionFocus;
+const selectionFocus = ExactVisualGuard.selectionFocus;
 
 pub const Caret = struct {
     rect: [4]f64 = .{ 0, 0, 0, 0 },
@@ -351,16 +342,102 @@ fn writeBytes(context: *anyopaque, data: [*]const u8, len: usize) callconv(.c) b
 }
 extern "c" fn lp_document_rgba(*Document, *anyopaque, *const fn (*anyopaque, [*]const u8, usize) callconv(.c) bool) bool;
 
+const BorrowedPaint = struct {
+    frame: *Frame,
+    width: u32,
+    height: u32,
+    scale: f32,
+    key: ExactVisualGuard.Key,
+    guard: ExactVisualGuard.Capture = .{},
+    stable: bool = false,
+    failure: ?anyerror = null,
+};
+fn paintBorrowed(context: *anyopaque, pixels: [*]u8, len: usize, stride: usize) callconv(.c) bool {
+    const was_paused = @import("TaskGate.zig").callbackEnter();
+    defer @import("TaskGate.zig").callbackExit(was_paused);
+    const paint: *BorrowedPaint = @ptrCast(@alignCast(context));
+    paint.guard = ExactVisualGuard.prepare(paint.frame, paint.key) catch |err| {
+        paint.failure = err;
+        return false;
+    };
+    if (paint.guard.viewport.width != paint.width or paint.guard.viewport.height != paint.height or
+        paint.guard.viewport.scale != paint.scale)
+    {
+        paint.failure = error.VisualUnstable;
+        return false;
+    }
+    clearPaint(paint.frame);
+    const value = document(paint.frame) catch |err| {
+        paint.failure = err;
+        return false;
+    };
+    if (!lp_document_paint_borrowed(value, paint.width, paint.height, paint.scale, pixels, len, stride)) {
+        paint.failure = error.RawFrameFailed;
+        return false;
+    }
+    paint.stable = ExactVisualGuard.validate(paint.frame, paint.guard, false);
+    return true;
+}
+extern "c" fn lp_document_paint_borrowed(*Document, u32, u32, f32, [*]u8, usize, usize) bool;
+const BackingMetadata = extern struct { row_stride: u64 = 0, byte_length: u64 = 0, allocation_bytes: u64 = 0 };
+// Private result bits: 1 = all native aliases released, 2 = paint completed.
+extern "c" fn lp_broker_paint([*:0]const u8, u64, i32, u32, i32, u32, u32, u32, *anyopaque, *const fn (*anyopaque, [*]u8, usize, usize) callconv(.c) bool, *BackingMetadata) u32;
+
+pub const BrokerFrame = struct {
+    width: u32,
+    height: u32,
+    stride: u32,
+    byte_length: u64,
+    allocation_bytes: u64,
+    guard: ExactVisualGuard.Capture,
+    painted: bool,
+    capture_stable: bool,
+    failure: ?anyerror,
+};
+/// Trusted cooperative CPU-only writer. The broker retains its writer use until
+/// its own trusted-profile terminal protocol completes; this is not publication.
+pub fn brokerFrame(frame: *Frame, name: [:0]const u8, epoch: u64, host: i32, uid: u32, version: i32, timeout: u32, key: ExactVisualGuard.Key) !BrokerFrame {
+    if (comptime @import("builtin").os.tag != .macos) return error.Unsupported;
+    const view = frame.page.getViewport();
+    if (view.width == 0 or view.height == 0 or !std.math.isFinite(view.scale) or view.scale < 0.25 or view.scale > 8) return error.InvalidExtent;
+    const physical_width = @ceil(@as(f64, @floatFromInt(view.width)) * @as(f64, view.scale));
+    const physical_height = @ceil(@as(f64, @floatFromInt(view.height)) * @as(f64, view.scale));
+    if (physical_width < 1 or physical_height < 1 or physical_width > 3840 * 2160 or physical_height > 3840 * 2160 or physical_width * physical_height > 3840 * 2160) return error.InvalidExtent;
+    const width: u32 = @intFromFloat(physical_width);
+    const raster_height: u32 = @intFromFloat(physical_height);
+    var paint: BorrowedPaint = .{ .frame = frame, .width = view.width, .height = view.height, .scale = view.scale, .key = key };
+    var metadata: BackingMetadata = .{};
+    const suspended = @import("TaskGate.zig").pauseForWait();
+    const status = lp_broker_paint(name.ptr, epoch, host, uid, version, timeout, width, raster_height, &paint, paintBorrowed, &metadata);
+    @import("TaskGate.zig").resumeAfterWait(suspended);
+    if ((status & 1) == 0) return error.RawFrameFailed;
+    const painted = (status & 2) != 0;
+    return .{ .width = width, .height = raster_height, .stride = @intCast(metadata.row_stride), .byte_length = metadata.byte_length, .allocation_bytes = metadata.allocation_bytes, .guard = paint.guard, .painted = painted, .failure = paint.failure, .capture_stable = painted and paint.stable and ExactVisualGuard.validate(frame, paint.guard, false) };
+}
+
 pub const RawFrame = extern struct { width: u32 = 0, height: u32 = 0, stride: u32 = 0, theme: u32 = 0, fingerprint: [32]u8 = undefined };
+pub const FingerprintCache = struct { guard: ExactVisualGuard.Capture, pixels: [32]u8, scoped: [32]u8 };
 pub fn rawFrame(frame: *Frame, path: []const u8, slot: u32) !RawFrame {
+    // Clear before prepare can replace a history entry, including failed paints.
+    frame._native_fingerprint_cache = null;
+    const guard: ?ExactVisualGuard.Capture = ExactVisualGuard.prepare(frame, .{ .owner = @intFromPtr(frame), .generation = std.math.maxInt(u64) }) catch null;
     const view = frame.page.getViewport();
     clearPaint(frame);
     var result: RawFrame = .{};
-    if (!lp_document_raw_frame(try document(frame), path.ptr, path.len, slot, view.width, view.height, view.scale, &result)) return error.RawFrameFailed;
+    if (!lp_document_raw_frame(try document(frame), path.ptr, path.len, slot, view.width, view.height, view.scale, hashPixels, &result)) return error.RawFrameFailed;
+    const pixels = result.fingerprint;
     result.fingerprint = try scopedFingerprint(frame, result.fingerprint);
+    if (guard) |stable| {
+        if (ExactVisualGuard.validate(frame, stable, false)) frame._native_fingerprint_cache = .{ .guard = stable, .pixels = pixels, .scoped = result.fingerprint };
+    }
     return result;
 }
-extern "c" fn lp_document_raw_frame(*Document, [*]const u8, usize, u32, u32, u32, f32, *RawFrame) bool;
+// Keep raw capture and atomic input on the same SHA-256 implementation. Zig's
+// target-selected backend uses the host SHA instructions without a Rust asm dep.
+fn hashPixels(bytes: [*]const u8, len: usize, out: *[32]u8) callconv(.c) void {
+    std.crypto.hash.sha2.Sha256.hash(bytes[0..len], out, .{});
+}
+extern "c" fn lp_document_raw_frame(*Document, [*]const u8, usize, u32, u32, u32, f32, *const fn ([*]const u8, usize, *[32]u8) callconv(.c) void, *RawFrame) bool;
 fn clearPaint(frame: *Frame) void {
     if (frame._layout_document) |value| lp_document_clear_paint(value);
     for (frame.child_frames.items) |child| clearPaint(child);
@@ -368,9 +445,17 @@ fn clearPaint(frame: *Frame) void {
 extern "c" fn lp_document_clear_paint(*Document) void;
 
 pub fn frameFingerprint(frame: *Frame) ![32]u8 {
+    if (frame._native_fingerprint_cache) |cached| {
+        if (ExactVisualGuard.validate(frame, cached.guard, false)) {
+            // Reproject every document: don't substitute a notification counter
+            // for current DOM/style/resource semantics. Only pixels are reused.
+            const scoped = try scopedFingerprint(frame, cached.pixels);
+            if (std.mem.eql(u8, &scoped, &cached.scoped) and ExactVisualGuard.validate(frame, cached.guard, false)) return scoped;
+        }
+    }
     const view = frame.page.getViewport();
     var pixels: [32]u8 = undefined;
-    if (!lp_document_frame_fingerprint(try document(frame), view.width, view.height, view.scale, &pixels)) return error.RawFrameFailed;
+    if (!lp_document_frame_fingerprint(try document(frame), view.width, view.height, view.scale, hashPixels, &pixels)) return error.RawFrameFailed;
     return scopedFingerprint(frame, pixels);
 }
 fn scopedFingerprint(frame: *Frame, pixels: [32]u8) ![32]u8 {
@@ -389,13 +474,15 @@ fn hashDocumentTree(frame: *Frame, hasher: *std.crypto.hash.sha2.Sha256) !void {
     hasher.update(std.mem.asBytes(&frame.page.style_version));
     for (frame.child_frames.items) |child| try hashDocumentTree(child, hasher);
 }
-extern "c" fn lp_document_frame_fingerprint(*Document, u32, u32, f32, *[32]u8) bool;
+extern "c" fn lp_document_frame_fingerprint(*Document, u32, u32, f32, *const fn ([*]const u8, usize, *[32]u8) callconv(.c) void, *[32]u8) bool;
 
 /// Cheap renderer-owned dirtiness; only scanned while a native client subscribes.
 pub fn revision(frame: *Frame) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(std.mem.asBytes(&frame.page.dom_version));
     hasher.update(std.mem.asBytes(&frame.page.style_version));
+    const visual_generation = frame.page.visual_generation.load(.acquire);
+    hasher.update(std.mem.asBytes(&visual_generation));
     const view = frame.page.getViewport();
     hasher.update(std.mem.asBytes(&view.width));
     hasher.update(std.mem.asBytes(&view.height));
@@ -431,6 +518,28 @@ fn hashRevision(frame: *Frame, hasher: *std.hash.Wyhash) void {
     for (frame.child_frames.items) |child| hashRevision(child, hasher);
 }
 
+test "browser.native_layout: delayed native borrow rejects changed viewport and DPR before paint" {
+    const testing = @import("../testing.zig");
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const view = frame.page.getViewport();
+    var bytes: [64]u8 = @splat(0xa5);
+    for ([_]bool{ false, true }) |dpr| {
+        var paint: BorrowedPaint = .{
+            .frame = frame,
+            .width = if (dpr) view.width else view.width + 1,
+            .height = view.height,
+            .scale = if (dpr) view.scale + 0.5 else view.scale,
+            .key = .{ .owner = 1, .generation = if (dpr) 2 else 1 },
+        };
+        try testing.expect(!paintBorrowed(&paint, &bytes, bytes.len, 16));
+        try testing.expect(paint.failure != null);
+        try testing.expectEqual(error.VisualUnstable, paint.failure.?);
+        try testing.expect(!paint.stable);
+        for (bytes) |byte| try testing.expect(byte == 0xa5);
+    }
+}
+
 test "browser.native_layout: authoritative focus and dynamic CSS" {
     try @import("../testing.zig").htmlRunner("canvas/native_layout_focus.html", .{});
 }
@@ -440,7 +549,7 @@ test "browser.native_layout: selection focus uses live UTF-8 direction" {
         _selection_start: u32,
         _selection_end: u32,
         _selection_direction: @import("webapi/Selection.zig").SelectionDirection,
-        fn getValue(_: @This()) []const u8 {
+        pub fn getValue(_: @This()) []const u8 {
             return "A😀中";
         }
     };

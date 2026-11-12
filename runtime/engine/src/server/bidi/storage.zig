@@ -53,6 +53,15 @@ pub fn add(jar: *Cookie.Jar, fields: Cookie.Fields, url: ?[:0]const u8) !void {
         error.OutOfMemory, error.InvalidDomain => |e| return e,
         error.InvalidCookie => return error.UnableToSetCookie,
     };
+    if (jar.profile_client) |client| {
+        cookie.deinit();
+        const reply = client.request(jar.allocator, "cookies.fields_set", .{ .fields = fields, .url = url }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnableToSetCookie,
+        };
+        defer reply.deinit();
+        return;
+    }
 
     jar.add(cookie, lp.datetime.timestamp(.real), true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -127,7 +136,7 @@ pub const HttpCookie = struct {
 };
 
 // A network.Cookie.
-const BiDiCookie = struct {
+pub const BiDiCookie = struct {
     cookie: *const Cookie,
 
     pub fn jsonStringify(self: BiDiCookie, jws: anytype) !void {
@@ -228,7 +237,7 @@ fn requireUserContext(cmd: *BiDi.Command, id: []const u8) !?[]const u8 {
 }
 
 // storage.CookieFilter: a cookie matches when every field given is equal.
-const Filter = struct {
+pub const Filter = struct {
     name: ?[]const u8 = null,
     value: ?BytesValue = null,
     domain: ?[]const u8 = null,
@@ -246,7 +255,7 @@ const Filter = struct {
         }
     }
 
-    fn matches(self: *const Filter, cookie: *const Cookie) bool {
+    pub fn matches(self: *const Filter, cookie: *const Cookie) bool {
         if (self.name) |name| if (std.mem.eql(u8, name, cookie.name) == false) return false;
         if (self.value) |value| if (std.mem.eql(u8, value.value, cookie.value) == false) return false;
         if (self.domain) |domain| if (std.mem.eql(u8, domain, cookie.domain) == false) return false;
@@ -274,6 +283,13 @@ fn getCookies(cmd: *BiDi.Command) !void {
     filter.decode(cmd.arena) catch return cmd.sendError("invalid argument", "invalid filter.value");
 
     const jar = &cmd.bidi.user_context.session.cookie_jar;
+    if (jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.bidi_get", .{ .filter = filter });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .array) return error.ProfileProtocolError;
+        return cmd.sendResult(.{ .cookies = result, .partitionKey = .{ .userContext = user_context } });
+    }
     try jar.removeExpired(null);
 
     var cookies: std.ArrayList(BiDiCookie) = .empty;
@@ -336,6 +352,11 @@ fn deleteCookies(cmd: *BiDi.Command) !void {
 
     var filter = p.filter;
     filter.decode(cmd.arena) catch return cmd.sendError("invalid argument", "invalid filter.value");
+    if (cmd.bidi.user_context.session.cookie_jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.bidi_delete", .{ .filter = filter });
+        defer reply.deinit();
+        return cmd.sendResult(.{ .partitionKey = .{ .userContext = user_context } });
+    }
 
     try remove(&cmd.bidi.user_context.session.cookie_jar, &filter, Filter.matches);
     return cmd.sendResult(.{ .partitionKey = .{ .userContext = user_context } });

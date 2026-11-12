@@ -50,6 +50,8 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         close,
         captureScreenshot,
         captureRawFrame,
+        captureBrokerFrame,
+        bindDisplayedFrame,
         subscribeNativeFrames,
         getSiteIcon,
         subscribeSiteIcons,
@@ -76,6 +78,8 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .close => return close(cmd),
         .captureScreenshot => return captureScreenshot(cmd),
         .captureRawFrame => return captureRawFrame(cmd),
+        .captureBrokerFrame => return captureBrokerFrame(cmd),
+        .bindDisplayedFrame => return bindDisplayedFrame(cmd),
         .subscribeNativeFrames => {
             const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
             try bc.nativeFramesEnable();
@@ -1121,6 +1125,163 @@ const Viewport = struct {
     height: f64,
     scale: f64,
 };
+
+const BrokerDiagnosticStage = enum {
+    params_missing,
+    params_invalid,
+    host_missing,
+    uid_missing,
+    version_missing,
+    host_parse,
+    uid_parse,
+    version_parse,
+    authority_mismatch,
+    context_missing,
+    frame_missing,
+    destination_storage,
+    generation_exhausted,
+    raster,
+};
+var broker_diagnostic_count = std.atomic.Value(u32).init(0);
+fn brokerDiagnostic(stage: BrokerDiagnosticStage, failure: ?anyerror) void {
+    var count = broker_diagnostic_count.load(.monotonic);
+    while (count < 8) {
+        if (broker_diagnostic_count.cmpxchgWeak(count, count + 1, .monotonic, .monotonic)) |observed| {
+            count = observed;
+            continue;
+        }
+        log.warn(.cdp, "broker capture diagnostic", .{
+            .stage = @tagName(stage),
+            .failure = if (failure) |err| @errorName(err) else "none",
+            .sequence = count + 1,
+        });
+        return;
+    }
+}
+
+fn captureBrokerFrame(cmd: *CDP.Command) !void {
+    const Params = struct { broker: []const u8, epoch: u64, hostPid: i32, hostUid: u32, timeoutMs: u32 };
+    const params = try cmd.params(Params) orelse {
+        brokerDiagnostic(.params_missing, null);
+        return cmd.sendError(-32602, "broker destination required", .{});
+    };
+    if (params.broker.len == 0 or params.broker.len >= 128 or std.mem.indexOfScalar(u8, params.broker, 0) != null or
+        params.epoch == 0 or params.hostPid <= 0 or params.timeoutMs == 0 or params.timeoutMs > 10000)
+    {
+        brokerDiagnostic(.params_invalid, null);
+        return cmd.sendError(-32602, "invalid broker destination", .{});
+    }
+    // The owner identity is fixed by the trusted launcher, never by the CDP
+    // request. Standalone/headless processes do not enable this private path.
+    const host_env = std.c.getenv("MIOA_TRUSTED_RASTER_HOST_PID") orelse {
+        brokerDiagnostic(.host_missing, null);
+        return cmd.sendError(-32000, "trusted raster profile unavailable", .{});
+    };
+    const uid_env = std.c.getenv("MIOA_TRUSTED_RASTER_HOST_UID") orelse {
+        brokerDiagnostic(.uid_missing, null);
+        return cmd.sendError(-32000, "trusted raster profile unavailable", .{});
+    };
+    const version_env = std.c.getenv("MIOA_TRUSTED_RASTER_HOST_VERSION") orelse {
+        brokerDiagnostic(.version_missing, null);
+        return cmd.sendError(-32000, "trusted raster profile unavailable", .{});
+    };
+    const host = std.fmt.parseInt(i32, std.mem.span(host_env), 10) catch |err| {
+        brokerDiagnostic(.host_parse, err);
+        return cmd.sendError(-32000, "trusted raster profile unavailable", .{});
+    };
+    const uid = std.fmt.parseInt(u32, std.mem.span(uid_env), 10) catch |err| {
+        brokerDiagnostic(.uid_parse, err);
+        return cmd.sendError(-32000, "trusted raster profile unavailable", .{});
+    };
+    const version = std.fmt.parseInt(i32, std.mem.span(version_env), 10) catch |err| {
+        brokerDiagnostic(.version_parse, err);
+        return cmd.sendError(-32000, "trusted raster profile unavailable", .{});
+    };
+    if (host <= 0 or host != params.hostPid or uid != params.hostUid) {
+        brokerDiagnostic(.authority_mismatch, null);
+        return cmd.sendError(-32000, "trusted raster authority mismatch", .{});
+    }
+    const bc = cmd.browser_context orelse {
+        brokerDiagnostic(.context_missing, error.BrowserContextNotLoaded);
+        return error.BrowserContextNotLoaded;
+    };
+    const frame = bc.mainFrame() orelse {
+        brokerDiagnostic(.frame_missing, error.FrameNotLoaded);
+        return error.FrameNotLoaded;
+    };
+    const name = cmd.arena.dupeSentinel(u8, params.broker, 0) catch |err| {
+        brokerDiagnostic(.destination_storage, err);
+        return err;
+    };
+    if (bc.native_capture_generation >= 9007199254740991) {
+        brokerDiagnostic(.generation_exhausted, error.InvalidState);
+        return error.InvalidState;
+    }
+    bc.native_capture_generation += 1;
+    const generation = bc.native_capture_generation;
+    const result = @import("../../../browser/native_layout.zig").brokerFrame(frame, name, params.epoch, host, uid, version, params.timeoutMs, .{ .owner = @intFromPtr(bc), .generation = generation }) catch |err| {
+        brokerDiagnostic(.raster, err);
+        return cmd.sendError(-32000, "broker frame failed; borrow release not established", .{});
+    };
+    bc.native_captures[@intCast(generation % bc.native_captures.len)] = .{};
+    const view = frame.page.getViewport();
+    const focused_frame = Frame.user_input.focusedFrame(frame);
+    const caret = if (result.capture_stable) @import("../../../browser/native_layout.zig").focusedCaret(frame, focused_frame) else @import("../../../browser/native_layout.zig").Caret{};
+    var focused_element_buffer: [32]u8 = undefined;
+    const focused_element_id = if (focused_frame.document._active_element) |element|
+        try std.fmt.bufPrint(&focused_element_buffer, "node-{x}", .{@intFromPtr(element.asNode())})
+    else
+        null;
+    const stable = result.capture_stable and @import("../../../browser/ExactVisualGuard.zig").validate(frame, result.guard, false);
+    if (stable) bc.native_captures[@intCast(generation % bc.native_captures.len)] = .{
+        .generation = generation,
+        .loader = frame._loader_id,
+        .guard = result.guard,
+    };
+    var model_buffer: [32]u8 = undefined;
+    var canvas_buffer: [32]u8 = undefined;
+    const capture_error: ?[]const u8 = if (result.failure) |failure| @errorName(failure) else if (!stable) "VisualUnstable" else null;
+    return cmd.sendResult(.{
+        .viewport = .{ .width = view.width, .height = view.height },
+        .width = result.width,
+        .height = result.height,
+        .stride = result.stride,
+        .byte_length = result.byte_length,
+        .allocation_bytes = result.allocation_bytes,
+        .dpr_milli = @as(u32, @intFromFloat(@round(view.scale * 1000))),
+        .format = "premultiplied-rgba8",
+        .writer = "trusted-cooperative-cpu",
+        .focused_frame_id = &id.toFrameId(focused_frame._frame_id),
+        .focused_element_id = focused_element_id,
+        .caret_rect = caret.rect,
+        .caret_kind = caret.kind,
+        .input_guard = if (stable) "native-exact-v1" else "unavailable",
+        .visual_generation = generation,
+        .model_stamp = try std.fmt.bufPrint(&model_buffer, "{d}", .{result.guard.model_stamp}),
+        .canvas_epoch = try std.fmt.bufPrint(&canvas_buffer, "{d}", .{result.guard.canvas_epoch}),
+        .capture_stable = stable,
+        .painted = result.painted,
+        .capture_error = capture_error,
+        .document_loader_id = frame._loader_id,
+        .writer_completion = .{ .epoch = params.epoch, .broker = params.broker, .phase = "borrow-released", .trust_profile = "trusted-core-cpu-v1" },
+    }, .{});
+}
+
+fn bindDisplayedFrame(cmd: *CDP.Command) !void {
+    const params = try cmd.params(struct { sceneRevision: u64, visualGeneration: u64 }) orelse return error.InvalidParams;
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+    if (params.sceneRevision == 0 or params.visualGeneration == 0 or params.sceneRevision <= bc.native_displayed_scene)
+        return cmd.sendError(-32042, "stale displayed scene", .{});
+    const capture = bc.native_captures[@intCast(params.visualGeneration % bc.native_captures.len)];
+    bc.native_displayed_capture = .{};
+    bc.native_displayed_scene = params.sceneRevision;
+    if (capture.generation != params.visualGeneration or capture.loader != frame._loader_id or
+        !@import("../../../browser/ExactVisualGuard.zig").pinDisplayed(frame, capture.guard))
+        return cmd.sendError(-32042, "stale native capture", .{});
+    bc.native_displayed_capture = capture;
+    return cmd.sendResult(null, .{});
+}
 
 fn captureRawFrame(cmd: *CDP.Command) !void {
     const Params = struct { path: []const u8, slot: u32 };

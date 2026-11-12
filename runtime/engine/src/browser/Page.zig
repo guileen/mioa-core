@@ -57,6 +57,8 @@ const Allocator = std.mem.Allocator;
 // For now, Session still holds a single Page.
 const Page = @This();
 
+pub const HoverStyle = enum { unknown, absent, present };
+
 session: *Session,
 
 // DOM version used to invalidate cached state of "live" collections. Ideally
@@ -75,6 +77,18 @@ dom_version: usize = 0,
 // Superset of dom_version that also moves for non-tree state (see
 // Frame.styleChanged); validates the StyleManager memo.
 style_version: usize = 0,
+
+// Whether any ingested rule can match `:hover`, the only selector state tied to
+// input_hover_target. `.unknown` is treated as present, so a page whose sheets
+// have not been ingested yet can never under-invalidate.
+hover_style: HoverStyle = .unknown,
+
+// Exact, saturating model epoch. A governed capture also checks every rendered
+// frame's identity/state and the canvas writer epoch; this counter alone is not
+// an authorization token. Saturation permanently disables exact qualification.
+visual_generation: std.atomic.Value(u64) = .init(0),
+canvas_epoch: std.atomic.Value(u64) = .init(0),
+canvas_writers: std.atomic.Value(u64) = .init(0),
 
 // Monotonic creation counter for BroadcastChannels in this Page. A postMessage
 // captures the current value so delivery targets only channels that existed
@@ -209,12 +223,10 @@ input_touch: @import("frame/user_input.zig").TouchInput = .{},
 input_pointer: @import("frame/user_input.zig").PointerButtons = .{},
 input_keyboard_modality: bool = false,
 
-// Popup Frames opened by window.open. They are top-level browsing contexts
-// (parent == null, no iframe element) but share this Page's factory, arena,
-// and identity map.
-// Their lifetime is bound to the Page: on Page.deinit they
-// are torn down. TODO: this is far from correct. An new window shouldn't be tied
-// to the original page like this.
+// Opener-bearing auxiliary Frames retain stable Window pointers in this Page.
+// Noopener contexts instead own independent Session Pages and CDP targets.
+// Retained opener references still bind these Frames to their creator's lifetime;
+// separating them requires a WindowProxy lifetime model.
 popups: std.ArrayList(*Frame) = .empty,
 
 // Popup Frames that have been closed. The window can still be referenced / used
@@ -256,7 +268,55 @@ pub fn getViewport(self: *const Page) Viewport {
     return self.session.browser.getViewport();
 }
 
+fn advanceVisualEpoch(epoch: *std.atomic.Value(u64)) void {
+    var current = epoch.load(.monotonic);
+    while (current != std.math.maxInt(u64)) {
+        current = epoch.cmpxchgWeak(current, current + 1, .release, .monotonic) orelse return;
+    }
+}
+
+pub fn visualChanged(self: *Page) void {
+    advanceVisualEpoch(&self.visual_generation);
+}
+
+pub const CanvasWrite = struct {
+    page: *Page,
+    counted: bool,
+
+    pub fn end(self: CanvasWrite) void {
+        if (!self.counted) return;
+        advanceVisualEpoch(&self.page.canvas_epoch);
+        self.page.visualChanged();
+        _ = self.page.canvas_writers.fetchSub(1, .release);
+    }
+};
+
+// Call while the observed Surface's mutex pins its Frame/Page and BEFORE any
+// backing mutation; end before unlocking, including failed/partial commands.
+pub fn beginCanvasWrite(self: *Page) CanvasWrite {
+    var writers = self.canvas_writers.load(.monotonic);
+    while (true) {
+        if (writers == std.math.maxInt(u64)) {
+            self.canvas_epoch.store(std.math.maxInt(u64), .release);
+            self.visual_generation.store(std.math.maxInt(u64), .release);
+            return .{ .page = self, .counted = false };
+        }
+        writers = self.canvas_writers.cmpxchgWeak(writers, writers + 1, .acq_rel, .monotonic) orelse break;
+    }
+    advanceVisualEpoch(&self.canvas_epoch);
+    self.visualChanged();
+    return .{ .page = self, .counted = true };
+}
+
+// An observed GPU completion failure cannot establish a stable canvas epoch.
+// Preserve normal teardown, but never qualify another exact capture on this Page.
+pub fn invalidateCanvasWrites(self: *Page) void {
+    self.canvas_epoch.store(std.math.maxInt(u64), .release);
+    self.visual_generation.store(std.math.maxInt(u64), .release);
+}
+
 pub fn viewportChanged(self: *Page) void {
+    self.visualChanged();
     self.frame.viewportChanged();
     var i: usize = 0;
     while (i < self.popups.items.len) : (i += 1) {

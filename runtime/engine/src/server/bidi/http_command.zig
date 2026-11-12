@@ -843,6 +843,13 @@ fn setTimeouts(cmd: *BiDi.Command, p: SetTimeouts) !void {
 fn getAllCookies(cmd: *BiDi.Command) !void {
     const frame = (try currentFrame(cmd)) orelse return;
     const jar = &cmd.bidi.user_context.session.cookie_jar;
+    if (jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.associated_get", .{ .url = frame.url, .name = @as(?[]const u8, null) });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .array) return error.ProfileProtocolError;
+        return cmd.sendResult(result);
+    }
     try jar.removeExpired(null);
 
     const associated: storage.Associated = .init(frame.url, null);
@@ -862,6 +869,14 @@ pub const CookieName = struct {
 fn getNamedCookie(cmd: *BiDi.Command, p: CookieName) !void {
     const frame = (try currentFrame(cmd)) orelse return;
     const jar = &cmd.bidi.user_context.session.cookie_jar;
+    if (jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.associated_get", .{ .url = frame.url, .name = p.name });
+        defer reply.deinit();
+        const result = reply.value.object.get("result") orelse return error.ProfileProtocolError;
+        if (result != .array) return error.ProfileProtocolError;
+        if (result.array.items.len == 0) return cmd.sendError("no such cookie", "no cookie with that name");
+        return cmd.sendResult(result.array.items[0]);
+    }
     try jar.removeExpired(null);
 
     const associated: storage.Associated = .init(frame.url, p.name);
@@ -917,6 +932,11 @@ fn addCookie(cmd: *BiDi.Command, p: AddCookie) !void {
 // DELETE /session/{id}/cookie/{name}, DELETE /session/{id}/cookie
 fn deleteCookies(cmd: *BiDi.Command, name: ?[]const u8) !void {
     const frame = (try currentFrame(cmd)) orelse return;
+    if (cmd.bidi.user_context.session.cookie_jar.profile_client) |client| {
+        const reply = try client.request(cmd.arena, "cookies.associated_delete", .{ .url = frame.url, .name = name });
+        defer reply.deinit();
+        return cmd.sendDone();
+    }
     const associated: storage.Associated = .init(frame.url, name);
     try storage.remove(&cmd.bidi.user_context.session.cookie_jar, &associated, storage.Associated.has);
     return cmd.sendDone();

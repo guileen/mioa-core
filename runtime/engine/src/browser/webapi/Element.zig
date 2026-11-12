@@ -951,6 +951,7 @@ pub fn attachShadow(self: *Element, opts: ShadowRoot.AttachOptions, frame: *Fram
     const page = frame.page;
     try page.element_shadow_roots.put(page.arena, self, shadow_root);
     self._flags.shadow_host = true;
+    if (self.ownerFrame(frame)) |owner| owner.domChanged();
     return shadow_root;
 }
 
@@ -2044,6 +2045,7 @@ fn writeScroll(self: *Element, write: ScrollWrite, frame: *Frame) !bool {
     }
     gop.value_ptr.x = x;
     gop.value_ptr.y = y;
+    owner.page.visualChanged();
     try self.scheduleScrollEvents(gop.value_ptr, owner);
     return true;
 }

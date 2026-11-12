@@ -100,3 +100,26 @@
   }
   testing.expectError("QuotaExceededError", () => localStorage.setItem("last", "v"));
 </script>
+
+<script id="localstorage_large_value">
+  localStorage.clear();
+  // Escaping and multi-byte characters cross transport chunk boundaries.
+  const value = '"😀'.repeat(1024 * 1024);
+  localStorage.setItem('large', value);
+  testing.expectEqual(value, localStorage.getItem('large'));
+  testing.expectEqual(1, localStorage.length);
+  testing.expectError("QuotaExceededError", () => localStorage.setItem('other', 'x'));
+  testing.expectEqual(value, localStorage.getItem('large'));
+  testing.expectEqual(null, localStorage.getItem('other'));
+  localStorage.removeItem('large');
+  testing.expectEqual(0, localStorage.length);
+  // Key bytes are not charged against the value quota.
+  const largeKey = 'k'.repeat(5 * 1024 * 1024 + 1);
+  localStorage.setItem(largeKey, 'key value');
+  testing.expectEqual('key value', localStorage.getItem(largeKey));
+  localStorage.removeItem(largeKey);
+  testing.expectEqual(null, localStorage.getItem(largeKey));
+  localStorage.setItem('after', 'ok');
+  testing.expectEqual('ok', localStorage.getItem('after'));
+  localStorage.clear();
+</script>
