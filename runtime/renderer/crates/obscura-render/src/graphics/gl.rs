@@ -85,6 +85,12 @@ impl GlContext {
         Ok(Self {context,library,gl:std::mem::ManuallyDrop::new(gl),width,height,backend,fbo,color,depth,precision_query,errors:std::collections::VecDeque::new(),shaders:HashMap::new(),programs:HashMap::new(),buffers:HashMap::new(),textures:HashMap::new(),framebuffers:HashMap::new(),renderbuffers:HashMap::new(),uniforms:HashMap::new(),next_uniform:1})
     } }
     fn current(&self)->Result<Current,String> { unsafe { let old=CGLGetCurrentContext(); if CGLSetCurrentContext(self.context)!=0 { return Err("CGL context unavailable".into()); } Ok(Current(old)) } }
+    /// Completes submitted GPU work before an observed canvas writer is released.
+    pub fn finish(&mut self)->Result<(),String>{
+        let _current=self.current()?;
+        unsafe{self.gl.finish();}
+        Ok(())
+    }
     /// Uploads borrowed pixels directly; the driver consumes them synchronously.
     pub fn upload_texture_2d(&mut self,target:u32,level:i32,internal:i32,width:i32,height:i32,border:i32,format:u32,kind:u32,pixels:Option<&[u8]>)->Result<(),String>{
         let _current=self.current()?;

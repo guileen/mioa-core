@@ -3709,6 +3709,25 @@ impl TextEngine {
         &mut self,
         pixmap: &mut tiny_skia::Pixmap,
         text: &str,
+        text_style: LayoutStyle,
+        content: Rect,
+        multiline: bool,
+        selection_focus: Option<usize>,
+        clip: Option<Rect>,
+        clip_mask: Option<&tiny_skia::Mask>,
+        raster_scale: f32,
+        print_economy: bool,
+    ) -> Option<Rect> {
+        self.paint_control_text_borrowed(
+            &mut pixmap.as_mut(), text, text_style, content, multiline,
+            selection_focus, clip, clip_mask, raster_scale, print_economy,
+        )
+    }
+
+    pub(crate) fn paint_control_text_borrowed(
+        &mut self,
+        pixmap: &mut tiny_skia::PixmapMut<'_>,
+        text: &str,
         mut text_style: LayoutStyle,
         content: Rect,
         multiline: bool,
@@ -3764,7 +3783,7 @@ impl TextEngine {
             None => content,
         });
         self.finalize(item, origin, content.width, clip);
-        self.paint_item_with_clip_mask_scaled_for_print(
+        self.paint_item_with_clip_mask_scaled_for_print_borrowed(
             item, pixmap, (0.0, 0.0), clip, clip_mask, raster_scale, print_economy,
         );
         // Read insertion geometry before discarding the painted full-value
@@ -3906,6 +3925,21 @@ impl TextEngine {
         &mut self,
         idx: usize,
         pixmap: &mut tiny_skia::Pixmap,
+        offset: (f32, f32),
+        clip_override: Option<Rect>,
+        clip_mask: Option<&tiny_skia::Mask>,
+        raster_scale: f32,
+        print_economy: bool,
+    ) {
+        self.paint_item_with_clip_mask_scaled_for_print_borrowed(
+            idx, &mut pixmap.as_mut(), offset, clip_override, clip_mask, raster_scale, print_economy,
+        );
+    }
+
+    pub(crate) fn paint_item_with_clip_mask_scaled_for_print_borrowed(
+        &mut self,
+        idx: usize,
+        pixmap: &mut tiny_skia::PixmapMut<'_>,
         offset: (f32, f32),
         clip_override: Option<Rect>,
         clip_mask: Option<&tiny_skia::Mask>,
@@ -4219,41 +4253,68 @@ impl TextEngine {
         // glyph from the selected font without changing DOM text or the
         // natural content buffer. The direct pure-text slice is LTR-only;
         // logical-start marker placement arrives with the bidi foundation.
+        // Same device-grid treatment as the main run: `marker.x` / `marker.y`
+        // are logical CSS offsets, so rasterizing the marker at 1x would both
+        // misplace it (logical offset added to device pixels) and blur it at
+        // fractional raster scales.
         if let (Some(marker), Some(marker_buffer)) = (item.marker, item.marker_buffer.as_ref()) {
-            marker_buffer.draw(font_system, swash, default, |x, y, _, _, color| {
-                let px = ox as i32 + marker.x.round() as i32 + x;
-                let py = oy as i32 + marker.y.round() as i32 + y;
-                if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
-                    if (px as f32) < cx0
-                        || (px as f32) >= cx1
-                        || (py as f32) < cy0
-                        || (py as f32) >= cy1
-                    {
-                        return;
-                    }
+            for run in marker_buffer.layout_runs() {
+                for glyph in run.glyphs {
+                    let glyph_color = glyph.color_opt.unwrap_or(default);
+                    // `LayoutGlyph::physical` adds `offset` after scaling, so
+                    // the logical marker position must be converted to device
+                    // pixels explicitly.
+                    let physical = glyph.physical(
+                        (marker.x * raster_scale, marker.y * raster_scale),
+                        raster_scale,
+                    );
+                    swash.with_pixels(
+                        font_system,
+                        physical.cache_key,
+                        glyph_color,
+                        |x, y, color| {
+                            let px = ox as i32 + physical.x + x;
+                            let py = oy as i32
+                                + (run.line_y * raster_scale) as i32
+                                + physical.y
+                                + y;
+                            if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
+                                if (px as f32) < cx0
+                                    || (px as f32) >= cx1
+                                    || (py as f32) < cy0
+                                    || (py as f32) >= cy1
+                                {
+                                    return;
+                                }
+                            }
+                            if px < 0 || px >= pw || py < 0 || py >= ph {
+                                return;
+                            }
+                            let alpha = color.a() as u32 * glyph_color.a() as u32 / 255;
+                            if alpha == 0 {
+                                return;
+                            }
+                            let index = (py * pw + px) as usize;
+                            let dst = pixels[index];
+                            let inverse = 255 - alpha;
+                            let out_alpha = alpha + dst.alpha() as u32 * inverse / 255;
+                            let out_red =
+                                color.r() as u32 * alpha / 255 + dst.red() as u32 * inverse / 255;
+                            let out_green =
+                                color.g() as u32 * alpha / 255 + dst.green() as u32 * inverse / 255;
+                            let out_blue =
+                                color.b() as u32 * alpha / 255 + dst.blue() as u32 * inverse / 255;
+                            pixels[index] = tiny_skia::PremultipliedColorU8::from_rgba(
+                                out_red as u8,
+                                out_green as u8,
+                                out_blue as u8,
+                                out_alpha as u8,
+                            )
+                            .unwrap_or(dst);
+                        },
+                    );
                 }
-                if px < 0 || px >= pw || py < 0 || py >= ph {
-                    return;
-                }
-                let alpha = color.a() as u32;
-                if alpha == 0 {
-                    return;
-                }
-                let index = (py * pw + px) as usize;
-                let dst = pixels[index];
-                let inverse = 255 - alpha;
-                let out_alpha = alpha + dst.alpha() as u32 * inverse / 255;
-                let out_red = color.r() as u32 * alpha / 255 + dst.red() as u32 * inverse / 255;
-                let out_green = color.g() as u32 * alpha / 255 + dst.green() as u32 * inverse / 255;
-                let out_blue = color.b() as u32 * alpha / 255 + dst.blue() as u32 * inverse / 255;
-                pixels[index] = tiny_skia::PremultipliedColorU8::from_rgba(
-                    out_red as u8,
-                    out_green as u8,
-                    out_blue as u8,
-                    out_alpha as u8,
-                )
-                .unwrap_or(dst);
-            });
+            }
         }
 
         // Stroke underline segments with the same authored alpha as their
@@ -4327,6 +4388,7 @@ mod tests {
         engine.finalize(item, (0.0, 10.0), 200.0, None);
         (engine, item)
     }
+
 
     #[test]
     fn embedded_font_database_is_initialized_once() {

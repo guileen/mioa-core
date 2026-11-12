@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tiny_skia::{
     Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, PathBuilder, Pattern,
-    Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform,
+    Pixmap, PixmapMut, Point, RadialGradient, Rect, SpreadMode, Transform,
 };
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
@@ -3416,7 +3416,7 @@ fn paint_prepared_with_surface_color(
         scroll,
         None,
         None,
-        pixmap,
+        pixmap.as_mut(),
         resources,
         &prepared.selected_images,
         &EMPTY_CANVAS_SURFACES,
@@ -3440,7 +3440,8 @@ fn paint_prepared_with_surface_color(
         crate::Affine2::default(),
     );
     if painted.is_none() { prepared.native_control_carets.clear(); }
-    painted
+    painted?;
+    Some(pixmap)
 }
 
 /// Paint from the same resolved root + element scroll snapshot used by CSSOM
@@ -3510,7 +3511,7 @@ pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
         scroll.root_offset(),
         Some(scroll),
         None,
-        pixmap,
+        pixmap.as_mut(),
         resources,
         &prepared.selected_images,
         canvas_surfaces,
@@ -3534,7 +3535,8 @@ pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
         crate::Affine2::default(),
     );
     if painted.is_none() { prepared.native_control_carets.clear(); }
-    painted
+    painted?;
+    Some(pixmap)
 }
 
 /// Paint an arbitrary document-space rectangle from one retained layout and
@@ -3670,7 +3672,7 @@ fn paint_prepared_region_with_scroll_policy(
         root,
         Some(scroll),
         None,
-        pixmap,
+        pixmap.as_mut(),
         resources,
         &prepared.selected_images,
         canvas_surfaces,
@@ -3694,7 +3696,7 @@ fn paint_prepared_region_with_scroll_policy(
         crate::Affine2::translate(-surface_offset.0, -surface_offset.1),
     );
     if painted.is_none() { prepared.native_control_carets.clear(); }
-    let pixmap = painted.ok_or(CaptureError::PaintFailed)?;
+    painted.ok_or(CaptureError::PaintFailed)?;
 
     if native_scaled || (output_width == native_width && output_height == native_height) {
         return Ok(pixmap);
@@ -3715,6 +3717,169 @@ fn paint_prepared_region_with_scroll_policy(
     let size = tiny_skia::IntSize::from_wh(output_width, output_height)
         .ok_or(CaptureError::AllocationLimitExceeded)?;
     Pixmap::from_vec(scaled.into_raw(), size).ok_or(CaptureError::PaintFailed)
+}
+
+pub fn paint_prepared_region_into_borrowed(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    surface_color: [u8; 4],
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+    destination: &mut [u8],
+    row_stride: usize,
+) -> Result<(), CaptureError> {
+    prepared.native_control_carets.clear();
+    let (native_width, native_height, output_width, output_height) =
+        checked_capture_dimensions(region, false)?;
+    let scale_matches_output =
+        (output_width as f64 - f64::from(region.width) * f64::from(region.scale)).abs() <= 1.0
+            && (output_height as f64 - f64::from(region.height) * f64::from(region.scale)).abs()
+                <= 1.0;
+    let native_scaled = (output_width != native_width || output_height != native_height)
+        && scale_matches_output
+        && native_raster_scale_supported(tree, &prepared.layout);
+    if !native_scaled {
+        checked_capture_dimensions(region, true)?;
+    }
+    let (paint_width, paint_height, raster_scale) = if native_scaled {
+        (output_width, output_height, region.scale)
+    } else {
+        (native_width, native_height, 1.0)
+    };
+    let stride = (output_width as usize).checked_mul(4).ok_or(CaptureError::PaintFailed)?;
+    let size = row_stride.checked_mul(output_height as usize).ok_or(CaptureError::PaintFailed)?;
+    if row_stride < stride || row_stride % 4 != 0 || row_stride / 4 > u32::MAX as usize
+        || destination.len() != size {
+        return Err(CaptureError::PaintFailed);
+    }
+    let needs_resample = !native_scaled && (output_width != native_width || output_height != native_height);
+    let mut source = if needs_resample {
+        Some(Pixmap::new(paint_width, paint_height).ok_or(CaptureError::AllocationLimitExceeded)?)
+    } else { None };
+    let mut pixmap = match source.as_mut() {
+        Some(source) => source.as_mut(),
+        // tiny-skia's storage width is its row pitch. Keep the CSS/layout
+        // viewport unchanged and expose native padding as extra storage columns,
+        // never as extra document extent. No tight full-page staging copy.
+        None => PixmapMut::from_bytes(&mut *destination, (row_stride / 4) as u32, output_height).ok_or(CaptureError::PaintFailed)?,
+    };
+    pixmap.fill(Color::from_rgba8(
+        surface_color[0],
+        surface_color[1],
+        surface_color[2],
+        surface_color[3],
+    ));
+
+    // Resolved node movement already contains `-root_scroll` for ordinary
+    // document content and zero root movement for fixed content. Adding the
+    // live root offset back before subtracting the capture origin therefore
+    // maps ordinary nodes to page space while leaving fixed/sticky nodes at
+    // their live viewport's document-space position.
+    let root = scroll.root_offset();
+    let surface_offset = (root.0 - region.x, root.1 - region.y);
+    let canvas_background = canvas_background_source(tree, &prepared.layout);
+    let painted = paint_laid_dom_scrolled(
+        tree,
+        prepared.viewport,
+        prepared.base_url.as_deref(),
+        root,
+        Some(scroll),
+        None,
+        pixmap,
+        resources,
+        &prepared.selected_images,
+        canvas_surfaces,
+        &prepared.svg_fonts,
+        prepared.content_size,
+        &prepared.viewport_fixed,
+        &prepared.sticky,
+        &prepared.scroll_tree,
+        &mut prepared.layout,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some((region.width, region.height)),
+        surface_offset,
+        raster_scale,
+        false,
+        canvas_background,
+        &mut prepared.native_control_carets,
+        crate::Affine2::translate(-surface_offset.0, -surface_offset.1),
+    );
+    if painted.is_none() { prepared.native_control_carets.clear(); }
+    painted.ok_or(CaptureError::PaintFailed)?;
+
+    if let Some(source) = source {
+        resize_lanczos3_into(source.data(), native_width, native_height, destination, output_width, output_height, row_stride);
+    }
+    // Native padding is exported with the backing, but is not image content.
+    // Clear it even when a paint primitive covered the storage-only columns.
+    if row_stride != stride {
+        for row in destination.chunks_exact_mut(row_stride) { row[stride..].fill(0); }
+    }
+    Ok(())
+}
+
+// Match image::imageops::resize(Lanczos3)'s vertical f32 and horizontal
+// rounding passes, retaining only one intermediate row before writing the
+// final pixels directly into the caller's backing.
+fn resize_lanczos3_into(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32, row_stride: usize) {
+    fn sinc(x: f32) -> f32 {
+        let a = x * std::f32::consts::PI;
+        if x == 0.0 { 1.0 } else { a.sin() / a }
+    }
+    fn weights(pos: u32, old: u32, new: u32, ws: &mut Vec<f32>) -> u32 {
+        let ratio = old as f32 / new as f32;
+        let scale = ratio.max(1.0);
+        let center = (pos as f32 + 0.5) * ratio;
+        let left = ((center - 3.0 * scale).floor() as i64).clamp(0, old as i64 - 1) as u32;
+        let right = ((center + 3.0 * scale).ceil() as i64).clamp(left as i64 + 1, old as i64) as u32;
+        let center = center - 0.5;
+        ws.clear();
+        let mut sum = 0.0;
+        for i in left..right {
+            let x = (i as f32 - center) / scale;
+            let w = if x.abs() < 3.0 { sinc(x) * sinc(x / 3.0) } else { 0.0 };
+            ws.push(w);
+            sum += w;
+        }
+        for w in ws.iter_mut() { *w /= sum; }
+        left
+    }
+    let mut row = vec![[0.0f32; 4]; sw as usize];
+    let mut ws = Vec::new();
+    let mut horizontal = Vec::with_capacity(dw as usize);
+    let mut horizontal_weights = Vec::new();
+    for x in 0..dw {
+        let left = weights(x, sw, dw, &mut ws);
+        let start = horizontal_weights.len();
+        horizontal_weights.extend_from_slice(&ws);
+        horizontal.push((left, start, horizontal_weights.len()));
+    }
+    for y in 0..dh {
+        let top = weights(y, sh, dh, &mut ws);
+        for x in 0..sw {
+            let mut pixel = [0.0; 4];
+            for (i, w) in ws.iter().enumerate() {
+                let offset = (((top as usize + i) * sw as usize) + x as usize) * 4;
+                for c in 0..4 { pixel[c] += src[offset + c] as f32 * w; }
+            }
+            row[x as usize] = pixel;
+        }
+        for (x, &(left, start, end)) in horizontal.iter().enumerate() {
+            let mut pixel = [0.0; 4];
+            for (i, w) in horizontal_weights[start..end].iter().enumerate() {
+                let sample = row[left as usize + i];
+                for c in 0..4 { pixel[c] += sample[c] * w; }
+            }
+            let offset = y as usize * row_stride + x * 4;
+            for c in 0..4 { dst[offset + c] = pixel[c].clamp(0.0, 255.0).round() as u8; }
+        }
+    }
 }
 
 /// Whether a retained display list can currently be rasterized directly at a
@@ -3764,24 +3929,34 @@ fn native_raster_scale_supported(tree: &DomTree, laid: &crate::DomLayout) -> boo
                     crate::BackgroundGradientLayer::Conic { .. } => false,
                 })
             && (!has_gradient || direct_gradient_geometry_supported(style));
-        let simple = !has_authored_transform(style)
-            && style.opacity.is_none_or(|opacity| opacity >= 1.0)
+        // Pure translations reuse the existing offset painter, not an
+        // intermediate logical-pixel surface. Other transform kinds stay out.
+        let simple = style.individual_rotate.is_none()
+            && style.individual_scale.is_none()
+            && style
+                .transform_ops
+                .iter()
+                .all(|op| matches!(op, crate::TransformOp::Translate(..)))
+            && style
+                .opacity
+                .is_none_or(|opacity| opacity <= 0.0 || opacity >= 1.0)
             && style.clip_path.is_none()
             && style.background_image.is_none()
             && style.mask_image.is_none()
             && gradients_supported
             && !style.background_clip_text
-            && style.box_shadow.is_none()
-            && style.content_image.is_none()
-            && style.text_overflow == crate::TextOverflow::Clip;
+            && style.box_shadow.is_none_or(|shadow| !shadow.inset)
+            && style.content_image.is_none();
         simple
-            && style.before_pseudo.as_deref().is_none_or(style_supported)
-            && style.after_pseudo.as_deref().is_none_or(style_supported)
+            && style.before_pseudo.as_deref().is_none_or(|pseudo| {
+                !has_authored_transform(pseudo) && style_supported(pseudo)
+            })
+            && style.after_pseudo.as_deref().is_none_or(|pseudo| {
+                !has_authored_transform(pseudo) && style_supported(pseudo)
+            })
     }
 
-    if laid.clip_rects.values().any(|clip| clip.is_some())
-        || laid.styles.values().any(|style| !style_supported(style))
-    {
+    if laid.styles.values().any(|style| !style_supported(style)) {
         return false;
     }
     !tree.descendants(tree.document()).into_iter().any(|id| {
@@ -3963,7 +4138,7 @@ fn canvas_background_source(tree: &DomTree, laid: &crate::DomLayout) -> Option<C
 }
 
 fn paint_canvas_background(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     style: &crate::LayoutStyle,
     origin_rect: &crate::Rect,
     surface_rect: &crate::Rect,
@@ -4085,14 +4260,14 @@ fn paint_canvas_background(
     }
 }
 
-fn paint_laid_dom_scrolled(
+fn paint_laid_dom_scrolled<'a>(
     tree: &DomTree,
     viewport: (f32, f32),
     base_url: Option<&str>,
     scroll: (f32, f32),
     resolved_scroll: Option<&ResolvedScrollState>,
     shared_scroll_state: Option<&ScrollPaintState<'_>>,
-    mut pixmap: Pixmap,
+    mut pixmap: PixmapMut<'a>,
     image_cache: &mut RenderResourceCache,
     selected_images: &HashMap<obscura_dom::tree::NodeId, SelectedImage>,
     canvas_surfaces: &dyn CanvasSurfaceSource,
@@ -4114,7 +4289,7 @@ fn paint_laid_dom_scrolled(
     canvas_background: Option<CanvasBackground>,
     native_control_carets: &mut HashMap<obscura_dom::tree::NodeId, crate::Rect>,
     caret_to_viewport: crate::Affine2,
-) -> Option<Pixmap> {
+) -> Option<PixmapMut<'a>> {
     let scroll_state = match resolved_scroll {
         Some(resolved) => ScrollPaintState::from_resolved(
             tree,
@@ -4165,7 +4340,12 @@ fn paint_laid_dom_scrolled(
                         width: source_rect.width,
                         height: source_rect.height,
                     };
-                    let surface_rect = paint_surface_rect(&pixmap, raster_scale);
+                    let mut surface_rect = paint_surface_rect(&pixmap, raster_scale);
+                    if let Some((width, _)) = surface_extent {
+                        // Match the tight target's rounded device extent at
+                        // fractional DPR; only storage padding is excluded.
+                        surface_rect.width = surface_rect.width.min((width * raster_scale).ceil() / raster_scale);
+                    }
                     paint_canvas_background(
                         &mut pixmap,
                         style,
@@ -4448,10 +4628,11 @@ fn paint_laid_dom_scrolled(
                         pixmap.height(),
                         clip,
                         scroll_state.surface_extent.unwrap_or(viewport),
+                        raster_scale,
                     )
                 });
                 for &item in items {
-                    laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                    laid.text_engine.paint_item_with_clip_mask_scaled_for_print_borrowed(
                         item,
                         &mut pixmap,
                         offset,
@@ -4592,7 +4773,7 @@ fn paint_laid_dom_scrolled(
                 continue;
             }
             let layer_delta = (-left, -top);
-            let Some(layer) = Pixmap::new(layer_width, layer_height) else {
+            let Some(mut layer) = Pixmap::new(layer_width, layer_height) else {
                 continue;
             };
             let layer = paint_laid_dom_scrolled(
@@ -4602,7 +4783,7 @@ fn paint_laid_dom_scrolled(
                 scroll,
                 resolved_scroll,
                 Some(&scroll_state),
-                layer,
+                layer.as_mut(),
                 image_cache,
                 selected_images,
                 canvas_surfaces,
@@ -4646,6 +4827,7 @@ fn paint_laid_dom_scrolled(
                     pixmap.height(),
                     clip,
                     scroll_state.surface_extent.unwrap_or(viewport),
+                    raster_scale,
                 )
             });
             pixmap.draw_pixmap(
@@ -4674,7 +4856,7 @@ fn paint_laid_dom_scrolled(
             // Opacity is applied to the finished stacking context, never to
             // each primitive. Otherwise two opaque overlapping children at
             // opacity:.5 incorrectly become .75 alpha in their overlap.
-            let layer = Pixmap::new(pixmap.width(), pixmap.height())?;
+            let mut layer = Pixmap::new(pixmap.width(), pixmap.height())?;
             let layer = paint_laid_dom_scrolled(
                 tree,
                 viewport,
@@ -4682,7 +4864,7 @@ fn paint_laid_dom_scrolled(
                 scroll,
                 resolved_scroll,
                 Some(&scroll_state),
-                layer,
+                layer.as_mut(),
                 image_cache,
                 selected_images,
                 canvas_surfaces,
@@ -4795,6 +4977,7 @@ fn paint_laid_dom_scrolled(
                         pixmap.height(),
                         clip,
                         scroll_state.surface_extent.unwrap_or(viewport),
+                        raster_scale,
                     )
                 })
             })
@@ -4858,6 +5041,7 @@ fn paint_laid_dom_scrolled(
                     &rect,
                     style.border_model.radii,
                     ancestor_clip_mask.as_deref(),
+                    raster_scale,
                 );
             }
         }
@@ -5317,7 +5501,7 @@ fn paint_laid_dom_scrolled(
         if let Some(items) = laid.word_ifc_items.get(&nid) {
             let offset = scroll_state.translation_for(laid, nid);
             for &item in items {
-                laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                laid.text_engine.paint_item_with_clip_mask_scaled_for_print_borrowed(
                     item,
                     &mut pixmap,
                     offset,
@@ -5364,7 +5548,7 @@ fn paint_laid_dom_scrolled(
         // so the label and disclosure arrow belong to the atomic control.
         if name.local.as_ref() == "select" {
             if let Some(label) = selected_option_label(tree, nid) {
-                let _ = laid.text_engine.paint_control_text(
+                let _ = laid.text_engine.paint_control_text_borrowed(
                     &mut pixmap, &label, style.clone(), control_content, false, None,
                     clip, element_clip_mask, raster_scale, print_economy,
                 );
@@ -5524,7 +5708,7 @@ fn paint_laid_dom_scrolled(
                         text_style.line_height = pseudo.line_height.or(text_style.line_height);
                     }
                 }
-                let caret = laid.text_engine.paint_control_text(
+                let caret = laid.text_engine.paint_control_text_borrowed(
                     &mut pixmap, &shown, text_style, control_content,
                     name.local.as_ref() == "textarea", selection_focus, clip, element_clip_mask,
                     raster_scale, print_economy,
@@ -5587,10 +5771,11 @@ fn paint_laid_dom_scrolled(
                 pixmap.height(),
                 clip,
                 scroll_state.surface_extent.unwrap_or(viewport),
+                raster_scale,
             )
         });
         if let Some(idx) = whole {
-            laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+            laid.text_engine.paint_item_with_clip_mask_scaled_for_print_borrowed(
                 idx,
                 &mut pixmap,
                 off,
@@ -5604,7 +5789,7 @@ fn paint_laid_dom_scrolled(
         // `build_mixed_block`), pinned to their own boxes at finalize.
         if let Some(items) = run_items {
             for idx in items {
-                laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                laid.text_engine.paint_item_with_clip_mask_scaled_for_print_borrowed(
                     idx,
                     &mut pixmap,
                     off,
@@ -5627,7 +5812,7 @@ fn raster_transform(scale: f32) -> Transform {
 /// The raster target in the CSS-pixel coordinate space used by paint items.
 /// Region captures can raster directly above 1x, so device dimensions alone
 /// are not a valid cull rect.
-fn paint_surface_rect(pixmap: &Pixmap, raster_scale: f32) -> crate::Rect {
+fn paint_surface_rect(pixmap: &PixmapMut<'_>, raster_scale: f32) -> crate::Rect {
     let scale = if raster_scale.is_finite() && raster_scale > 0.0 {
         raster_scale
     } else {
@@ -5641,7 +5826,7 @@ fn paint_surface_rect(pixmap: &Pixmap, raster_scale: f32) -> crate::Rect {
     }
 }
 
-fn rect_intersects_paint_surface(rect: &crate::Rect, pixmap: &Pixmap, raster_scale: f32) -> bool {
+fn rect_intersects_paint_surface(rect: &crate::Rect, pixmap: &PixmapMut<'_>, raster_scale: f32) -> bool {
     rect.width > 0.0
         && rect.height > 0.0
         && rect
@@ -5689,7 +5874,7 @@ fn non_text_ink_bounds(rect: &crate::Rect, style: &crate::LayoutStyle) -> crate:
 /// decoration, while left/right borders and radii appear only on the first
 /// and last continuation respectively.
 fn paint_inline_fragment_decorations(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     fragments: &[crate::Rect],
     offset: (f32, f32),
     union: &crate::Rect,
@@ -5773,6 +5958,7 @@ fn paint_inline_fragment_decorations(
                 &fragment,
                 fragment_style.border_model.radii,
                 ancestor_clip_mask,
+                raster_scale,
             );
         }
         if fragment_style.mask_image.is_none() && !fragment_style.background_clip_text {
@@ -6311,7 +6497,7 @@ fn effective_border_styles(style: &crate::LayoutStyle) -> crate::Sides<crate::Bo
 }
 
 fn paint_css_border(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     rect: &crate::Rect,
     style: &crate::LayoutStyle,
     mask: Option<&tiny_skia::Mask>,
@@ -6471,7 +6657,7 @@ fn paint_css_border(
 }
 
 fn paint_css_outline(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     rect: &crate::Rect,
     style: &crate::LayoutStyle,
     mask: Option<&tiny_skia::Mask>,
@@ -6524,7 +6710,7 @@ fn paint_css_outline(
 }
 
 fn paint_uniform_border(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     rect: &crate::Rect,
     width: f32,
     line_style: crate::BorderStyle,
@@ -6583,7 +6769,7 @@ fn paint_uniform_border(
 }
 
 fn stroke_rounded_border_path(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     center_rect: &crate::Rect,
     width: f32,
     line_style: crate::BorderStyle,
@@ -6622,7 +6808,7 @@ fn stroke_rounded_border_path(
 }
 
 fn fill_solid_border_side(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     rect: &crate::Rect,
     widths: crate::Sides<f32>,
     radii: crate::ResolvedBorderRadii,
@@ -6764,7 +6950,7 @@ fn solid_border_side_path(
 }
 
 fn paint_straight_border_side(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     rect: &crate::Rect,
     side: Side,
     stroke_width: f32,
@@ -6836,36 +7022,44 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
 /// not painted. `clip`, when set, is the ancestor `overflow: hidden` region and
 /// is intersected with the shadow mask.
 fn paint_box_shadow(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     shadow: &crate::BoxShadow,
     rect: &crate::Rect,
     border_radius: crate::BorderRadii,
     ancestor_clip: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
 ) {
     if shadow.inset || shadow.color[3] == 0 {
         return;
     }
-    let spread = shadow.spread;
-    let x0 = rect.x + shadow.offset_x - spread;
-    let y0 = rect.y + shadow.offset_y - spread;
+    let border_radii = border_radius
+        .resolve(rect.width, rect.height)
+        .scaled(raster_scale);
+    let rect = crate::Rect {
+        x: rect.x * raster_scale,
+        y: rect.y * raster_scale,
+        width: rect.width * raster_scale,
+        height: rect.height * raster_scale,
+    };
+    let spread = shadow.spread * raster_scale;
+    let x0 = rect.x + shadow.offset_x * raster_scale - spread;
+    let y0 = rect.y + shadow.offset_y * raster_scale - spread;
     let w0 = rect.width + 2.0 * spread;
     let h0 = rect.height + 2.0 * spread;
     if w0 <= 0.0 || h0 <= 0.0 {
         return;
     }
-    let border_radii = border_radius.resolve(rect.width, rect.height);
     let radius = border_radii.top_left;
     let rx0 = (radius.0 + spread).max(0.0);
     let ry0 = (radius.1 + spread).max(0.0);
-    let blur = shadow.blur.max(0.0);
+    let css_blur = shadow.blur.max(0.0);
+    let blur = css_blur * raster_scale;
     let shadow_bounds = crate::Rect {
         x: x0 - blur,
         y: y0 - blur,
         width: w0 + 2.0 * blur,
         height: h0 + 2.0 * blur,
     };
-    // Shadows disable the native >1x path, so their paint coordinate space is
-    // the pixmap's one-CSS-pixel-per-pixel surface.
     if !rect_intersects_paint_surface(&shadow_bounds, pixmap, 1.0) {
         return;
     }
@@ -6883,7 +7077,7 @@ fn paint_box_shadow(
     let local_rect = crate::Rect {
         x: rect.x - left as f32,
         y: rect.y - top as f32,
-        ..*rect
+        ..rect
     };
     let Some(mut shadow_mask) = rounded_box_clip_mask_radii(
             shadow_pixmap.width(),
@@ -6895,10 +7089,10 @@ fn paint_box_shadow(
     };
     shadow_mask.invert();
     let color = shadow.color;
-    if blur < 0.5 {
+    if css_blur < 0.5 {
         // No blur: a single crisp, offset (and spread) rounded rect.
         fill_shadow_rect(
-            &mut shadow_pixmap,
+            &mut shadow_pixmap.as_mut(),
             x0 - left as f32,
             y0 - top as f32,
             w0,
@@ -6909,7 +7103,7 @@ fn paint_box_shadow(
             Some(&shadow_mask),
         );
     } else {
-        let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
+        let steps: u32 = (css_blur.ceil() as u32).clamp(2, 24);
         // Per-layer alpha chosen so `steps` source-over composites reach the target
         // alpha at the core: 1 - (1 - a)^steps == A  =>  a = 1 - (1 - A)^(1/steps).
         let a_frac = color[3] as f32 / 255.0;
@@ -6921,7 +7115,7 @@ fn paint_box_shadow(
             // radius. Larger rects paint first, smaller (more-covered) ones on top.
             let e = blur * (j as f32) / ((steps - 1) as f32);
             fill_shadow_rect(
-                &mut shadow_pixmap,
+                &mut shadow_pixmap.as_mut(),
                 x0 - e - left as f32,
                 y0 - e - top as f32,
                 w0 + 2.0 * e,
@@ -6947,7 +7141,7 @@ fn paint_box_shadow(
 /// Fill one (possibly rounded) shadow rectangle with a flat color, optionally
 /// constrained by an alpha mask. A helper for `paint_box_shadow`'s layers.
 fn fill_shadow_rect(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     x: f32,
     y: f32,
     w: f32,
@@ -7496,7 +7690,7 @@ fn paint_text_node(
     nid: obscura_dom::tree::NodeId,
     laid: &crate::DomLayout,
     scroll_state: &ScrollPaintState,
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     raster_scale: f32,
 ) -> Option<()> {
     let runs = laid.text_runs.get(&nid)?;
@@ -7524,6 +7718,7 @@ fn paint_text_node(
             pixmap.height(),
             clip,
             scroll_state.surface_extent.unwrap_or(scroll_state.viewport),
+            raster_scale,
         )
     });
 
@@ -7615,7 +7810,7 @@ pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) 
 }
 
 fn draw_text(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     text: &str,
     x: f32,
     y: f32,
@@ -8393,7 +8588,7 @@ fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
 /// the stops land where a browser puts them. Positionless stops are spread
 /// evenly; positions are clamped monotonic (tiny-skia requires ascending).
 fn paint_linear_gradient(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     path: &tiny_skia::Path,
     rect: &crate::Rect,
     angle: f32,
@@ -8443,7 +8638,7 @@ fn paint_linear_gradient(
 }
 
 fn paint_linear_gradient_layer(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     path: &tiny_skia::Path,
     rect: &crate::Rect,
     angle: f32,
@@ -8669,7 +8864,7 @@ fn background_extra_clip(
 }
 
 fn paint_radial_gradient(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     path: &tiny_skia::Path,
     rect: &crate::Rect,
     center: (f32, f32),
@@ -8813,7 +9008,7 @@ fn resolve_radial_radius(
 }
 
 fn paint_background_gradient_layers(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     path: &tiny_skia::Path,
     origin_rect: &crate::Rect,
     clip_rect: &crate::Rect,
@@ -8857,7 +9052,7 @@ fn paint_background_gradient_layers(
                 })
             {
                 paint_gradient_layer_stack(
-                    &mut tile,
+                    &mut tile.as_mut(),
                     &tile_path,
                     &tile_rect,
                     &tile_rect,
@@ -8968,7 +9163,7 @@ fn paint_background_gradient_layers(
 }
 
 fn paint_gradient_layer_stack(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     path: &tiny_skia::Path,
     sampling_rect: &crate::Rect,
     clip_rect: &crate::Rect,
@@ -9084,7 +9279,7 @@ fn background_gradient_tile_size(
 }
 
 fn paint_conic_gradient_sampled(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     rect: &crate::Rect,
     sampling_rect: &crate::Rect,
     border_radius: crate::ResolvedBorderRadii,
@@ -9436,7 +9631,7 @@ fn split_background_size_components(value: &str) -> Vec<&str> {
 }
 
 fn paint_in_flow_generated_box(
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     generated: &crate::dom::GeneratedBox,
     laid: &crate::dom::DomLayout,
     scroll_state: &ScrollPaintState,
@@ -9491,6 +9686,7 @@ fn paint_in_flow_generated_box(
             pixmap.height(),
             clip,
             scroll_state.surface_extent.unwrap_or(viewport),
+            raster_scale,
         )
     });
 
@@ -9501,6 +9697,7 @@ fn paint_in_flow_generated_box(
             &rect,
             style.border_model.radii,
             ancestor_clip_mask.as_ref(),
+            raster_scale,
         );
     }
     let radius = style.border_model.radii.resolve(rect.width, rect.height);
@@ -9666,7 +9863,7 @@ fn paint_in_flow_generated_box(
 
 fn paint_positioned_pseudo(
     text_engine: &mut crate::inline::TextEngine,
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     style: &crate::LayoutStyle,
     containing_block: &crate::Rect,
     static_position_rect: &crate::Rect,
@@ -9744,7 +9941,7 @@ fn paint_positioned_pseudo(
         return;
     }
     let ancestor_clip_mask = ancestor_overflow_clip
-        .and_then(|clip| overflow_clip_mask(pixmap.width(), pixmap.height(), clip, clip_extent));
+        .and_then(|clip| overflow_clip_mask(pixmap.width(), pixmap.height(), clip, clip_extent, raster_scale));
     let radius = style.border_model.radii.resolve(rect.width, rect.height);
     let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
         polygon_clip_mask(
@@ -9935,13 +10132,14 @@ fn paint_positioned_pseudo(
             _ => rect.y + style.padding.top,
         };
         text_engine.finalize(item, (x, y), text_width, Some(visible));
-        text_engine.paint_item_with_clip_mask_scaled(
+        text_engine.paint_item_with_clip_mask_scaled_for_print_borrowed(
             item,
             pixmap,
             (0.0, 0.0),
             Some(visible),
             element_clip_mask.as_ref(),
             raster_scale,
+            false,
         );
     }
 }
@@ -10355,7 +10553,7 @@ fn paint_canvas_surface(
     visible_rect: &crate::Rect,
     object_fit: crate::ObjectFit,
     object_position: crate::ObjectPosition,
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     clip_radius: crate::ResolvedBorderRadii,
     extra_clip: Option<&tiny_skia::Mask>,
     raster_scale: f32,
@@ -10466,7 +10664,7 @@ fn paint_image(
     visible_rect: &crate::Rect,
     object_fit: crate::ObjectFit,
     object_position: crate::ObjectPosition,
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     cache: &mut RenderResourceCache,
     profile: Option<ImageRequestProfile>,
     transform: Option<crate::Affine2>,
@@ -10877,9 +11075,14 @@ fn overflow_clip_mask(
     ph: u32,
     clip: &crate::dom::OverflowClip,
     viewport: (f32, f32),
+    raster_scale: f32,
 ) -> Option<tiny_skia::Mask> {
     let bounds = clip.viewport_rect(viewport);
-    let mut mask = box_clip_mask(pw, ph, &bounds)?;
+    let mut mask = tiny_skia::Mask::new(pw, ph)?;
+    let mut builder = PathBuilder::new();
+    builder.push_rect(Rect::from_xywh(bounds.x, bounds.y, bounds.width, bounds.height)?);
+    let transform = raster_transform(raster_scale);
+    mask.fill_path(&builder.finish()?, FillRule::Winding, true, transform);
     let offset = clip.rounded_offset();
     let mut current = clip.rounded_chain().map(AsRef::as_ref);
     while let Some(node) = current {
@@ -10891,7 +11094,7 @@ fn overflow_clip_mask(
         if let Some(path) =
             rounded_rect_path_radii(rect.x, rect.y, rect.width, rect.height, node.clip.radii)
         {
-            mask.intersect_path(&path, FillRule::Winding, true, Transform::identity());
+            mask.intersect_path(&path, FillRule::Winding, true, transform);
         }
         current = node.parent.as_deref();
     }
@@ -10941,12 +11144,14 @@ fn cached_overflow_clip_mask(
     ph: u32,
     clip: &crate::dom::OverflowClip,
     viewport: (f32, f32),
+    raster_scale: f32,
 ) -> Option<Arc<tiny_skia::Mask>> {
     let key = overflow_clip_mask_key(clip, viewport);
     if let Some((_, mask)) = cache.get(&key) {
         return Some(Arc::clone(mask));
     }
-    let mask = Arc::new(overflow_clip_mask(pw, ph, clip, viewport)?);
+    // The cache belongs to this paint surface and its fixed raster scale.
+    let mask = Arc::new(overflow_clip_mask(pw, ph, clip, viewport, raster_scale)?);
     // A mask is one byte per output pixel. Two entries keep the ubiquitous
     // shared scrollport fast without turning a page with many distinct clips
     // into an unbounded surface-sized memory cache. DOM traversal is locally
@@ -12155,7 +12360,7 @@ fn paint_mask(
     mask_size: Option<(f32, f32)>,
     mask_repeat: Option<(bool, bool)>,
     extra_clip: Option<&tiny_skia::Mask>,
-    pixmap: &mut Pixmap,
+    pixmap: &mut PixmapMut<'_>,
     cache: &mut RenderResourceCache,
 ) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
@@ -12294,6 +12499,49 @@ fn paint_mask(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn borrowed_page_matches_owned_with_canaries_and_resampling() {
+        for effect in ["", "opacity:.6;transform:rotate(3deg);background:conic-gradient(red,blue,red)"] {
+            let html = format!(r#"<html style="margin:0"><body style="margin:0;background:transparent"><div style="width:23px;height:19px;{}">Text</div></body></html>"#, effect);
+            let tree = parse_html(&html);
+            let mut cache = RenderResourceCache::with_loader(|_url: &str| None);
+            let mut prepared = prepare_dom(&tree, (32.0, 28.0), None, &mut cache).unwrap();
+            let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+            for scale in [1.0, 2.0, 0.5, 1.5] {
+                let region = CaptureRegion::new(0.0, 0.0, 32.0, 28.0, scale);
+                let expected = paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+                    &tree, &mut prepared, &mut cache, &scroll, region, [23, 40, 70, 110], &EMPTY_CANVAS_SURFACES).unwrap();
+                let row = expected.width() as usize * 4;
+                for stride in [row, (row + 131) & !127] {
+                    let len = stride * expected.height() as usize;
+                    let mut guarded = vec![0xa5; len + 32];
+                    paint_prepared_region_into_borrowed(&tree, &mut prepared, &mut cache, &scroll, region,
+                        [23, 40, 70, 110], &EMPTY_CANVAS_SURFACES, &mut guarded[16..16+len], stride).unwrap();
+                    for y in 0..expected.height() as usize {
+                        assert_eq!(&guarded[16+y*stride..16+y*stride+row],
+                            &expected.data()[y*row..(y+1)*row], "effect={effect}, scale={scale}");
+                        assert!(guarded[16+y*stride+row..16+(y+1)*stride].iter().all(|b| *b==0));
+                    }
+                    assert!(guarded[..16].iter().chain(&guarded[16+len..]).all(|b| *b==0xa5));
+                    assert!(paint_prepared_region_into_borrowed(&tree, &mut prepared, &mut cache, &scroll, region,
+                        [0; 4], &EMPTY_CANVAS_SURFACES, &mut guarded[16..16+len], stride-1).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_lanczos_matches_reference_at_size_boundaries() {
+        for (sw, sh, dw, dh) in [(1, 1, 7, 3), (7, 3, 1, 1), (9, 13, 17, 5), (11, 4, 3, 19)] {
+            let source: Vec<u8> = (0..sw * sh * 4).map(|i| ((i * 73 + 29) % 256) as u8).collect();
+            let image = image::RgbaImage::from_raw(sw, sh, source.clone()).unwrap();
+            let expected = image::imageops::resize(&image, dw, dh, image::imageops::FilterType::Lanczos3);
+            let mut output = vec![0; (dw * dh * 4) as usize];
+            super::resize_lanczos3_into(&source, sw, sh, &mut output, dw, dh, dw as usize * 4);
+            assert_eq!(output, expected.into_raw(), "{sw}x{sh} -> {dw}x{dh}");
+        }
+    }
+
     use super::*;
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree::ShadowRootMode;
@@ -12367,7 +12615,7 @@ mod tests {
             assert!(paint_canvas_surface(
                 CanvasSurface::from_premultiplied_rgba8(source.width(),source.height(),source.data()).unwrap(),
                 &rect,&rect,crate::ObjectFit::Fill,crate::ObjectPosition::default(),
-                &mut image,radii,Some(&inherited),scale,
+                &mut image.as_mut(),radii,Some(&inherited),scale,
             ));
             for (x,y,expected) in [(40.0,30.0,(208,32,64)),(31.0,21.0,(17,51,85)),(60.0,30.0,(17,51,85))] {
                 let pixel = image.pixel((x*scale) as u32,(y*scale) as u32).unwrap();
@@ -14284,7 +14532,7 @@ mod tests {
             let draw = |src, cache: &mut RenderResourceCache| {
                 let mut surface = Pixmap::new(12, 18).unwrap();
                 assert!(paint_image(src, Some(base), &rect, &rect, crate::ObjectFit::Fill,
-                    crate::ObjectPosition::default(), &mut surface, cache, profile, None,
+                    crate::ObjectPosition::default(), &mut surface.as_mut(), cache, profile, None,
                     crate::ResolvedBorderRadii::default(), None));
                 surface
             };
@@ -14370,7 +14618,7 @@ mod tests {
         let draw = |cache: &mut RenderResourceCache| {
             let mut surface = Pixmap::new(40, 40).unwrap();
             assert!(paint_image(url, None, &rect, &clip, crate::ObjectFit::Cover,
-                crate::ObjectPosition::default(), &mut surface, cache,
+                crate::ObjectPosition::default(), &mut surface.as_mut(), cache,
                 Some(ImageRequestProfile::NoCorsInclude), None,
                 crate::ResolvedBorderRadii::default(), None));
             surface
@@ -15164,7 +15412,7 @@ mod tests {
         );
         assert_eq!(rounded.clip.radii.top_left, (20.0, 20.0));
         let direct_mask =
-            overflow_clip_mask(130, 130, child_clip, (130.0, 130.0)).expect("rounded mask");
+            overflow_clip_mask(130, 130, child_clip, (130.0, 130.0), 1.0).expect("rounded mask");
         assert_eq!(direct_mask.data()[(23 * 130 + 23) as usize], 0);
         let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
             .expect("rounded overflow paint");
@@ -19325,6 +19573,90 @@ next</textarea></div></div>"#,
     }
 
     #[test]
+    fn ellipsis_markers_rasterize_on_the_device_grid_at_two_x() {
+        let page = |overflow: &str| {
+            format!(
+                r#"<html style="margin:0"><body style="margin:0">
+                <div style="width:120px;font:16px/20px Arial;white-space:nowrap;overflow:hidden;text-overflow:{overflow}">ABCDEFGHIJKLMNO</div>
+                </body></html>"#
+            )
+        };
+        let ellipsis_tree = parse_html(&page("ellipsis"));
+        let clip_tree = parse_html(&page("clip"));
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared = prepare_dom(&ellipsis_tree, (140.0, 30.0), None, &mut resources)
+            .expect("prepared render");
+        assert!(
+            native_raster_scale_supported(&ellipsis_tree, &prepared.layout),
+            "text-overflow:ellipsis is shaped text plus a marker and must use direct device-scale paint"
+        );
+        let scroll = prepared.resolve_scroll_state(&ellipsis_tree, (0.0, 0.0), &HashMap::new());
+        let ellipsis = paint_prepared_region_with_scroll(
+            &ellipsis_tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            CaptureRegion::new(0.0, 0.0, 120.0, 20.0, 2.0),
+        )
+        .unwrap();
+
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared_clip = prepare_dom(&clip_tree, (140.0, 30.0), None, &mut resources)
+            .expect("prepared render");
+        let scroll_clip = prepared_clip.resolve_scroll_state(&clip_tree, (0.0, 0.0), &HashMap::new());
+        let clip = paint_prepared_region_with_scroll(
+            &clip_tree,
+            &mut prepared_clip,
+            &mut resources,
+            &scroll_clip,
+            CaptureRegion::new(0.0, 0.0, 120.0, 20.0, 2.0),
+        )
+        .unwrap();
+        assert_eq!(
+            (ellipsis.width(), ellipsis.height()),
+            (240, 40),
+            "ellipsis capture must render at the requested device scale"
+        );
+
+        // Both variants shape and truncate identically up to the marker start
+        // (content_width - marker_width); only glyphs past that end and the
+        // marker itself differ. A marker painted at the unscaled logical
+        // offset would appear near device x≈108 instead of x≈216.
+        let mut differing = 0;
+        let mut diff_min_x = usize::MAX;
+        let mut diff_max_x = 0;
+        let mut early = 0;
+        let mut early_samples = Vec::new();
+        for y in 0..ellipsis.height() {
+            for x in 0..ellipsis.width() {
+                if ellipsis.pixel(x, y) != clip.pixel(x, y) {
+                    differing += 1;
+                    diff_min_x = diff_min_x.min(x as usize);
+                    diff_max_x = diff_max_x.max(x as usize);
+                    if x < 180 {
+                        early += 1;
+                        if early_samples.len() < 12 {
+                            early_samples.push((x, y, ellipsis.pixel(x, y), clip.pixel(x, y)));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            differing > 20,
+            "the ellipsis marker must replace truncated tail ink ({differing} differing pixels)"
+        );
+        assert_eq!(
+            early, 0,
+            "the marker must be scaled with the raster scale, not painted at its logical offset ({early_samples:?}, bbox {diff_min_x}..{diff_max_x})"
+        );
+        assert!(
+            diff_min_x >= 180 && diff_max_x <= 245,
+            "marker diff must stay in the device-scale tail band, got {diff_min_x}..{diff_max_x}"
+        );
+    }
+
+    #[test]
     fn direct_vector_gradients_rasterize_natively_at_two_x() {
         let tree = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -19494,7 +19826,7 @@ next</textarea></div></div>"#,
 
     #[test]
     fn paint_surface_culling_uses_css_coordinates_and_ink_overflow() {
-        let pixmap = Pixmap::new(200, 160).expect("surface");
+        let mut pixmap = Pixmap::new(200, 160).expect("surface");
         assert!(rect_intersects_paint_surface(
             &crate::Rect {
                 x: 90.0,
@@ -19502,7 +19834,7 @@ next</textarea></div></div>"#,
                 width: 20.0,
                 height: 20.0,
             },
-            &pixmap,
+            &pixmap.as_mut(),
             2.0,
         ));
         assert!(!rect_intersects_paint_surface(
@@ -19512,7 +19844,7 @@ next</textarea></div></div>"#,
                 width: 20.0,
                 height: 20.0,
             },
-            &pixmap,
+            &pixmap.as_mut(),
             2.0,
         ));
 
@@ -19623,7 +19955,7 @@ next</textarea></div></div>"#,
             &rect,
             crate::ObjectFit::Fill,
             crate::ObjectPosition::default(),
-            &mut pixmap,
+            &mut pixmap.as_mut(),
             &mut resources,
             None,
             None,

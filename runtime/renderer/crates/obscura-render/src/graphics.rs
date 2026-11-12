@@ -30,6 +30,7 @@ impl GlContext {
     pub fn new_with_backend(_:u32,_:u32,_:&str)->Result<Self,String>{Err("Native GL requires macOS CGL/OpenGL".into())}
     pub fn backend(&self)->&'static str{"unavailable"}
     pub fn command(&mut self, _: &serde_json::Value) -> Result<serde_json::Value, String> { Err("Native GL unavailable".into()) }
+    pub fn finish(&mut self)->Result<(),String>{Err("Native GL unavailable".into())}
     pub fn readback(&mut self, _: &mut [u8]) -> Result<(), String> { Err("Native GL unavailable".into()) }
     pub fn upload_texture_2d(&mut self,_:u32,_:i32,_:i32,_:i32,_:i32,_:i32,_:u32,_:u32,_:Option<&[u8]>)->Result<(),String>{Err("Native GL unavailable".into())}
     pub fn upload_texture_sub_2d(&mut self,_:u32,_:i32,_:i32,_:i32,_:i32,_:i32,_:u32,_:u32,_:&[u8])->Result<(),String>{Err("Native GL unavailable".into())}

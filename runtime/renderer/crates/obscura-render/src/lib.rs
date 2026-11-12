@@ -106,6 +106,7 @@ pub use paint::{
     paint_dom_scrolled_at_animation_time_with_surface_color_and_resources,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,
+    paint_prepared_region_into_borrowed,
     paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces,
     paint_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces,
     paint_prepared_with_scroll, paint_prepared_with_scroll_and_surface_color,
