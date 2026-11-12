@@ -23,6 +23,8 @@ const Translator = @import("translate_c").Translator;
 const lightpanda_version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch unreachable;
 const min_zig_version = std.SemanticVersion.parse(@import("build.zig.zon").minimum_zig_version) catch unreachable;
 
+const NativeProvider = enum { rust, zig };
+
 const Build = blk: {
     if (builtin.zig_version.order(min_zig_version) == .lt) {
         @compileError(std.fmt.comptimePrint(
@@ -80,6 +82,7 @@ pub fn build(b: *Build) !void {
     const deps: Deps = .{
         .target = requested_target,
         .optimize = if (debug_deps) .debug else .fast,
+        .macos_sdk = b.option([]const u8, "macos_sdk", "Explicit macOS SDK selected by the source-bound builder") orelse b.graph.environ_map.get("SDKROOT"),
     };
 
     // Core's build entry supplies a content-verified archive explicitly.
@@ -90,6 +93,8 @@ pub fn build(b: *Build) !void {
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
     const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
     const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
+    const v8_headers = b.option([]const u8, "v8-headers", "Candidate-only matching V8 include directory");
+    if (v8_headers != null and shared_v8) return error.CandidateRequiresStaticV8;
     const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
     // Hot-code layout for the Linux release artifacts, see orderfile/README.md.
     // Opt-in (CI passes it): it needs LLD and costs link time on every build.
@@ -106,6 +111,11 @@ pub fn build(b: *Build) !void {
     opts.addOption([]const u8, "version_encoded", version_encoded);
     opts.addOption(?[]const u8, "snapshot_path", snapshot_path);
     opts.addOption(bool, "wpt_extensions", wpt_extensions);
+    opts.addOption(bool, "accounted_clone", v8_headers != null);
+    const entities_provider = b.option(NativeProvider, "entities_provider", "Named character references implementation") orelse .zig;
+    const png_provider = b.option(NativeProvider, "png_provider", "RGBA8 PNG export implementation") orelse .zig;
+    opts.addOption(NativeProvider, "entities_provider", entities_provider);
+    opts.addOption(NativeProvider, "png_provider", png_provider);
 
     const lightpanda_module = b.addModule("lightpanda", .{
         .root_source_file = b.path("src/lightpanda.zig"),
@@ -116,8 +126,98 @@ pub fn build(b: *Build) !void {
         .sanitize_c = enable_csan,
         .sanitize_thread = enable_tsan,
     });
+    const environment_api_module = b.createModule(.{
+        .root_source_file = b.path("src/sys/environment.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lightpanda_module.addImport("environment_api", environment_api_module);
+    const process_api_module = b.createModule(.{
+        .root_source_file = b.path("../../mioa-os/process.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lightpanda_module.addImport("process_api", process_api_module);
+    process_api_module.addImport("lightpanda", lightpanda_module);
+    const thread_api_module = b.createModule(.{
+        .root_source_file = b.path("../../mioa-os/thread.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lightpanda_module.addImport("thread_api", thread_api_module);
     lightpanda_module.addImport("lightpanda", lightpanda_module); // allow circular "lightpanda" import
     lightpanda_module.addImport("build_config", opts.createModule());
+    lightpanda_module.addIncludePath(b.path("../../mioa-os/api/system"));
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("../../mioa-os/app_data.c"),
+        .flags = &.{"-std=c11"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("../../mioa-os/environment.c"),
+        .flags = &.{"-std=c11"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("../../mioa-os/executable_path.c"),
+        .flags = &.{"-std=c11"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("../../mioa-os/terminal.c"),
+        .flags = &.{"-std=c11"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("../../mioa-os/files.c"),
+        .flags = &.{"-std=c11"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("../../mioa-os/random.c"),
+        .flags = &.{"-std=c11"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("../../mioa-os/clock.c"),
+        .flags = &.{"-std=c11"},
+    });
+    lightpanda_module.addIncludePath(b.path("src/c"));
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("src/c/ada.cpp"),
+        .flags = &.{"-std=c++20"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("src/c/ada_bridge.cpp"),
+        .flags = &.{"-std=c++20"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("src/c/html_bridge.cpp"),
+        .flags = &.{"-std=c++20"},
+    });
+    lightpanda_module.addCSourceFile(.{
+        .file = b.path("src/c/render_bridge.cpp"),
+        .flags = &.{"-std=c++20"},
+    });
+    if (target.result.os.tag == .windows) {
+        lightpanda_module.linkSystemLibrary("kernel32", .{});
+    }
+    if (v8_headers) |headers| {
+        const cpp_flags = &[_][]const u8{
+            "-std=c++23",                                                "-fno-rtti",                                   "-fno-exceptions",                    "-nostdinc++",
+            "-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",                  "-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS", "-D_LIBCPP_INSTRUMENTED_WITH_ASAN=0", "-DCR_LIBCXX_REVISION=97b436da4c33663581d394f4ee0a5977fc38c2f4",
+            "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE", "-DV8_COMPRESS_POINTERS",
+        };
+        // Isolate Chromium's C++ ABI from Zig's automatic system-libc++ flags.
+        inline for (.{ "accounted_clone", "runtime_memory" }) |name| {
+            const cpp = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .link_libcpp = false,
+            });
+            cpp.addIncludePath(.{ .cwd_relative = headers });
+            cpp.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ headers, "cpp-abi", "config" }) });
+            cpp.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ headers, "cpp-abi", "libcxx", "include" }) });
+            cpp.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ headers, "cpp-abi", "libcxxabi", "include" }) });
+            cpp.addCSourceFile(.{ .file = b.path("src/browser/js/" ++ name ++ ".cpp"), .flags = cpp_flags });
+            lightpanda_module.addObject(b.addObject(.{ .name = name, .root_module = cpp, .use_llvm = use_llvm }));
+        }
+    }
 
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt = b.addFmt(.{
@@ -131,9 +231,9 @@ pub fn build(b: *Build) !void {
     // functions' sections can be addressed by the linker script.
     const v8_archive: ?Build.LazyPath = if (prebuilt_v8_path) |path| .{ .cwd_relative = path } else null;
     const v8_for_link = if (orderfile != null and v8_archive != null and !shared_v8) markHotSections(b, v8_archive.?) else v8_archive;
-    linkV8(b, lightpanda_module, enable_asan, enable_tsan, v8_for_link, shared_v8);
+    linkV8(b, lightpanda_module, enable_asan, enable_tsan, v8_for_link, shared_v8, deps.macos_sdk);
     linkCurl(b, lightpanda_module, deps, enable_tsan, orderfile != null);
-    linkRust(b, lightpanda_module, deps);
+    linkNativePlatform(b, lightpanda_module, deps);
     linkZenai(b, lightpanda_module);
     linkIsocline(b, lightpanda_module);
     linkSqlite(b, lightpanda_module, deps, enable_csan, enable_tsan, orderfile != null);
@@ -156,6 +256,9 @@ pub fn build(b: *Build) !void {
     const exe_config: ExeConfig = .{
         .check = check,
         .lightpanda_module = lightpanda_module,
+        .environment_api_module = environment_api_module,
+        .process_api_module = process_api_module,
+        .thread_api_module = thread_api_module,
         .target = target,
         .optimize = optimize,
         .use_llvm = use_llvm,
@@ -193,6 +296,24 @@ pub fn build(b: *Build) !void {
 
     addGenerator(b, exe_config, "skills", "Generate LLM skill docs (zig-out/skills/<name>/SKILL.md)");
     addGenerator(b, exe_config, "docs", "Generate reference partials for the docs site (zig-out/docs/*.mdx)");
+
+    {
+        const native_options = b.addOptions();
+        native_options.addOption(NativeProvider, "entities_provider", .zig);
+        native_options.addOption(NativeProvider, "png_provider", .zig);
+        const native_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/native_tests.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "build_config", .module = native_options.createModule() }},
+            }),
+            .use_llvm = use_llvm,
+        });
+        const run_native_tests = b.addRunArtifact(native_tests);
+        b.step("native-tests", "Run isolated Zig primitive behavior tests").dependOn(&run_native_tests.step);
+    }
 
     {
         // test
@@ -233,11 +354,15 @@ pub fn build(b: *Build) !void {
 const Deps = struct {
     target: Build.ResolvedTarget,
     optimize: std.lang.Optimize,
+    macos_sdk: ?[]const u8,
 };
 
 const ExeConfig = struct {
     check: *Build.Step,
     lightpanda_module: *Build.Module,
+    environment_api_module: *Build.Module,
+    process_api_module: *Build.Module,
+    thread_api_module: *Build.Module,
     target: Build.ResolvedTarget,
     optimize: std.lang.Optimize,
     use_llvm: bool,
@@ -272,6 +397,9 @@ fn addExe(b: *Build, config: ExeConfig, name: []const u8, check_name: []const u8
             .sanitize_thread = config.sanitize_thread,
             .imports = &.{
                 .{ .name = "lightpanda", .module = config.lightpanda_module },
+                .{ .name = "environment_api", .module = config.environment_api_module },
+                .{ .name = "process_api", .module = config.process_api_module },
+                .{ .name = "thread_api", .module = config.thread_api_module },
             },
         }),
     });
@@ -341,6 +469,7 @@ fn linkV8(
     is_tsan: bool,
     prebuilt_v8_path: ?Build.LazyPath,
     shared_v8: bool,
+    macos_sdk: ?[]const u8,
 ) void {
     const target = mod.resolved_target.?;
 
@@ -355,72 +484,28 @@ fn linkV8(
         .prebuilt_v8_path = prebuilt_v8_path,
         .shared_v8 = shared_v8,
     });
-    mod.addImport("v8", dep.module("v8"));
-}
-
-fn linkRust(b: *Build, mod: *Build.Module, deps: Deps) void {
-    // Cargo's "dev" profile writes to target/debug.
-    const profile, const out_subdir = if (deps.optimize == .debug) .{ "dev", "debug" } else .{ "release", "release" };
-
-    // One cargo workspace, one staticlib (src/rust/Cargo.toml explains why).
-    const cargo = b.option([]const u8, "cargo", "Explicit Cargo executable") orelse "cargo";
-    const cargo_config = b.option([]const u8, "cargo_config", "Explicit Cargo configuration file");
-    const exec_cargo = b.addSystemCommand(&.{
-        cargo,             "build",
-        "--profile",       profile,
-        "--manifest-path", "src/rust/ffi/Cargo.toml",
-        "--frozen",
-    });
-    if (cargo_config) |config| exec_cargo.addArgs(&.{ "--config", config });
-
-    addDirInputs(b, exec_cargo, "src/rust", "target") catch |err| {
-        std.debug.panic("walk src/rust: {t}", .{err});
-    };
-    for ([_][]const u8{
-        "../renderer/crates/obscura-render",
-        "../renderer/crates/obscura-dom",
-        "../renderer/crates/obscura-ssrf",
-        "../renderer/vendor/cosmic-text",
-        "../renderer/vendor/taffy",
-    }) |path| addDirInputs(b, exec_cargo, path, "target") catch |err| {
-        std.debug.panic("walk pinned renderer {s}: {t}", .{ path, err });
-    };
-    exec_cargo.addFileInput(.{ .cwd_relative = rootPath(b, "../renderer/Cargo.toml") });
-
-    // Cargo reports progress on stderr; left uncaptured, Zig prints it as a
-    // "failed command: ..." diagnostic on a successful build. A non-zero exit
-    // still surfaces the captured output.
-    _ = exec_cargo.captureStdErr(.{});
-
-    // TODO: We can prefer `--artifact-dir` once it become stable.
-    const out_dir = exec_cargo.addOutputDirectoryArg2("rust", .{ .prefix = "--target-dir=" });
-
-    const rust_step = b.step("rust", "Build the Rust staticlib (requires cargo)");
-    rust_step.dependOn(&exec_cargo.step);
-
-    const obj = out_dir.path(b, out_subdir).path(b, "liblightpanda_ffi.a");
-    mod.addObjectFile(obj);
-}
-
-/// Registers every file under `root` (relative to the build root) as an
-/// input of `run`, skipping the `skip_dir` subtree at any depth.
-fn addDirInputs(b: *Build, run: *Build.Step.Run, root: []const u8, skip_dir: []const u8) !void {
-    const io = b.graph.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, rootPath(b, root), .{ .iterate = true });
-    defer dir.close(io);
-
-    b.dependOnDirectoryContents(.{ .cwd_relative = rootPath(b, root) });
-    var walker = try dir.walk(b.allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        switch (entry.kind) {
-            .directory => if (std.mem.eql(u8, entry.basename, skip_dir))
-                walker.leave(io)
-            else
-                b.dependOnDirectoryContents(.{ .cwd_relative = rootPath(b, b.pathJoin(&.{ root, entry.path })) }),
-            .file => run.addFileInput(.{ .cwd_relative = rootPath(b, b.pathJoin(&.{ root, entry.path })) }),
+    const v8_module = dep.module("v8");
+    if (target.result.os.tag == .macos) {
+        const sdk = macos_sdk orelse @panic("macOS native build requires -Dmacos_sdk or SDKROOT");
+        const frameworks: Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) };
+        // Configure this dependency module instance, not the pinned package.
+        // A later headerless host-framework path can otherwise shadow the SDK.
+        for (v8_module.include_dirs.items) |*include| switch (include.*) {
+            .framework_path => include.* = .{ .framework_path = frameworks },
+            .framework_path_system => include.* = .{ .framework_path_system = frameworks },
             else => {},
-        }
+        };
+    }
+    mod.addImport("v8", v8_module);
+}
+
+fn linkNativePlatform(b: *Build, mod: *Build.Module, deps: Deps) void {
+    if (deps.target.result.os.tag == .macos) {
+        const sdk = deps.macos_sdk orelse @panic("macOS native build requires -Dmacos_sdk or SDKROOT");
+        mod.addCSourceFile(.{ .file = b.path("../../mioa-os/broker.c"), .flags = &.{ "-isysroot", sdk } });
+        mod.linkFramework("IOSurface", .{});
+        mod.linkFramework("CoreFoundation", .{});
+        mod.linkSystemLibrary("bsm", .{});
     }
 }
 
@@ -430,6 +515,8 @@ fn linkSqlite(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.S
     const lib_mod = cLibModule(b, deps.target, deps.optimize, is_tsan);
     lib_mod.sanitize_c = enable_csan;
     lib_mod.addCSourceFile(.{ .file = dep.path("sqlite3.c") });
+    lib_mod.addIncludePath(dep.path(""));
+    lib_mod.addCSourceFile(.{ .file = b.path("src/storage/sqlite/bind_copy.c") });
     const lib = sectionize(b.addLibrary(.{ .name = "sqlite3", .root_module = lib_mod }), section);
 
     const macros = [_]struct { []const u8, []const u8 }{
@@ -524,11 +611,9 @@ fn linkCurl(b: *Build, mod: *Build.Module, deps: Deps, is_tsan: bool, section: b
 
     if (deps.target.result.os.tag == .macos) {
         // needed for proxying on mac
-        const framework_path = if (b.graph.environ_map.get("SDKROOT")) |sdk_root|
-            b.pathJoin(&.{ sdk_root, "System/Library/Frameworks" })
-        else
-            "/System/Library/Frameworks";
-        mod.addSystemFrameworkPath(.{ .cwd_relative = framework_path });
+        const sdk = deps.macos_sdk orelse @panic("macOS native build requires -Dmacos_sdk or SDKROOT");
+        mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
         mod.linkFramework("CoreFoundation", .{});
         mod.linkFramework("SystemConfiguration", .{});
         mod.linkFramework("OpenGL", .{});
@@ -566,6 +651,9 @@ fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.lang.Optimiz
             "trees.c",   "uncompr.c",  "zutil.c",
         },
     });
+    // zcalloc backs both curl and CompressionStreams. The gz API also owns
+    // raw buffers without an allocation callback; retain all upstream frees.
+    admitNativeHeap(b, mod, &.{ "zutil.c", "gzlib.c", "gzread.c", "gzwrite.c" }, "src/sys/compression_memory.h");
 
     return lib;
 }
@@ -575,6 +663,8 @@ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.lang.Optim
 
     const mod = cLibModule(b, target, optimize, is_tsan);
     mod.addIncludePath(dep.path("c/include"));
+    // Quota denial must unwind allocations, not terminate the owning app.
+    mod.addCMacro("BROTLI_ENCODER_CLEANUP_ON_OOM", "1");
 
     const brotlicmn = sectionize(b.addLibrary(.{ .name = "brotlicommon", .root_module = mod }), section);
     const brotlidec = sectionize(b.addLibrary(.{ .name = "brotlidec", .root_module = mod }), section);
@@ -601,13 +691,20 @@ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.lang.Optim
             "backward_references.c",        "backward_references_hq.c", "bit_cost.c",
             "block_splitter.c",             "brotli_bit_stream.c",      "cluster.c",
             "command.c",                    "compound_dictionary.c",    "compress_fragment.c",
-            "compress_fragment_two_pass.c", "dictionary_hash.c",        "encode.c",
-            "encoder_dict.c",               "entropy_encode.c",         "fast_log.c",
-            "histogram.c",                  "literal_cost.c",           "memory.c",
-            "metablock.c",                  "static_dict.c",            "static_dict_lut.c",
-            "static_init.c",                "utf8_util.c",
+            "compress_fragment_two_pass.c", "dictionary_hash.c",        "encoder_dict.c",
+            "entropy_encode.c",             "fast_log.c",               "histogram.c",
+            "literal_cost.c",               "memory.c",                 "metablock.c",
+            "static_dict.c",                "static_dict_lut.c",        "static_init.c",
+            "utf8_util.c",
         },
     });
+    mod.addIncludePath(dep.path("c/enc"));
+    mod.addCSourceFile(.{ .file = b.path("src/sys/brotli_encoder.c") });
+    // Public allocator callbacks do not cover every default constructor or
+    // static-dictionary initialization. Redirect only their libc fallbacks.
+    admitNativeHeap(b, mod, &.{
+        "platform.c", "shared_dictionary.c", "decode.c", "memory.c", "static_dict_lut.c",
+    }, "src/sys/compression_memory.h");
 
     return .{ brotlicmn, brotlidec, brotlienc };
 }
@@ -636,6 +733,11 @@ fn buildZstd(b: *Build, target: Build.ResolvedTarget, optimize: std.lang.Optimiz
             "decompress/huf_decompress_amd64.S",
         },
     });
+    // HAVE_ZSTD enables curl's live streaming decoder. Preserve customMem
+    // and static/caller-owned workspaces; admit only default heap backing.
+    admitNativeHeap(b, mod, &.{
+        "common/xxhash.c", "decompress/zstd_ddict.c", "decompress/zstd_decompress.c",
+    }, "src/sys/compression_memory.h");
 
     return lib;
 }
@@ -653,7 +755,51 @@ fn buildBoringSsl(b: *Build, target: Build.ResolvedTarget, optimize: std.lang.Op
     const crypto = sectionize(dep.artifact("crypto"), section);
     crypto.bundle_ubsan_rt = false;
 
+    // The pinned BoringSSL weak allocator hooks are ELF-only. Redirect only
+    // its heap-owning translation units, retaining upstream cleanse/realloc.
+    admitNativeHeap(b, crypto.root_module, &.{
+        "crypto/mem.cc",
+        "crypto/err/err.cc",
+        "crypto/thread_pthread.cc",
+    }, "src/sys/boringssl_memory.h");
+    admitNativeHeap(b, ssl.root_module, &.{"ssl/ssl_buffer.cc"}, "src/sys/boringssl_memory.h");
+
     return .{ ssl, crypto };
+}
+
+fn admitNativeHeap(b: *Build, mod: *Build.Module, paths: []const []const u8, header: []const u8) void {
+    var isolated: std.ArrayList(Build.Module.CSourceFile) = .empty;
+    for (mod.link_objects.items) |object| {
+        switch (object) {
+            .c_source_files => |sources| {
+                var kept: std.ArrayList([]const u8) = .empty;
+                for (sources.files) |file| {
+                    const selected = for (paths) |path| {
+                        if (std.mem.eql(u8, file, path)) break true;
+                    } else false;
+                    if (selected) {
+                        const flags = b.allocator.alloc([]const u8, sources.flags.len + 6) catch @panic("OOM");
+                        @memcpy(flags[0..sources.flags.len], sources.flags);
+                        @memcpy(flags[sources.flags.len..], &[_][]const u8{
+                            "-include",             rootPath(b, header),
+                            "-fno-builtin-malloc",  "-fno-builtin-calloc",
+                            "-fno-builtin-realloc", "-fno-builtin-free",
+                        });
+                        isolated.append(b.allocator, .{
+                            .file = sources.root.path(b, file),
+                            .flags = flags,
+                        }) catch @panic("OOM");
+                    } else {
+                        kept.append(b.allocator, file) catch @panic("OOM");
+                    }
+                }
+                sources.files = kept.toOwnedSlice(b.allocator) catch @panic("OOM");
+            },
+            else => {},
+        }
+    }
+    if (isolated.items.len != paths.len) @panic("pinned native heap source inventory changed");
+    for (isolated.items) |source| mod.addCSourceFile(source);
 }
 
 fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.lang.Optimize, is_tsan: bool, section: bool) *Build.Step.Compile {
@@ -695,6 +841,11 @@ fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.lang.Opti
             "nghttp2_ratelim.c",         "nghttp2_time.c",
         },
     });
+    // new3's supplied nghttp2_mem remains authoritative. Callbacks/options
+    // and the queue have separate raw allocations even with custom sessions.
+    admitNativeHeap(b, mod, &.{
+        "nghttp2_mem.c", "nghttp2_callbacks.c", "nghttp2_option.c", "nghttp2_queue.c",
+    }, "src/sys/compression_memory.h");
 
     return lib;
 }

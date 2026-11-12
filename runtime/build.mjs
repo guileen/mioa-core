@@ -6,22 +6,46 @@ import { createReadStream } from 'node:fs';
 import { chmod, copyFile, cp, lstat, mkdir, open, readFile, readdir, readlink, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyV8CppAbi, V8_CPP_ABI_POLICY } from './v8_abi.mjs';
 
 const runtime = dirname(fileURLToPath(import.meta.url));
 const core = dirname(runtime);
-const usage = 'Usage: node runtime/build.mjs build --inputs <machine-config.json> [--output-root <directory>] [--target engine|renderer|all]';
+const usage = 'Usage: node runtime/build.mjs build --inputs <machine-config.json> [--output-root <directory>] [--target engine|renderer|all] [--entities-provider zig|rust] [--png-provider zig|rust] [--v8-headers <directory>] | format --inputs <machine-config.json> --file runtime/engine/src/browser/StyleManager.zig';
 const args = process.argv.slice(2);
-if (args.shift() !== 'build') throw new Error(usage);
+const action = args.shift();
+if (!['build', 'format'].includes(action)) throw new Error(usage);
 const options = {};
+const allowedOptions = action === 'format'
+  ? ['--inputs', '--file']
+  : ['--inputs', '--output-root', '--target', '--entities-provider', '--png-provider', '--v8-headers'];
 while (args.length) {
   const key = args.shift();
-  if (!['--inputs', '--output-root', '--target'].includes(key) || !args.length || options[key]) throw new Error(usage);
+  if (!allowedOptions.includes(key) || !args.length || options[key]) throw new Error(usage);
   options[key] = args.shift();
 }
 if (!options['--inputs']) throw new Error(usage);
+if (action === 'format') {
+  if (options['--file'] !== 'runtime/engine/src/browser/StyleManager.zig') throw new Error(usage);
+  const configPath = resolve(options['--inputs']);
+  const config = JSON.parse(await readFile(configPath, 'utf8'));
+  if (config.schema !== 1 || typeof config.zig !== 'string' || !config.zig) throw new Error('Format requires a schema-1 input config with a pinned Zig path.');
+  const lock = JSON.parse(await readFile(join(runtime, 'inputs.lock.json'), 'utf8'));
+  const zig = resolve(dirname(configPath), config.zig);
+  const version = spawnSync(zig, ['version'], { cwd: runtime, env: process.env, encoding: 'utf8' });
+  if (version.error || version.status !== 0 || version.stdout.trim() !== lock.tools.zig) throw new Error('Pinned Zig version mismatch; formatter was not run.', { cause: version.error });
+  const source = join(runtime, 'engine/src/browser/StyleManager.zig');
+  if (await realpath(source) !== source) throw new Error('Formatter source must be a real file path.');
+  const formatted = spawnSync(zig, ['fmt', source], { cwd: runtime, stdio: 'inherit' });
+  if (formatted.error || formatted.status !== 0) throw new Error('Pinned Zig formatter failed.', { cause: formatted.error });
+  console.log(JSON.stringify({ status: 'formatted', file: source, zig: version.stdout.trim() }));
+  process.exit(0);
+}
 const target = options['--target'] ?? 'engine';
 if (!['engine', 'renderer', 'all'].includes(target)) throw new Error(usage);
 const targets = target === 'all' ? ['engine', 'renderer'] : [target];
+const nativeProviders = { entities: options['--entities-provider'] ?? 'zig', png: options['--png-provider'] ?? 'zig' };
+if (Object.values(nativeProviders).some(value => !['zig', 'rust'].includes(value))) throw new Error('Native providers must be zig or rust.');
+if (!targets.includes('engine') && (options['--entities-provider'] || options['--png-provider'])) throw new Error('Native provider selection applies to the engine target only.');
 const output = resolve(options['--output-root'] ?? join(runtime, '.local/build'));
 const within = (parent, child) => child === parent || child.startsWith(parent + sep);
 if (within(core, output) && !within(join(runtime, '.local'), output)) {
@@ -34,6 +58,10 @@ const guard = await open(guardPath, 'wx').catch(error => {
   throw new Error(`Cannot acquire ${guardPath}: another build may own it. After a terminated build, remove only this lock once its process has stopped.`, { cause: error });
 });
 const receipt = { schema: 1, status: 'started', target, started_utc: new Date().toISOString(), commands: [], qualification: 'Source-bound compilation only; functionality, release acceptance and bit-identical reproducibility are separate.' };
+receipt.native_providers = {
+  ...(targets.includes('engine') ? { engine: { ...nativeProviders, parser: 'cpp-bridge', rendering: 'cpp-bridge' } } : {}),
+  ...(targets.includes('renderer') ? { renderer: 'rust' } : {}),
+};
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const json = value => JSON.stringify(value, null, 2) + '\n';
 const byteOrder = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
@@ -82,11 +110,12 @@ async function verifyTree(path, expected) {
   if (rows.length !== expected.files || treeDigest(rows) !== expected.sha256) throw new Error(`Pinned dependency tree mismatch: ${path}`);
   return rows;
 }
-async function sources() {
+const sourceOutputDirectories = new Set(['.local', '.zig-cache', 'zig-out', 'target', 'zig-pkg', '.lp-cache']);
+async function sources(includeOs = false) {
   const files = [];
   async function visit(directory) {
     for (const name of (await readdir(directory)).sort(byteOrder)) {
-      if (name === '.local') continue;
+      if (sourceOutputDirectories.has(name)) continue;
       const path = join(directory, name);
       const metadata = await lstat(path);
       if (metadata.isDirectory()) await visit(path);
@@ -95,6 +124,14 @@ async function sources() {
     }
   }
   await visit(runtime);
+  if (includeOs) {
+    for (const path of ['mioa-os/app_data.c', 'mioa-os/api/system/app_data_v1.h', 'mioa-os/environment.c', 'mioa-os/api/system/environment_v1.h', 'mioa-os/executable_path.c', 'mioa-os/api/system/executable_path_v1.h', 'mioa-os/process.zig', 'mioa-os/api/system/process_v1.h', 'mioa-os/terminal.c', 'mioa-os/api/system/terminal_v1.h', 'mioa-os/thread.zig', 'mioa-os/api/system/thread_v1.h', 'mioa-os/files.c', 'mioa-os/files.h', 'mioa-os/api/system/graphics_file_v1.h', 'mioa-os/broker.c', 'mioa-os/api/system/broker_v1.h', 'mioa-os/clock.c', 'mioa-os/api/system/clock_v1.h', 'mioa-os/random.c', 'mioa-os/api/system/random_v1.h']) {
+      const fullPath = join(core, path);
+      const metadata = await lstat(fullPath);
+      if (!metadata.isFile()) throw new Error(`Source must be a regular file: ${fullPath}`);
+      files.push({ path, ...await fileInfo(fullPath), executable: metadata.mode & 0o111 });
+    }
+  }
   files.sort((a, b) => byteOrder(a.path, b.path));
   return { sha256: hash(JSON.stringify(files)), files };
 }
@@ -106,7 +143,7 @@ function execute(program, argv, cwd, env, capture = false) {
   return result.stdout?.trim();
 }
 async function materialize(name, snapshot) {
-  const destination = join(output, name);
+  const destination = join(output, 'runtime', name);
   await mkdir(destination, { recursive: true });
   // Preserve only our standalone renderer's compiler target cache, never sources.
   for (const entry of await readdir(destination)) {
@@ -115,8 +152,15 @@ async function materialize(name, snapshot) {
   }
   for (const entry of snapshot.files) {
     const prefix = `runtime/${name}/`;
-    if (!entry.path.startsWith(prefix)) continue;
-    const to = join(destination, entry.path.slice(prefix.length));
+    const localPath = entry.path.startsWith(prefix)
+      ? entry.path.slice(prefix.length)
+      : name === 'engine' && entry.path.startsWith('mioa-os/')
+        ? entry.path
+        : null;
+    if (localPath === null) continue;
+    const to = name === 'engine' && entry.path.startsWith('mioa-os/')
+      ? join(output, entry.path)
+      : join(destination, localPath);
     await mkdir(dirname(to), { recursive: true });
     await copyFile(join(core, entry.path), to);
     await chmod(to, 0o644 | entry.executable);
@@ -125,6 +169,15 @@ async function materialize(name, snapshot) {
 }
 
 try {
+  if (options['--v8-headers']) {
+    if (!targets.includes('engine')) throw new Error('V8 headers apply to the engine target only.');
+    const path = resolve(options['--v8-headers']);
+    if (await realpath(path) !== path) throw new Error('V8 headers must be a real directory path.');
+    const cppAbi = await verifyV8CppAbi(path);
+    const rows = await treeRows(path);
+    if (!rows.some(row => row[0] === 'v8.h' && row[1] === 'file') || rows.some(row => row[1] !== 'file')) throw new Error('Invalid V8 header tree.');
+    receipt.v8_headers = { path, commit: V8_CPP_ABI_POLICY.v8.revision, sha256: treeDigest(rows), files: rows.length, cpp_abi: cppAbi };
+  }
   if (process.platform !== 'darwin' || process.arch !== 'arm64') throw new Error('Only macOS arm64 is configured and input-pinned by this builder. Other platforms require a separately reviewed input lock.');
   const configPath = resolve(options['--inputs']);
   const config = JSON.parse(await readFile(configPath, 'utf8'));
@@ -143,7 +196,7 @@ try {
   for (const file of lock.dependency_files) await verifyFile(join(runtime, file.path), file);
   if (Number(process.versions.node.split('.')[0]) < lock.tools.node_minimum_major) throw new Error('Node.js 22 or newer is required.');
   receipt.inputs_lock_sha256 = hash(lockBytes);
-  receipt.sources = await sources();
+  receipt.sources = await sources(targets.includes('engine'));
   try { receipt.core_manifest_sha256 = (await fileInfo(join(core, 'MANIFEST.sha256'))).sha256; }
   catch (error) { if (error.code !== 'ENOENT') throw error; receipt.core_manifest_sha256 = null; }
   const cargoHome = join(output, 'cargo-home');
@@ -220,21 +273,29 @@ try {
   await writeFile(cargoConfig, `[net]\noffline = true\n[source.crates-io]\nreplace-with = "core-verified-vendor"\n[source.core-verified-vendor]\ndirectory = ${JSON.stringify(vendor)}\n`);
   receipt.artifacts = {};
   if (targets.includes('engine')) {
-    const binary = join(output, 'engine/zig-out/bin/lightpanda');
+    const binary = join(output, 'runtime/engine/zig-out/bin/lightpanda');
     await rm(binary, { force: true });
-    execute(config.zig, ['build', '-Doptimize=fast', '-Ddev_fast=false', '-Dshared_v8=false', `-Dprebuilt_v8_path=${receipt.v8_archive.path}`, `-Dcargo=${config.cargo}`, `-Dcargo_config=${cargoConfig}`, `-j${jobs}`, '--cache-dir', env.ZIG_LOCAL_CACHE_DIR], join(output, 'engine'), env);
+    execute(config.zig, ['build', '-Doptimize=fast', '-Ddev_fast=false', '-Dshared_v8=false', `-Dmacos_sdk=${config.sdk}`, `-Dprebuilt_v8_path=${receipt.v8_archive.path}`, `-Dentities_provider=${nativeProviders.entities}`, `-Dpng_provider=${nativeProviders.png}`, ...(receipt.v8_headers ? [`-Dv8-headers=${receipt.v8_headers.path}`] : []), `-j${jobs}`, '--cache-dir', env.ZIG_LOCAL_CACHE_DIR], join(output, 'runtime/engine'), env);
+    if (receipt.v8_headers) await verifyTree(receipt.v8_headers.path, receipt.v8_headers);
     receipt.artifacts.engine = { path: binary, ...await fileInfo(binary) };
     receipt.binary = receipt.artifacts.engine;
   }
   if (targets.includes('renderer')) {
-    const binary = join(output, 'renderer/target/release/obscura');
+    const binary = join(output, 'runtime/renderer/target/release/obscura');
     await rm(binary, { force: true });
-    execute(config.cargo, ['--config', cargoConfig, 'build', '--frozen', '--release', '-p', 'obscura-cli', '--features', 'render', '--bin', 'obscura', '--target-dir', join(output, 'renderer/target')], join(output, 'renderer'), env);
+    execute(config.cargo, ['--config', cargoConfig, 'build', '--frozen', '--release', '-p', 'obscura-cli', '--features', 'render', '--bin', 'obscura', '--target-dir', join(output, 'runtime/renderer/target')], join(output, 'runtime/renderer'), env);
     receipt.artifacts.renderer = { path: binary, ...await fileInfo(binary) };
     if (!receipt.binary) receipt.binary = receipt.artifacts.renderer;
   }
-  const after = await sources();
-  if (after.sha256 !== receipt.sources.sha256) throw new Error('Core source inputs changed during compilation; no completed receipt is issued.');
+  const after = await sources(targets.includes('engine'));
+  if (after.sha256 !== receipt.sources.sha256) {
+    const beforeRows = new Map(receipt.sources.files.map(row => [row.path, JSON.stringify(row)]));
+    const afterRows = new Map(after.files.map(row => [row.path, JSON.stringify(row)]));
+    const changed = [...new Set([...beforeRows.keys(), ...afterRows.keys()])]
+      .filter(path => beforeRows.get(path) !== afterRows.get(path))
+      .sort(byteOrder);
+    throw new Error(`Core source inputs changed during compilation: ${changed.join(', ') || 'unknown paths'} (${receipt.sources.sha256} -> ${after.sha256}).`);
+  }
   if (receipt.core_manifest_sha256 !== null && (await fileInfo(join(core, 'MANIFEST.sha256'))).sha256 !== receipt.core_manifest_sha256) throw new Error('Core MANIFEST.sha256 changed during compilation.');
   receipt.status = 'completed';
 } catch (error) {
