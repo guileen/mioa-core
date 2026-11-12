@@ -733,15 +733,6 @@ pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
                 for (r.languages) |language| try validateLocale(language);
                 try validateTimezone(r.timezone);
                 try validateAssets(allocator, &e);
-                // Measurement pin: the profile generator derives
-                // `device_scale_factor` from a random seed, so two identical
-                // runs can measure a 1x or a 2x viewport. Pin it after the
-                // digest check so the pinned config stays byte-identical.
-                if (std.c.getenv("MIOA_DEVICE_SCALE_FACTOR")) |raw| {
-                    const value = std.fmt.parseFloat(f64, std.mem.span(raw)) catch return error.invalid_config;
-                    if (!std.math.isFinite(value) or value < 0.5 or value > 8) return error.invalid_config;
-                    e.resolved.device_scale_factor = value;
-                }
                 try std.Io.Dir.cwd().createDirPath(lp.io, e.storage.path);
                 config.environment = e;
                 config.environment_sha256 = sha256Hex(bytes);
