@@ -1102,6 +1102,7 @@ fn deflate(arena: Allocator, data: []const u8) ![]const u8 {
 }
 
 const testing = @import("../testing.zig");
+
 test "browser.pdf: structure, pagination and links" {
     defer testing.test_session.closeAllPages();
     const frame = try testing.createFrame();

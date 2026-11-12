@@ -1,5 +1,34 @@
 # Native runtime changes
 
+## 2026-11-12 — Zig renderer replaces Obscura
+
+- Rendering (DOM layout, inline text, paint, PNG) now runs through the
+  Desktop-owned Zig module `src/render_kernel`: `document.zig` consumes the
+  engine's DOM projection, `block.zig` serves the block model/PDF path, and
+  `painter.zig`/`png.zig` rasterize. The engine imports the module directly:
+  there is no renderer selector and no `extern` render entry point; the ABI
+  test compares the kernel's `abi.zig` mirrors against the engine's structs.
+  `runtime/renderer` (Obscura), `engine/src/rust`, the `renderer` build target,
+  the `-Drender_kernel` option, and the document/layout/paint/raster path in
+  `engine/src/c/render_bridge.cpp` were removed. That file now only bridges
+  Canvas2D/WebGL (still stubbed) and the canvas PNG encoder.
+- `runtime/build.mjs` builds only the engine: no Cargo home, registry
+  vendoring, or `rusty_v8` input. `inputs.lock.json` keeps the Rust rows as
+  provenance and verifies only `engine/build.zig.zon`.
+- Fixes found while wiring the renderer: fragment parsing dropped children
+  (`htmlAsChildren`), `<li>` popped across `<ol>`/`<ul>`, declarative shadow
+  roots ignored `allow_declarative`, and `Streaming.feed` panicked after
+  teardown.
+- The DOM projection carries one computed-style string per element, resolved by
+  the engine's cascade (author rules, inline style, `:focus`/`:focus-visible`,
+  inheritance), instead of the raw `style` attribute plus a serialized `<style>`
+  sheet the kernel never read. The kernel applies that string and now models the
+  box (width/height, padding, border widths, `box-sizing`) for block flow,
+  reporting border boxes from `getBoundingClientRect`/metrics and padding boxes
+  from `clientWidth`/`clientHeight`. There is still no second CSS engine.
+- Fonts stay explicit: `--render-font`/environment assets first, then the
+  checked-in Liberation Sans regular/bold fallback. No host font discovery.
+
 ## 2026-11-07 — Core source ownership
 
 - Imported current maintained Lightpanda engine/Rust bridge and Obscura

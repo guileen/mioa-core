@@ -1,9 +1,10 @@
 # Core native Web runtime
 
-Core owns `engine/` (the maintained Lightpanda Zig engine and Rust bridge) and
-`renderer/` (the maintained Obscura Rust layout/paint implementation and its
-internal path dependencies). These are source trees, not a binary wrapper or a
-patch overlay. Desktop is a Host/consumer; independent headless callers use the
+Core owns `engine/`: the maintained Lightpanda Zig engine, its C/C++ DOM bridge,
+and the Desktop-owned Zig renderer module `src/render_kernel` (layout, shaping,
+paint, PNG). The Rust `engine/src/rust` bridge and the Obscura `renderer/` tree
+were removed; the Zig kernel is the only renderer. These are source
+trees, not a binary wrapper or a patch overlay. Desktop is a Host/consumer; independent headless callers use the
 same native CDP executable. This migration does not claim broader Web standards
 coverage than the imported implementations provide.
 
@@ -34,20 +35,15 @@ Create a private machine configuration outside tracked sources, for example
 ```
 
 Paths may be absolute or relative to the configuration file. Executable fields
-are explicit paths, not PATH lookup names. `rusty_v8_archive` is required only
-for the standalone renderer target; `zig`, `v8_archive`, and `zig_packages` are
-required only for the engine. The other fields are required; `jobs` defaults to
-4. Unknown configuration keys fail. Configurations and receipts may contain
+are explicit paths, not PATH lookup names. `zig`, `v8_archive`, and `zig_packages` are
+required. `cargo`, `rustc`, `cargo_registry_cache`, and `rusty_v8_archive` are
+accepted for older configurations and ignored; `jobs` defaults to 4. Unknown configuration keys fail. Configurations and receipts may contain
 machine paths and must stay private and outside the source manifest.
 
 From the Core root:
 
 ```sh
 node runtime/build.mjs build --inputs runtime/.local/inputs.json
-# Optional standalone Obscura CDP runtime, retaining the imported render feature:
-node runtime/build.mjs build --inputs runtime/.local/inputs.json --target renderer
-# Both native runtimes:
-node runtime/build.mjs build --inputs runtime/.local/inputs.json --target all
 ```
 
 The default output root is `runtime/.local/build`. `--output-root /absolute/dir`
@@ -55,20 +51,16 @@ supports a consumer-owned directory without modifying a vendored Core checkout.
 Generated outputs:
 
 - engine: `<output-root>/engine/zig-out/bin/lightpanda`;
-- standalone renderer: `<output-root>/renderer/target/release/obscura`;
 - build receipt: `<output-root>/receipt.json`.
 
-The builder materializes current owned sources into isolated `engine/` and
-`renderer/` output trees, verifies each copied source, verifies/copies configured
-native dependency inputs, and uses a fresh isolated Cargo home with a locally
-extracted, checksum-verified registry source directory. Both native targets pass
-that Cargo configuration explicitly, overriding ancestor registry rewrites.
-The builder never generates a new Cargo lockfile, exports/applies patches,
-searches a sibling checkout, or accepts an already-built sibling browser.
-Engine and standalone Rust compilation use `--frozen`; lockfiles remain authoritative.
-Old output executables are removed before compiling their target. Only the
-builder-owned standalone renderer target cache is retained when rematerializing
-that tree; Zig caches are under the output root, never in maintained sources.
+The builder materializes current owned sources into an isolated `engine/` output
+tree, verifies each copied source, verifies/copies the configured native
+dependency inputs (prebuilt V8 archive, Zig packages), and compiles with the
+pinned Zig toolchain. There is no Cargo step and no Rust renderer. The builder
+never generates a lockfile, exports/applies patches, searches a sibling
+checkout, or accepts an already-built sibling browser. Old output executables
+are removed before compiling. Zig caches are under the output root, never in
+maintained sources.
 
 `receipt.json` schema 1 has `status: "completed"` only after the compiler
 succeeds, its expected output exists, and the Core source fingerprint and root
@@ -101,31 +93,21 @@ accept a failing cache. Pin changes require source/dependency review.
   an existing exact cache without trusting its location or directory name.
   The input lock's absent optional SLJIT package is lazy and unused by the
   supported JIT-disabled PCRE2 build. No JIT-enabled variant is offered here.
-- **Cargo:** put `<name>-<version>.crate` archives directly in
-  `cargo_registry_cache`. A preexisting Cargo cache's registry-specific
-  `registry/cache/<registry-id>` directory is suitable. The expected names and
-  SHA-256 checksums are in `inputs.lock.json` and the two Cargo lockfiles.
-  Archives may also be acquired from
-  `https://static.crates.io/crates/<name>/<name>-<version>.crate`. The builder
-  does not need or trust a registry index or existing extracted crate source.
-  Engine compilation needs 245 registry packages; standalone renderer needs
-  478; the union is 570. Each target selects only its locked package set.
-- **Standalone Rust V8:** download `rusty_v8_archive.url`, decompress its gzip
-  stream to a raw `.a`, and configure that raw archive. The committed SHA-256
-  pins the **decompressed** bytes. The V8 crate's generated source bindings are
-  included in its checksummed crate archive; no live binding download is used.
+- **Cargo (historical):** `cargo_crates`, `cargo_registry_cache`, and
+  `rusty_v8_archive` remain in `inputs.lock.json` as provenance for the removed
+  Rust renderer. The builder no longer reads or verifies them.
 - **SDK/toolchains:** install the pinned versions and configure their explicit
   paths. The SDK settings file is content-pinned; tool versions are checked and
   executable digests are recorded. Full compiler-distribution and SDK-header
   inventories are **not** supplied, so this is reproducible-input source and
   dependency binding, not a fully hermetic or bit-reproducible toolchain claim.
 
-The builder copies verified V8/Zig inputs into its output directory. Cargo
-archives are verified before extraction and protected by Cargo directory-source
-checksums. No dependency cache, native executable, generated V8 snapshot,
-compiler target directory, profile, or credential is checked into Core.
-Required compile fonts are intentionally checked in: four engine DejaVu fonts,
-17 renderer fonts, and three vendored text-engine test fonts. The CJK runtime
+The builder copies verified V8/Zig inputs into its output directory. No
+dependency cache, native executable, generated V8 snapshot, compiler target
+directory, profile, or credential is checked into Core. Required compile fonts
+are intentionally checked in: four engine DejaVu fonts (block model), the
+Desktop renderer's Liberation Sans regular/bold fallback in
+`../../src/render_kernel/fonts`, and three vendored text-engine test fonts. The CJK runtime
 font is `assets/fonts/NotoSansCJKsc-Regular.otf`, with its adjacent license.
 Runtime fonts are source inputs, not arbitrary installed system-font fallbacks.
 
@@ -148,17 +130,16 @@ build inputs. No private preservation directory is required to build.
   headers and `engine/LICENSING.md`. The latter declares AGPL-3.0-only while
   source headers and the Rust render manifest declare AGPL-3.0-or-later.
   This discrepancy is retained, not resolved or relicensed by migration.
-- Obscura's Apache-2.0 text remains in `renderer/LICENSE`; vendored
-  `cosmic-text`, `taffy`, and `wreq-util` retain their own license files.
-- DejaVu/Bitstream/Arev terms remain with the engine fonts and are additionally
-  included as `renderer/crates/obscura-render/assets/LICENSE-DEJAVU.txt`.
+- Obscura's Apache-2.0 text was removed with the renderer tree. The Desktop
+  renderer's Liberation Sans fallback keeps its original license file at
+  `../../src/render_kernel/fonts/LICENSE-LIBERATION-1.07.4.txt`.
+- DejaVu/Bitstream/Arev terms remain with the engine fonts.
 - The bundled Liberation files identify **1.07.4** in their name records. They
   use the original Liberation license (GPLv2 plus font exceptions), **not**
   the SIL OFL applicable to modern Liberation 2.x. Their original license and
-  GPLv2 text are preserved in that renderer assets directory; the original
-  license authority is the Fedora URL recorded in `source-origin.json`.
-- Noto Color Emoji and the CJK font retain their SIL OFL notices. Vendored
-  Noto test-font notices remain in `renderer/vendor/cosmic-text/fonts/`.
+  GPLv2 text are preserved next to the fallback faces; the original license
+  authority is the Fedora URL recorded in `source-origin.json`.
+- Noto Color Emoji and the CJK font retain their SIL OFL notices.
 
 No licensing compatibility determination, public binary distribution,
 publication, signing, or application-profile migration is performed here.

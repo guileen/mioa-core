@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 const runtime = dirname(fileURLToPath(import.meta.url));
 const core = dirname(runtime);
-const usage = 'Usage: node runtime/build.mjs build --inputs <machine-config.json> [--output-root <directory>] [--target engine|renderer|all]';
+const usage = 'Usage: node runtime/build.mjs build --inputs <machine-config.json> [--output-root <directory>]';
 const args = process.argv.slice(2);
 if (args.shift() !== 'build') throw new Error(usage);
 const options = {};
@@ -19,9 +19,7 @@ while (args.length) {
   options[key] = args.shift();
 }
 if (!options['--inputs']) throw new Error(usage);
-const target = options['--target'] ?? 'engine';
-if (!['engine', 'renderer', 'all'].includes(target)) throw new Error(usage);
-const targets = target === 'all' ? ['engine', 'renderer'] : [target];
+if (options['--target']) throw new Error(usage);
 const output = resolve(options['--output-root'] ?? join(runtime, '.local/build'));
 const within = (parent, child) => child === parent || child.startsWith(parent + sep);
 if (within(core, output) && !within(join(runtime, '.local'), output)) {
@@ -108,9 +106,7 @@ function execute(program, argv, cwd, env, capture = false) {
 async function materialize(name, snapshot) {
   const destination = join(output, name);
   await mkdir(destination, { recursive: true });
-  // Preserve only our standalone renderer's compiler target cache, never sources.
   for (const entry of await readdir(destination)) {
-    if (name === 'renderer' && entry === 'target') continue;
     await rm(join(destination, entry), { recursive: true, force: true });
   }
   for (const entry of snapshot.files) {
@@ -130,7 +126,7 @@ try {
   const config = JSON.parse(await readFile(configPath, 'utf8'));
   const allowed = new Set(['schema', 'zig', 'cargo', 'rustc', 'sdk', 'v8_archive', 'rusty_v8_archive', 'zig_packages', 'cargo_registry_cache', 'jobs']);
   if (config.schema !== 1 || Object.keys(config).some(key => !allowed.has(key))) throw new Error('Unsupported input config schema or key. See runtime/README.md.');
-  const required = ['cargo', 'rustc', 'sdk', 'cargo_registry_cache', ...(targets.includes('engine') ? ['zig', 'v8_archive', 'zig_packages'] : []), ...(targets.includes('renderer') ? ['rusty_v8_archive'] : [])];
+  const required = ['sdk', 'zig', 'v8_archive', 'zig_packages'];
   for (const key of required) {
     if (typeof config[key] !== 'string' || !config[key]) throw new Error(`Input config requires ${key}`);
     config[key] = resolve(dirname(configPath), config[key]);
@@ -146,33 +142,26 @@ try {
   receipt.sources = await sources();
   try { receipt.core_manifest_sha256 = (await fileInfo(join(core, 'MANIFEST.sha256'))).sha256; }
   catch (error) { if (error.code !== 'ENOENT') throw error; receipt.core_manifest_sha256 = null; }
-  const cargoHome = join(output, 'cargo-home');
-  // Separate credentials; the explicit --config also overrides ancestor registry rewrites.
-  await rm(cargoHome, { recursive: true, force: true });
-  await mkdir(cargoHome, { recursive: true });
   const env = {
-    PATH: [...new Set(required.filter(key => ['zig', 'cargo', 'rustc'].includes(key)).map(key => dirname(config[key]))) , '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':'),
+    PATH: [...new Set(['zig'].map(key => dirname(config[key]))), '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':'),
     HOME: process.env.HOME ?? '', LANG: 'C', LC_ALL: 'C',
     ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
-    SDKROOT: config.sdk, RUSTC: config.rustc, CARGO_HOME: cargoHome,
-    CARGO_NET_OFFLINE: 'true', CARGO_INCREMENTAL: '0', CARGO_BUILD_JOBS: String(jobs),
+    SDKROOT: config.sdk,
     ZIG_GLOBAL_CACHE_DIR: join(output, 'zig-global-cache'),
-    OBSCURA_VERSION: `0.1.0-mioa+${receipt.sources.sha256.slice(0, 12)}`,
     ZIG_LOCAL_CACHE_DIR: join(output, 'zig-local-cache'),
     ZIG_LOCAL_PKG_DIR: join(output, 'zig-pkg'),
   };
   receipt.tools = { node: { version: process.version, path: process.execPath, ...await fileInfo(await realpath(process.execPath)) } };
-  for (const name of ['cargo', 'rustc', ...(targets.includes('engine') ? ['zig'] : [])]) {
+  for (const name of ['zig']) {
     const version = execute(config[name], [name === 'zig' ? 'version' : '--version'], output, env, true);
     if (version !== lock.tools[name]) throw new Error(`Pinned ${name} version mismatch: ${version}`);
     receipt.tools[name] = { path: config[name], version, ...await fileInfo(await realpath(config[name])) };
   }
   receipt.sdk = { path: config.sdk, settings: await verifyFile(join(config.sdk, lock.sdk_settings.path), lock.sdk_settings) };
-  if (targets.includes('engine')) await materialize('engine', receipt.sources);
-  await materialize('renderer', receipt.sources);
+  await materialize('engine', receipt.sources);
   const inputDirectory = join(output, 'inputs');
   await mkdir(inputDirectory, { recursive: true });
-  if (targets.includes('engine')) {
+  {
     // Copy then verify: compiler inputs cannot race mutations in an external cache.
     const archive = join(inputDirectory, 'libc_v8.a');
     await copyFile(config.v8_archive, archive);
@@ -187,51 +176,14 @@ try {
     }
     receipt.zig_packages = lock.zig_packages;
   }
-  if (targets.includes('renderer')) {
-    const archive = join(inputDirectory, 'librusty_v8.a');
-    await copyFile(config.rusty_v8_archive, archive);
-    await verifyFile(archive, lock.rusty_v8_archive);
-    env.RUSTY_V8_ARCHIVE = archive;
-    receipt.rusty_v8_archive = { ...lock.rusty_v8_archive, path: archive };
-  }
-  // Cargo directory sources need no network or registry index. Each .crate is
-  // checked against the committed Cargo.lock checksum before extraction.
-  const vendor = join(output, 'cargo-vendor');
-  await rm(vendor, { recursive: true, force: true });
-  await mkdir(vendor, { recursive: true });
   receipt.cargo_crates = [];
-  for (const pkg of lock.cargo_crates.filter(pkg => pkg.targets.some(name => targets.includes(name)))) {
-    const name = `${pkg.name}-${pkg.version}`;
-    const archive = join(inputDirectory, 'crate.tar.gz');
-    await copyFile(join(config.cargo_registry_cache, `${name}.crate`), archive);
-    await verifyFile(archive, pkg);
-    execute('/usr/bin/tar', ['-xzf', archive, '-C', vendor], output, env);
-    const directory = join(vendor, name);
-    const checksums = {};
-    for (const row of await treeRows(directory)) {
-      if (row[1] !== 'file') throw new Error(`Registry package contains a non-regular file: ${name}/${row[0]}`);
-      if (row[0] !== '.cargo-checksum.json') checksums[row[0]] = row[2];
-    }
-    await writeFile(join(directory, '.cargo-checksum.json'), json({ files: checksums, package: pkg.sha256 }));
-    receipt.cargo_crates.push({ name: pkg.name, version: pkg.version, sha256: pkg.sha256 });
-  }
-  await rm(join(inputDirectory, 'crate.tar.gz'), { force: true });
-  const cargoConfig = join(cargoHome, 'config.toml');
-  await writeFile(cargoConfig, `[net]\noffline = true\n[source.crates-io]\nreplace-with = "core-verified-vendor"\n[source.core-verified-vendor]\ndirectory = ${JSON.stringify(vendor)}\n`);
   receipt.artifacts = {};
-  if (targets.includes('engine')) {
+  {
     const binary = join(output, 'engine/zig-out/bin/lightpanda');
     await rm(binary, { force: true });
-    execute(config.zig, ['build', '-Doptimize=fast', '-Ddev_fast=false', '-Dshared_v8=false', `-Dprebuilt_v8_path=${receipt.v8_archive.path}`, `-Dcargo=${config.cargo}`, `-Dcargo_config=${cargoConfig}`, `-j${jobs}`, '--cache-dir', env.ZIG_LOCAL_CACHE_DIR], join(output, 'engine'), env);
+    execute(config.zig, ['build', '-Doptimize=fast', '-Ddev_fast=false', '-Dshared_v8=false', `-Dprebuilt_v8_path=${receipt.v8_archive.path}`, `-j${jobs}`, '--cache-dir', env.ZIG_LOCAL_CACHE_DIR], join(output, 'engine'), env);
     receipt.artifacts.engine = { path: binary, ...await fileInfo(binary) };
     receipt.binary = receipt.artifacts.engine;
-  }
-  if (targets.includes('renderer')) {
-    const binary = join(output, 'renderer/target/release/obscura');
-    await rm(binary, { force: true });
-    execute(config.cargo, ['--config', cargoConfig, 'build', '--frozen', '--release', '-p', 'obscura-cli', '--features', 'render', '--bin', 'obscura', '--target-dir', join(output, 'renderer/target')], join(output, 'renderer'), env);
-    receipt.artifacts.renderer = { path: binary, ...await fileInfo(binary) };
-    if (!receipt.binary) receipt.binary = receipt.artifacts.renderer;
   }
   const after = await sources();
   if (after.sha256 !== receipt.sources.sha256) throw new Error('Core source inputs changed during compilation; no completed receipt is issued.');

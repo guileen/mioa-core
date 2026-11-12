@@ -5,16 +5,6 @@
       "path": "engine/build.zig.zon",
       "sha256": "eb21008326eb20f4abe2cb55218ba086053555068c005a081f4bbe98e527ffbb",
       "bytes": 2942
-    },
-    {
-      "path": "engine/src/rust/Cargo.lock",
-      "sha256": "1d3254ae675c53de03241fdf87b32f54ed547a37cb040de3a849c18796590915",
-      "bytes": 59281
-    },
-    {
-      "path": "renderer/Cargo.lock",
-      "sha256": "e6edbaf97af21641b69ed56fd8b279894883027b9b9f0beb07bda172c0c504c6",
-      "bytes": 119328
     }
   ],
   "host": {

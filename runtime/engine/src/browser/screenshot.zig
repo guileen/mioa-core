@@ -129,26 +129,26 @@ pub const Fonts = struct {
     }
 };
 
-// Parsed fonts, shaping scratch and the glyph cache, on the Rust side. One
-// per Browser, created on the first screenshot.
+// Parsed fonts, shaping scratch and the glyph cache, in the kernel. One per
+// Browser, created on the first screenshot.
 pub const Renderer = opaque {
     pub fn init(fonts: []const LpFontFile) !*Renderer {
-        return lp_render_new(fonts.ptr, fonts.len) orelse error.RendererInit;
+        return nl_render_new(fonts.ptr, fonts.len) orelse error.RendererInit;
     }
 
     pub fn deinit(self: *Renderer) void {
-        lp_render_free(self);
+        nl_render_free(self);
     }
 };
 
-/// The block model laid out by the Rust side at scale 1, as flat arrays
-/// (see `LpLayout`). Lives on the Rust heap until `deinit`.
+/// The block model laid out by the kernel at scale 1, as flat arrays
+/// (see `LpLayout`). Lives on the kernel heap until `deinit`.
 pub const Layout = struct {
     handle: *LayoutHandle,
     raw: LpLayout,
 
     pub fn deinit(self: *Layout) void {
-        lp_layout_free(self.handle);
+        nl_layout_free(self.handle);
     }
 
     pub fn blocks(self: *const Layout) []const LpLayoutBlock {
@@ -177,7 +177,7 @@ const LayoutHandle = opaque {};
 /// every side.
 pub fn layout(renderer: *Renderer, blocks: []const LpBlock, width: f32, margin: f32) error{LayoutFailed}!Layout {
     var raw: LpLayout = undefined;
-    const handle = lp_layout_new(renderer, blocks.ptr, blocks.len, width, margin, &raw) orelse return error.LayoutFailed;
+    const handle = nl_layout_new(renderer, blocks.ptr, blocks.len, width, margin, &raw) orelse return error.LayoutFailed;
     return .{ .handle = handle, .raw = raw };
 }
 
@@ -196,12 +196,10 @@ pub fn png(arena: Allocator, state: RenderTree.State, opts: Opts, writer: *std.I
     return prepared.write(writer);
 }
 
-/// The height a render at `width` would have.
+/// The height a render of `node` at `width` would have.
 pub fn contentHeight(arena: Allocator, node: *Node, width: u32, frame: *Frame) !u32 {
     _ = arena;
-    _ = node;
-    _ = width;
-    return @intFromFloat(@ceil(try @import("native_layout.zig").height(frame)));
+    return @intFromFloat(@ceil(try @import("native_layout.zig").heightAt(frame, node, @floatFromInt(width))));
 }
 
 // The DOM walk, done up front so it can fail (allocation) before any output
@@ -209,13 +207,13 @@ pub fn contentHeight(arena: Allocator, node: *Node, width: u32, frame: *Frame) !
 // std.json value and streams itself as a base64 string.
 pub fn preparePng(arena: Allocator, state: RenderTree.State, opts: Opts, frame: *Frame) !Prepared {
     _ = arena;
-    _ = state;
     if (opts.width == 0 or !(opts.scale > 0 and opts.scale <= 8)) {
         return error.InvalidScreenshotOptions;
     }
     return .{
         .opts = opts,
         .frame = frame,
+        .root = state.root,
     };
 }
 
@@ -248,6 +246,8 @@ fn renderFailed(comptime what: []const u8, rc: i32) error{WriteFailed} {
 pub const Prepared = struct {
     opts: Opts,
     frame: *Frame,
+    /// The subtree to render. Detached roots are legal (tests and `collect`).
+    root: *Node,
 
     pub fn write(self: *const Prepared, writer: *std.Io.Writer) std.Io.Writer.Error!u32 {
         return self.render(writer, 0);
@@ -274,7 +274,7 @@ pub const Prepared = struct {
         const clip = opts.clip orelse Opts.Clip{ .x = 0, .y = 0, .width = 0, .height = 0 };
         var content_height: u32 = 0;
         var sink: Sink = .{ .writer = writer };
-        const rc = @import("native_layout.zig").render(self.frame, .{
+        const rc = @import("native_layout.zig").renderScoped(self.frame, self.root, .{
             .width = opts.width,
             .height = opts.height,
             .clip_x = clip.x,
@@ -324,7 +324,7 @@ const Sink = struct {
     }
 };
 
-// Mirrors the C ABI in src/rust/render/lib.rs.
+// Mirrors the kernel's src/render_kernel/abi.zig.
 const LpSpan = extern struct {
     text: [*]const u8,
     len: usize,
@@ -375,9 +375,9 @@ const BLOCK_TIGHT: u8 = 1 << 0;
 
 const RENDER_MEASURE_ONLY: u32 = 1 << 0;
 
-// The laid-out document `lp_layout_new` exports, in layout px: blocks own a
+// The laid-out document the kernel exports, in layout px: blocks own a
 // range of lines, lines a range of runs and clusters, runs a range of
-// glyphs. Consumed by pdf.zig; see the Rust definitions for field docs.
+// glyphs. Consumed by pdf.zig; see the kernel's `abi.zig` for field docs.
 const LpLayout = extern struct {
     height: f32,
     pre_pad: f32,
@@ -484,7 +484,8 @@ const RC_NO_RASTER: i32 = 3;
 const RC_ENCODE_FAILED: i32 = 4;
 const RC_PANIC: i32 = 5;
 
-// What the Rust side reports about the mirror above; see the "rust abi" test.
+// What the Zig kernel reports about its copies of the mirror above; see the
+// "render kernel abi" test.
 const LpAbi = extern struct {
     size: u32,
 
@@ -628,27 +629,31 @@ const LpAbi = extern struct {
 const LINK_COLOR: u32 = 0x1a0dab;
 const MUTED_COLOR: u32 = 0x6b6b6b;
 
-extern "c" fn lp_render_new(fonts: [*]const LpFontFile, fonts_len: usize) ?*Renderer;
-extern "c" fn lp_render_free(r: *Renderer) void;
-extern "c" fn lp_render_png(
-    r: *Renderer,
-    blocks: [*]const LpBlock,
-    blocks_len: usize,
-    opts: LpRenderOpts,
-    content_height: *u32,
-    ctx: *anyopaque,
-    write: *const fn (ctx: *anyopaque, data: [*]const u8, len: usize) callconv(.c) bool,
-) i32;
-extern "c" fn lp_layout_new(
-    r: *Renderer,
-    blocks: [*]const LpBlock,
-    blocks_len: usize,
-    width: f32,
-    margin: f32,
-    out: *LpLayout,
-) ?*LayoutHandle;
-extern "c" fn lp_layout_free(h: *LayoutHandle) void;
-extern "c" fn lp_render_abi(out: *LpAbi) void;
+// ---------------------------------------------------------------------------
+// Renderer dispatch: the Desktop-owned Zig kernel (`mioa-desktop/src/
+// render_kernel`) owns layout and raster. These wrappers are the only seam;
+// `Renderer`/`LayoutHandle` stay opaque here so the engine never names a
+// kernel type.
+// ---------------------------------------------------------------------------
+const render_kernel = @import("render_kernel");
+
+fn nl_render_new(fonts: [*]const LpFontFile, fonts_len: usize) ?*Renderer {
+    return @ptrCast(render_kernel.block_model.lp_render_new(@ptrCast(fonts), fonts_len));
+}
+fn nl_render_free(r: *Renderer) void {
+    render_kernel.block_model.lp_render_free(@ptrCast(@alignCast(r)));
+}
+fn nl_layout_new(r: *Renderer, blocks: [*]const LpBlock, blocks_len: usize, width: f32, margin: f32, out: *LpLayout) ?*LayoutHandle {
+    return @ptrCast(render_kernel.block_model.lp_layout_new(@ptrCast(@alignCast(r)), @ptrCast(blocks), blocks_len, width, margin, @ptrCast(out)));
+}
+fn nl_layout_free(h: *LayoutHandle) void {
+    render_kernel.block_model.lp_layout_free(@ptrCast(@alignCast(h)));
+}
+
+/// The kernel's `@sizeOf`/`@offsetOf` for its copies of the structs above.
+fn lp_render_abi(out: *LpAbi) void {
+    render_kernel.abi.fillAbi(@ptrCast(out));
+}
 
 // Iterative else large trees will stackoverflow
 const Builder = struct {
@@ -1125,7 +1130,7 @@ fn isBlockTag(tag: Element.Tag) bool {
 }
 
 const testing = @import("../testing.zig");
-test "browser.screenshot: rust abi matches" {
+test "browser.screenshot: render kernel abi matches" {
     var got: LpAbi = undefined;
     lp_render_abi(&got);
 
@@ -1274,7 +1279,7 @@ test "browser.screenshot: rust abi matches" {
     try testing.expectEqual(expected.size, got.size);
     inline for (@typeInfo(LpAbi).@"struct".field_names) |field_name| {
         testing.expectEqual(@field(expected, field_name), @field(got, field_name)) catch |err| {
-            std.debug.print("rust/zig abi mismatch on {s}\n", .{field_name});
+            std.debug.print("render kernel abi mismatch on {s}\n", .{field_name});
             return err;
         };
     }
@@ -1723,13 +1728,17 @@ test "browser.screenshot: --render-font faces fill what DejaVu lacks" {
 
 test "browser.screenshot: Fonts maps --render-font files" {
     testing.silenceLog(&.{.app});
-    try testing.expectError(error.InvalidArgument, Fonts.load(testing.allocator, &.{"src/rust/render/fonts/missing.ttf"}));
+    // The renderer's faces live with the in-tree kernel now that `src/rust`
+    // is gone; the mapping contract (one mmap per --render-font path) is what
+    // this test pins.
+    const fonts_dir = "../../../../src/render_kernel/fonts";
+    try testing.expectError(error.InvalidArgument, Fonts.load(testing.allocator, &.{"src/render_kernel/fonts/missing.ttf"}));
 
-    var fonts: Fonts = try .load(testing.allocator, &.{ "src/rust/render/fonts/DejaVuSans.ttf", "src/rust/render/fonts/DejaVuSansMono.ttf" });
+    var fonts: Fonts = try .load(testing.allocator, &.{ fonts_dir ++ "/liberation-sans.ttf", fonts_dir ++ "/liberation-sans-bold.ttf" });
     defer fonts.deinit(testing.allocator);
     try testing.expectEqual(2, fonts.files.len);
     const data = fonts.files[0].data[0..fonts.files[0].data_len];
-    try testing.expectEqual(759720, data.len);
+    try testing.expectEqual(139512, data.len);
     try testing.expectEqual(0x00010000, std.mem.readInt(u32, data[0..4], .big));
 }
 

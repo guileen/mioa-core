@@ -41,10 +41,9 @@ const log = lp.log;
 const String = lp.String;
 const Allocator = std.mem.Allocator;
 
-// Tracks the CSS properties the renderless layout acts on (display, visibility,
-// opacity, pointer-events, overflow, width, height) and text-transform, which
-// innerText applies, from author stylesheets.
-// Rules are bucketed by their rightmost selector part for fast lookup.
+// Tracks the CSS properties the renderless layout acts on from author stylesheets.
+// `property_rules` lazily indexes declarations queried by computed CSSOM, so
+// getComputedStyle can resolve ordinary values without scanning every rule.
 const StyleManager = @This();
 
 const Tag = Element.Tag;
@@ -63,7 +62,7 @@ flow: Group(Flow) = .{},
 widths: WidthMemo = .{},
 
 // Keyed by property name, pruning to what is (hopefully) one or few rules
-custom_rules: std.StringHashMapUnmanaged(CustomProperty) = .empty,
+property_rules: std.StringHashMapUnmanaged(PropertyRules) = .empty,
 
 /// The thing to remember about layers is that we can't determine priority's
 /// layer_rank until everything is parsed. So we need to build up meta data when
@@ -445,10 +444,10 @@ fn finalizeLayerRanks(self: *StyleManager, build_arena: Allocator) Allocator.Err
         @field(self, field).stampRules(self);
     }
 
-    // Custom rules parse their selectors lazily, but the layer ranks are only
-    // known now that every sheet has been read
-    var custom_it = self.custom_rules.valueIterator();
-    while (custom_it.next()) |property| {
+    // Property-indexed rules parse their selectors lazily, but layer ranks are
+    // only known now that every sheet has been read.
+    var property_it = self.property_rules.valueIterator();
+    while (property_it.next()) |property| {
         for (property.rules.items) |*rule| {
             rule.priority |= self.layerRank(rule.priority) << RANK_SHIFT;
         }
@@ -475,43 +474,71 @@ fn addRawRule(self: *StyleManager, build_arena: Allocator, selector_text: []cons
     if (selector_text.len == 0) {
         return;
     }
-    var customs: CustomSink = .{ .allocator = build_arena };
-    const folded = try foldDeclarations(Declarations, CssParser.parseStyleBlock(block_text), &customs);
-    _ = try self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), customs.map.values(), layer);
+    var declaration_sink: DeclarationSink = .{ .allocator = build_arena };
+    const folded = try foldDeclarations(Declarations, CssParser.parseStyleBlock(block_text), &declaration_sink);
+    _ = try self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), declaration_sink.map.values(), layer);
+}
+
+/// Whether a selector can match `:hover`. Scanned as text because pseudo-class
+/// parsing is skipped for rules that only feed the CSSOM property index. A false
+/// positive (the text inside a string or attribute value) only costs an
+/// unnecessary recascade; absence is reported only when the substring is truly
+/// missing, so a real hover recascade can never be dropped.
+fn selectorUsesHover(selector_text: []const u8) bool {
+    const needle = ":hover";
+    if (selector_text.len < needle.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i + needle.len <= selector_text.len) : (i += 1) {
+        if (selector_text[i] == ':' and
+            std.ascii.eqlIgnoreCase(selector_text[i + 1 .. i + needle.len], needle[1..]))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Tracked rules get one group Rule per selector (not per selector list)
 // so each has correct specificity, bucketed by their rightmost selector part.
-// Custom properties are keyed by name instead, and lazily parse the selector.
-// Returns whether the rule set any tracked property.
+// CSSOM values are keyed by property name and lazily parse their selectors.
+// Returns whether the rule set any tracked layout property.
 fn addSelectorRules(
     self: *StyleManager,
     selector_text: []const u8,
     props: Declarations,
     important: Declarations,
-    customs: []const CustomDeclaration,
+    declarations: []const IndexedDeclaration,
     layer: u16,
 ) !bool {
     const relevant = props.isRelevant() or important.isRelevant();
-    if (relevant == false and customs.len == 0) {
+    if (relevant == false and declarations.len == 0) {
         return false;
+    }
+
+    if (selectorUsesHover(selector_text)) {
+        self.frame.page.hover_style = .present;
     }
 
     const arena = self.arena.allocator();
     const before = self.next_doc_order;
 
-    if (customs.len > 0) {
+    if (declarations.len > 0) {
         const priority = try self.nextPriority(layer);
-        for (customs) |custom| {
-            const gop = try self.custom_rules.getOrPut(arena, custom.name);
+        for (declarations) |declaration| {
+            const rule_priority = if (declaration.important) IMPORTANT_BIT | priority else priority;
+            const gop = try self.property_rules.getOrPut(arena, declaration.name);
             if (gop.found_existing == false) {
+                // Raw rule names may be allocated in the short-lived rebuild arena.
+                gop.key_ptr.* = try arena.dupe(u8, declaration.name);
                 gop.value_ptr.* = .{};
             }
             // An appended rule joins a property that may already be parsed
             gop.value_ptr.parsed = null;
             try gop.value_ptr.rules.append(arena, .{
-                .value = custom.value,
-                .priority = priority,
+                .value = declaration.value,
+                .priority = rule_priority,
                 .selector_text = selector_text,
             });
         }
@@ -596,7 +623,7 @@ fn rebuildIfDirty(self: *StyleManager) !void {
     inline for (group_fields, &caps) |field, *c| {
         c.* = @field(self, field).capacities();
     }
-    const custom_rules_count = self.custom_rules.count();
+    const property_rules_count = self.property_rules.count();
 
     self.arena.resetRetain();
     self.widths = .{};
@@ -609,8 +636,14 @@ fn rebuildIfDirty(self: *StyleManager) !void {
         try @field(self, field).reset(self.arena.allocator(), c);
     }
 
-    self.custom_rules = .empty;
-    try self.custom_rules.ensureTotalCapacity(self.arena.allocator(), custom_rules_count);
+    self.property_rules = .empty;
+    try self.property_rules.ensureTotalCapacity(self.arena.allocator(), property_rules_count);
+
+    // This rebuild re-ingests every sheet from scratch, so the hover flag has to
+    // be recomputed: dropping the last `:hover` rule must clear it. A failed
+    // rebuild falls back to `.unknown`, which counts as present.
+    self.frame.page.hover_style = .absent;
+    errdefer self.frame.page.hover_style = .unknown;
 
     const sheets = self.frame.document._style_sheets orelse return;
     for (sheets._sheets.items) |sheet| {
@@ -699,7 +732,7 @@ pub fn isHitTestable(self: *StyleManager, el: *Element) bool {
 pub fn textTransform(self: *StyleManager, el: *Element) TextTransform {
     self.assertOwns(el);
     var current: ?*Element = el;
-    while (current) |elem| : (current = elem.parentElement()) {
+    while (current) |elem| : (current = elem.asNode().flatTreeParentElement(self.frame)) {
         const own = self.ownTextTransform(elem);
         if (own != .inherit) {
             return own;
@@ -1242,14 +1275,14 @@ fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
     }
     const style = style_rule._style orelse return false;
     const folded = extractDeclared(Declarations, style);
-    const customs = try self.extractCustomDeclarations(style);
+    const declarations = try self.extractIndexedDeclarations(style);
 
-    // A custom rule holds selector_text until the property is looked up, but it
-    // doesn't need a copy: setSelectorText allocates the replacement from the
-    // frame arena and never frees the old one. Worst case we match a stale
-    // selector, which is what the rest of this file already does when a rule is
-    // mutated without going through sheetModified().
-    return self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), customs, NO_LAYER);
+    // An indexed rule retains selector_text until the property is looked up,
+    // but doesn't need a copy: setSelectorText allocates the replacement from
+    // the frame arena and never frees the old one. Worst case we match a stale
+    // selector, which is what the rest of this file already does when a rule
+    // is mutated without going through sheetModified().
+    return self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), declarations, NO_LAYER);
 }
 
 /// A style rule appended at or after the sheet that emitted the last rule is
@@ -1258,6 +1291,7 @@ fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
 pub fn ruleInserted(self: *StyleManager, sheet: *CSSStyleSheet, rule: *CSSRule) void {
     if (self.dirty) {
         // The pending rebuild reads the sheet's rules and picks it up.
+        self.frame.styleChanged();
         return;
     }
     const style_rule = switch (rule._type) {
@@ -1294,30 +1328,30 @@ fn appendable(self: *const StyleManager, sheet: *CSSStyleSheet, rule: *CSSRule) 
     return false;
 }
 
-/// The CSSOM counterpart to foldDeclarations' `--*` branch. Names within one
-/// declaration block are already unique, so there is nothing to dedup here.
-///
+/// Snapshot every declaration in a CSSOM rule for the computed-property index.
+/// Names are unique within a declaration block.
 /// Unlike the selector text, both strings have to be copied: they can point
 /// into the Property itself (small string optimization), and setProperty /
 /// removeProperty destroy it without going through sheetModified(). We'd be
 /// left reading freed memory rather than something merely stale.
-fn extractCustomDeclarations(self: *StyleManager, style: *CSSStyleProperties) ![]const CustomDeclaration {
+fn extractIndexedDeclarations(self: *StyleManager, style: *CSSStyleProperties) ![]const IndexedDeclaration {
     const arena = self.arena.allocator();
 
-    var customs: std.ArrayList(CustomDeclaration) = .empty;
+    var declarations: std.ArrayList(IndexedDeclaration) = .empty;
     var it = style.asCSSStyleDeclaration().iterator();
     while (it.next()) |property| {
-        const name = property._name.str();
-        if (isCustomProperty(name) == false) {
-            continue;
-        }
-        try customs.append(arena, .{
-            .name = try arena.dupe(u8, name),
+        const original_name = property._name.str();
+        const name = if (isCustomProperty(original_name))
+            try arena.dupe(u8, original_name)
+        else
+            try std.ascii.allocLowerString(arena, original_name);
+        try declarations.append(arena, .{
+            .name = name,
             .value = try arena.dupe(u8, property._value.str()),
             .important = property._important,
         });
     }
-    return customs.items;
+    return declarations.items;
 }
 
 const BucketKey = union(enum) {
@@ -1943,31 +1977,30 @@ fn Priorities(comptime Declared: type) type {
     return std.enums.EnumArray(std.meta.FieldEnum(Declared), u64);
 }
 
-// custom_rules map is property_name -> CustomProperty, loosely:
-//    --color => [(:root, "#ff0"), (.card, "#000")]
-// So when code says "getComputedStyle(el).getPropertyValue("--color")
-// We end up with a relatively small number of rules
-const CustomProperty = struct {
-    rules: std.ArrayList(CustomRule) = .empty,
-    parsed: ?[]const ParsedCustomRule = null, // lazily parsed
+// The property index maps a name to matching declarations, loosely:
+//    color => [(.card, "red"), (#alert, "blue")]
+// Selectors stay lazy until getComputedStyle asks for that property.
+const PropertyRules = struct {
+    rules: std.ArrayList(PropertyRule) = .empty,
+    parsed: ?[]const ParsedPropertyRule = null, // lazily parsed
 };
 
-const CustomRule = struct {
+const PropertyRule = struct {
     selector_text: []const u8,
     value: []const u8,
     priority: u64,
 };
 
-/// Some frameworks define hundreds+ of custom properties, 99% of which are
-/// never accessed via JS. So we don't parse them until something asks for it.
-const ParsedCustomRule = struct {
+/// Large stylesheets may declare many properties that JS never queries, so
+/// parse their selectors only on demand.
+const ParsedPropertyRule = struct {
     selector: Selector.Selector,
     value: []const u8,
     priority: u64, // packed the same way as a group Rule.priority
 };
 
-/// A `--*` declaration on its way from a rule block into custom_rules.
-const CustomDeclaration = struct {
+/// One declaration on its way from a rule block into the computed-property index.
+const IndexedDeclaration = struct {
     name: []const u8,
     value: []const u8,
     important: bool,
@@ -2035,34 +2068,124 @@ fn inlineDeclared(comptime Declared: type, el: *Element, frame: *Frame) Slots(De
     return foldDeclarations(Declared, CssParser.parseDeclarationsList(attr), null) catch unreachable;
 }
 
-/// `--*` declarations of one block, keyed by name so a block declaring the same
-/// custom property twice keeps only the winner.
-const CustomSink = struct {
+/// Declarations of one block, keyed by name so the block keeps each property's
+/// winning normal/important value.
+const DeclarationSink = struct {
     allocator: Allocator,
-    map: std.StringArrayHashMapUnmanaged(CustomDeclaration) = .empty,
+    map: std.StringArrayHashMapUnmanaged(IndexedDeclaration) = .empty,
 };
 
 // Must agree with CSSStyleDeclaration.applyDeclarations, which is what the
 // materialized object was built from: a normal declaration never overrides an
-// earlier !important one, and an empty value removes the property. The tracked
-// properties are matched case-insensitively; a custom property's name is
-// case-sensitive and goes to `customs` when there is one.
-fn foldDeclarations(comptime Declared: type, declarations: CssParser.DeclarationsIterator, customs: ?*CustomSink) !Slots(Declared) {
+// earlier !important one, and an empty value removes the property.
+fn foldDeclarations(comptime Declared: type, declarations: CssParser.DeclarationsIterator, declaration_sink: ?*DeclarationSink) !Slots(Declared) {
     var slots: Slots(Declared) = .{};
     var it = declarations;
     while (it.next()) |declaration| {
-        if (isCustomProperty(declaration.name)) {
-            const sink = customs orelse continue;
-            const gop = try sink.map.getOrPut(sink.allocator, declaration.name);
-            if (gop.found_existing and gop.value_ptr.important and !declaration.important) {
-                continue;
-            }
-            gop.value_ptr.* = .{ .name = declaration.name, .value = declaration.value, .important = declaration.important };
+        const sink = declaration_sink orelse {
+            slots.apply(declaration.name, declaration.value, declaration.important);
+            continue;
+        };
+        const name = if (isCustomProperty(declaration.name))
+            declaration.name
+        else
+            try std.ascii.allocLowerString(sink.allocator, declaration.name);
+        const gop = try sink.map.getOrPut(sink.allocator, name);
+        if (gop.found_existing and gop.value_ptr.important and !declaration.important) {
             continue;
         }
+        gop.value_ptr.* = .{ .name = name, .value = declaration.value, .important = declaration.important };
         slots.apply(declaration.name, declaration.value, declaration.important);
     }
     return slots;
+}
+const inherited_css_properties = std.StaticStringMap(void).initComptime(.{
+    .{ "color", {} },
+    .{ "cursor", {} },
+    .{ "direction", {} },
+    .{ "font-family", {} },
+    .{ "font-feature-settings", {} },
+    .{ "font-kerning", {} },
+    .{ "font-style", {} },
+    .{ "font-variant", {} },
+    .{ "font-weight", {} },
+    .{ "letter-spacing", {} },
+    .{ "line-height", {} },
+    .{ "list-style-image", {} },
+    .{ "list-style-position", {} },
+    .{ "list-style-type", {} },
+    .{ "orphans", {} },
+    .{ "pointer-events", {} },
+    .{ "quotes", {} },
+    .{ "tab-size", {} },
+    .{ "text-align", {} },
+    .{ "text-indent", {} },
+    .{ "text-orientation", {} },
+    .{ "text-rendering", {} },
+    .{ "text-transform", {} },
+    .{ "visibility", {} },
+    .{ "white-space", {} },
+    .{ "widows", {} },
+    .{ "word-break", {} },
+    .{ "word-spacing", {} },
+    .{ "writing-mode", {} },
+});
+
+/// Resolve a computed CSS property from author rules and inline style,
+/// following CSS inheritance and CSS-wide `inherit`/`unset`/`initial` keywords.
+pub fn computedPropertyValue(self: *StyleManager, el: *Element, property_name: String) ?[]const u8 {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return null;
+
+    const property = property_name.str();
+    var inherits = inherited_css_properties.has(property);
+    const rules = self.parsedPropertyRules(property) catch |err| blk: {
+        log.err(.browser, "computed property value", .{ .err = err });
+        break :blk &.{};
+    };
+    var current: ?*Element = el;
+    while (current) |candidate| {
+        var winner: ?[]const u8 = null;
+        var priority: u64 = 0;
+        for (rules) |rule| {
+            if (rule.priority > priority and matchesSelector(candidate, rule.selector, self.frame)) {
+                winner = rule.value;
+                priority = rule.priority;
+            }
+        }
+
+        var value = winner;
+        if (candidate.inlineStyle(self.frame)) |style| {
+            const declaration = style.asCSSStyleDeclaration();
+            if (declaration.declaredValue(property_name, self.frame)) |inline_value| {
+                if (declaration.declaredImportant(property_name) or priority & IMPORTANT_BIT == 0) {
+                    value = inline_value;
+                }
+            }
+        }
+        if (value) |resolved| {
+            const keyword = std.mem.trim(u8, resolved, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(keyword, "inherit")) {
+                inherits = true;
+                current = candidate.asNode().flatTreeParentElement(self.frame);
+                continue;
+            }
+            if (std.ascii.eqlIgnoreCase(keyword, "unset")) {
+                if (inherits) {
+                    current = candidate.asNode().flatTreeParentElement(self.frame);
+                    continue;
+                }
+                return "initial";
+            }
+            if (std.ascii.eqlIgnoreCase(keyword, "initial")) {
+                return "initial";
+            }
+            return resolved;
+        }
+        if (!inherits) return null;
+        current = candidate.asNode().flatTreeParentElement(self.frame);
+    }
+    return if (inherits) "initial" else null;
 }
 
 /// One block's winning value per property in `Declared.names`, folded in
@@ -2164,7 +2287,7 @@ pub fn customPropertyValue(self: *StyleManager, el: *Element, property_name: Str
     // Only the rules declaring this name; usually a handful, often none. An
     // element can still shadow them with an inline declaration, so a miss here
     // means walking for inline styles, not returning early.
-    const rules = self.parsedCustomRules(property_name.str()) catch |err| blk: {
+    const rules = self.parsedPropertyRules(property_name.str()) catch |err| blk: {
         log.err(.browser, "StyleManager customProperty", .{ .err = err });
         break :blk &.{};
     };
@@ -2196,24 +2319,21 @@ pub fn customPropertyValue(self: *StyleManager, el: *Element, property_name: Str
     return null;
 }
 
-/// Gets the parsed rule for a custom property name
-fn parsedCustomRules(self: *StyleManager, name: []const u8) ![]const ParsedCustomRule {
-    const property = self.custom_rules.getPtr(name) orelse return &.{};
+/// Gets the parsed rules for a property name, building and memoizing them once.
+fn parsedPropertyRules(self: *StyleManager, name: []const u8) ![]const ParsedPropertyRule {
+    const property = self.property_rules.getPtr(name) orelse return &.{};
     if (property.parsed) |parsed| {
-        // the custom property exists, and we already parsed it.
         return parsed;
     }
-
     const arena = self.arena.allocator();
-    var parsed: std.ArrayList(ParsedCustomRule) = .empty;
+    var parsed: std.ArrayList(ParsedPropertyRule) = .empty;
 
     for (property.rules.items) |rule| {
         const selectors = SelectorParser.parseList(arena, rule.selector_text) catch continue;
         for (selectors) |selector| {
             {
-                // we don't use buckets for custom properties (are property name
-                // lookup is more efficient), but we still want to skip dynamic
-                // pseudo-classes just like visibility does
+                // Property lookup already narrows the candidates; still skip
+                // dynamic pseudo-classes that cannot be resolved statically.
                 _ = getBucketKey(selector.rightmost()) orelse continue;
             }
 

@@ -1,0 +1,5 @@
+# Tests in the SUITE=render native_layout slice that are red on purpose.
+#
+# The gate (mioa-desktop/tests/render_expected.py) fails on any red that is not
+# listed here, and also when a listed test starts passing, so this file cannot
+# rot silently.
