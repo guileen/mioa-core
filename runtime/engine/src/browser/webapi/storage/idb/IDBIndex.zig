@@ -31,6 +31,7 @@ const IDBRequest = @import("IDBRequest.zig");
 const IDBKeyRange = @import("IDBKeyRange.zig");
 const IDBTransaction = @import("IDBTransaction.zig");
 const IDBObjectStore = @import("IDBObjectStore.zig");
+const IndexReadAsync = @import("IndexReadAsync.zig");
 
 const log = lp.log;
 const Execution = js.Execution;
@@ -98,13 +99,17 @@ pub fn get(self: *IDBIndex, query: js.Value, exec: *Execution) !*IDBRequest {
 
 pub fn runGet(self: *IDBIndex, request: *IDBRequest, bounds: Engine.Bounds, exec: *Execution) !void {
     const arena = exec.call_arena;
-    const bytes = self._engine.indexGetRange(arena, self._store._store_id, self._index_id, bounds) catch |err| {
+    const bytes = self._engine.indexGetRange(self._store._txn.gateWaiter(), arena, self._store._store_id, self._index_id, bounds) catch |err| {
         log.warn(.storage, "idb index get", .{ .err = err, .sqlite = self._engine.lastError() });
         request.setError(err);
         return;
     };
     const b = bytes orelse return;
     try request.setValue(try js.Value.deserialize(exec.js.local.?, b));
+}
+
+pub fn runGetAsync(self: *IDBIndex, request: *IDBRequest, bounds: Engine.Bounds, exec: *Execution, ctx: *anyopaque, done: IDBRequest.AsyncDone) !IDBRequest.AsyncStatus {
+    return IndexReadAsync.start(self, request, .get, bounds, .value, false, false, null, exec, ctx, done);
 }
 
 pub fn getKey(self: *IDBIndex, query: js.Value, exec: *Execution) !*IDBRequest {
@@ -116,13 +121,17 @@ pub fn getKey(self: *IDBIndex, query: js.Value, exec: *Execution) !*IDBRequest {
 
 pub fn runGetKey(self: *IDBIndex, request: *IDBRequest, bounds: Engine.Bounds, exec: *Execution) !void {
     const arena = exec.call_arena;
-    const bytes = self._engine.indexGetKeyRange(arena, self._index_id, bounds) catch |err| {
+    const bytes = self._engine.indexGetKeyRange(self._store._txn.gateWaiter(), arena, self._index_id, bounds) catch |err| {
         log.warn(.storage, "idb index getKey", .{ .err = err, .sqlite = self._engine.lastError() });
         request.setError(err);
         return;
     };
     const b = bytes orelse return;
     try request.setValue(try Key.decodeToJs(arena, exec.js.local.?, b));
+}
+
+pub fn runGetKeyAsync(self: *IDBIndex, request: *IDBRequest, bounds: Engine.Bounds, exec: *Execution, ctx: *anyopaque, done: IDBRequest.AsyncDone) !IDBRequest.AsyncStatus {
+    return IndexReadAsync.start(self, request, .get_key, bounds, .key, false, false, null, exec, ctx, done);
 }
 
 pub fn getAll(self: *IDBIndex, query_or_options: ?js.Value, count_: ?f64, exec: *Execution) !*IDBRequest {
@@ -156,6 +165,12 @@ pub fn runGetAll(self: *IDBIndex, request: *IDBRequest, args: IDBKeyRange.GetAll
     try request.setValue(arr);
 }
 
+pub fn runGetAllAsync(self: *IDBIndex, request: *IDBRequest, args: IDBKeyRange.GetAllArgs, mode: IDBObjectStore.GetAllMode, exec: *Execution, ctx: *anyopaque, done: IDBRequest.AsyncDone) !IDBRequest.AsyncStatus {
+    const reverse = args.direction == .prev or args.direction == .prevunique;
+    const unique = args.direction == .nextunique or args.direction == .prevunique;
+    return IndexReadAsync.start(self, request, .all, args.bounds, mode, reverse, unique, args.count, exec, ctx, done);
+}
+
 // Build a JS array of an index result: for .value the joined record value; for .key
 // the primary key; for .record the (index key, primary key, value) triple.
 fn collectAll(self: *IDBIndex, args: IDBKeyRange.GetAllArgs, mode: IDBObjectStore.GetAllMode, exec: *Execution) !js.Value {
@@ -163,7 +178,7 @@ fn collectAll(self: *IDBIndex, args: IDBKeyRange.GetAllArgs, mode: IDBObjectStor
     const reverse = args.direction == .prev or args.direction == .prevunique;
     const unique = args.direction == .nextunique or args.direction == .prevunique;
 
-    var rows = try self._engine.indexGetAllRows(self._store._store_id, self._index_id, args.bounds, reverse, unique, args.count);
+    var rows = try self._engine.indexGetAllRows(self._store._txn.gateWaiter(), self._store._store_id, self._index_id, args.bounds, reverse, unique, args.count);
     defer rows.deinit();
 
     const arr = local.newArray(0);
@@ -192,12 +207,16 @@ pub fn count(self: *IDBIndex, query: ?js.Value, exec: *Execution) !*IDBRequest {
 }
 
 pub fn runCount(self: *IDBIndex, request: *IDBRequest, bounds: Engine.Bounds, exec: *Execution) !void {
-    const n = self._engine.indexCountRange(self._index_id, bounds) catch |err| {
+    const n = self._engine.indexCountRange(self._store._txn.gateWaiter(), self._index_id, bounds) catch |err| {
         log.warn(.storage, "idb index count", .{ .err = err, .sqlite = self._engine.lastError() });
         request.setError(err);
         return;
     };
     try request.setValue(try exec.js.local.?.zigValueToJs(n, .{}));
+}
+
+pub fn runCountAsync(self: *IDBIndex, request: *IDBRequest, bounds: Engine.Bounds, exec: *Execution, ctx: *anyopaque, done: IDBRequest.AsyncDone) !IDBRequest.AsyncStatus {
+    return IndexReadAsync.start(self, request, .count, bounds, .value, false, false, null, exec, ctx, done);
 }
 
 fn openCursor(self: *IDBIndex, query: ?js.Value, direction: ?IDBCursor.Direction, exec: *Execution) !*IDBRequest {
@@ -226,14 +245,23 @@ pub fn setName(self: *IDBIndex, name: []const u8, _: *Execution) !void {
     if (std.mem.eql(u8, name, self._name)) {
         return;
     }
-    self._engine.renameIndex(self._index_id, name) catch |err| switch (err) {
-        error.Constraint => return error.ConstraintError,
-        else => return err,
-    };
+    const owned_name = try t.dupe(name);
+    if (self._engine.profile_async != null) {
+        const snapshot = t.schemaSnapshot();
+        if (snapshot.indexByName(self._store._store_id, name) != null) return error.ConstraintError;
+        const request = try t.reserveSchemaRequest();
+        try snapshot.renameIndex(t.schemaAllocator(), self._index_id, owned_name);
+        try request.submitSchema(.{ .rename_index = .{ .id = self._index_id, .name = owned_name } });
+    } else {
+        self._engine.renameIndex(t.gateWaiter(), self._index_id, name) catch |err| switch (err) {
+            error.Constraint => return error.ConstraintError,
+            else => return err,
+        };
+    }
     if (self._original_name == null) {
         self._original_name = self._name;
     }
-    self._name = try t.dupe(name);
+    self._name = owned_name;
 }
 
 fn getKeyPath(self: *IDBIndex, exec: *Execution) !js.Value {

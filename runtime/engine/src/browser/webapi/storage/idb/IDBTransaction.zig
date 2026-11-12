@@ -28,6 +28,8 @@ const DOMException = @import("../../DOMException.zig");
 
 const idb = @import("idb.zig");
 const Engine = @import("Engine.zig");
+const RuntimeMemory = @import("../RuntimeMemory.zig");
+const SchemaSnapshot = @import("SchemaSnapshot.zig").Snapshot;
 const IDBDatabase = @import("IDBDatabase.zig");
 const IDBRequest = @import("IDBRequest.zig");
 const IDBObjectStore = @import("IDBObjectStore.zig");
@@ -49,6 +51,10 @@ _mode: Mode,
 // deduped. Empty for a versionchange transaction, whose scope is "all stores"
 // and is resolved live in getObjectStoreNames.
 _scope: []const []const u8 = &.{},
+_schema: ?SchemaSnapshot = null,
+_schema_arena: ?std.heap.ArenaAllocator = null,
+_published_schema: ?SchemaSnapshot = null,
+_published_arena: ?std.heap.ArenaAllocator = null,
 // Advisory only: we always commit through sqlite. Stored to expose the property.
 _durability: Durability = .default,
 
@@ -79,6 +85,19 @@ _stores: std.ArrayList(*IDBObjectStore) = .empty,
 _queue: *std.ArrayList(*IDBRequest),
 _queue_a: std.ArrayList(*IDBRequest) = .empty,
 _queue_b: std.ArrayList(*IDBRequest) = .empty,
+// The current batch remains intact across owner RPCs. The other queue accepts
+// requests from event handlers until this batch has finished.
+_batch: ?*std.ArrayList(*IDBRequest) = null,
+_batch_index: usize = 0,
+_request_pending: bool = false,
+_request_ready: bool = false,
+_request_reset: u32 = 0,
+_command: enum { none, begin, commit, rollback } = .none,
+_command_pending: bool = false,
+_command_ready: bool = false,
+_command_error: ?anyerror = null,
+_command_id: ?u64 = null,
+_command_reset: u32 = 0,
 
 _begun: bool = false,
 _settled: bool = false,
@@ -86,13 +105,20 @@ _aborted: bool = false,
 _committing: bool = false,
 _error: ?anyerror = null,
 _gate_waiter: Engine.GateWaiter,
+// Versionchange work uses the enclosing open request's admission.
+_owner_waiter: ?*Engine.GateWaiter = null,
 // versionchange only: the version to fall back to if the upgrade aborts.
+// The open request owns the upgrade task and its gate admission.
+_upgrade_wake_ctx: ?*anyopaque = null,
+_upgrade_wake: ?*const fn (*anyopaque) void = null,
 _old_version: ?i64 = null,
 _abort_requests: std.ArrayList(*IDBRequest) = .empty,
 // Every request created under the transaction. They live in our arena, so
 // their listeners have to be dropped when it's released.
 _requests: std.ArrayList(*IDBRequest) = .empty,
 _abort_pending: bool = false,
+_abort_cleanup: bool = false,
+_detached: bool = false,
 // A transaction is only active for one execution of a Scheduler's task. We
 // capture the scheduler's generation here and reject any request made in a
 // later generation (see assertActive).
@@ -108,6 +134,7 @@ _cloning: bool = false,
 // that, when Engine.detach cancels us, we know whether the registration held
 // a pin (parked) or the drain task does (owner).
 _parked: bool = false,
+_parked_reset: u32 = 0,
 
 pub const Mode = enum {
     readonly,
@@ -176,6 +203,11 @@ pub fn initVersionChange(db: *IDBDatabase, exec: *Execution) !*IDBTransaction {
         ._queue = undefined,
         ._gate_waiter = undefined,
     });
+    if (db._engine.profile_async != null) {
+        self._schema_arena = std.heap.ArenaAllocator.init(try RuntimeMemory.allocator(db._engine.remote.?.allocator));
+        errdefer if (self._schema_arena) |*schema_arena| schema_arena.deinit();
+        self._schema = try db._snapshot.clone(self.schemaAllocator());
+    }
     self._queue = &self._queue_a;
     // A versionchange transaction never contends for the gate (the open path
     // holds it); keep the node well-formed so releaseGate's owner check no-ops.
@@ -198,6 +230,8 @@ pub fn deinit(self: *IDBTransaction, page: *Page) void {
     for (self._requests.items) |request| {
         page.removeTarget(request.asEventTarget());
     }
+    if (self._schema_arena) |*schema_arena| schema_arena.deinit();
+    if (self._published_arena) |*published_arena| published_arena.deinit();
     page.removeTarget(self.asEventTarget());
     self._arena.release();
 }
@@ -208,6 +242,12 @@ pub fn acquireRef(self: *IDBTransaction) void {
 
 pub fn releaseRef(self: *IDBTransaction, page: *Page) void {
     self._rc.release(self, page);
+}
+pub fn gateWaiter(self: *IDBTransaction) *Engine.GateWaiter {
+    return self._owner_waiter orelse &self._gate_waiter;
+}
+pub fn metadataWaiter(self: *IDBTransaction) ?*Engine.GateWaiter {
+    return if (self._begun and !self._settled) self.gateWaiter() else null;
 }
 
 // Persist a JS value with the transaction's lifetime: the handle is reset when the
@@ -265,18 +305,11 @@ pub fn aborted(self: *const IDBTransaction) bool {
     return self._aborted;
 }
 
-pub fn commit(self: *IDBTransaction, exec: *Execution) !void {
-    if (self._settled) {
-        return error.InvalidStateError;
-    }
-
-    if (self._mode == .versionchange) {
-        self.settle(exec);
-    } else {
-        // The drain is already scheduled and will settle us; just enter the
-        // "committing" state. It isn't _settled yet, so we can't use that flag
-        self._committing = true;
-    }
+pub fn commit(self: *IDBTransaction, _: *Execution) !void {
+    if (self._settled or self._committing) return error.InvalidStateError;
+    // The existing drain (or the open request for versionchange) performs the
+    // actual commit after all queued requests have finished.
+    self._committing = true;
 }
 
 // JS-facing, no reason
@@ -318,17 +351,13 @@ pub fn abortWith(self: *IDBTransaction, exec: *Execution, reason: ?anyerror) err
         }
     }
 
-    if (self._begun) {
-        self._engine.rollback();
-        self._begun = false;
-    }
-    // No-op if we're parked rather than owner; the park pin is then released
-    // by the eventual wake (drain's settled path) or a detach cancel.
-    _ = self._engine.releaseGate(&self._gate_waiter);
+    // In-flight operations may have side effects; retain the ticket until
+    // their response and the rollback acknowledgement.
+    self._abort_cleanup = true;
 
     for ([_]*std.ArrayList(*IDBRequest){ &self._queue_a, &self._queue_b }) |queue| {
         for (queue.items, 0..) |request, i| {
-            if (i != request._txn_index or request.delivered() or request._abort_reason != null) {
+            if (i != request._txn_index or request.delivered() or request._abort_reason != null or request.isSchema()) {
                 continue;
             }
             // Fail an undelivered request whose event hasn't fired yet (and
@@ -339,11 +368,38 @@ pub fn abortWith(self: *IDBTransaction, exec: *Execution, reason: ?anyerror) err
             };
         }
     }
+    self.cancelPendingRequest();
+    _ = self.finishAbort(exec);
+}
+
+fn finishAbort(self: *IDBTransaction, exec: *Execution) bool {
+    if (!self._abort_cleanup) return true;
+    if (self._request_pending or self._command_pending) return false;
+    if (self._command_ready and self._command == .begin) {
+        const begun = self.runCommand(.begin) catch |err| blk: {
+            if (err == error.ProfileSideEffectUnknown) self._engine.failRemote(err);
+            break :blk false;
+        };
+        self._begun = begun;
+    }
+    if (self._begun) {
+        const complete = self.runCommand(.rollback) catch |err| blk: {
+            log.warn(.storage, "idb rollback", .{ .err = err });
+            if (self._engine.remote != null) self._engine.failRemote(err);
+            break :blk true;
+        };
+        if (!complete) return false;
+        self._begun = false;
+    }
+    self._engine.cancelGate(&self._gate_waiter);
+    self._abort_cleanup = false;
     self.scheduleAbortDelivery(exec);
+    if (self._parked) self.unpark();
+    return true;
 }
 
 pub fn abortDeliveryPending(self: *const IDBTransaction) bool {
-    return self._abort_pending;
+    return self._abort_cleanup or self._abort_pending;
 }
 
 // Pin the transaction for the abort-delivery task (like scheduleDrain).
@@ -427,54 +483,132 @@ pub fn queueAbort(self: *IDBTransaction, reason: anyerror) !void {
     try self.enqueue(marker);
 }
 
-pub fn settle(self: *IDBTransaction, exec: *Execution) void {
-    // Deliver batches until the queue stays empty — a handler may enqueue more.
-    while (self.settleStep(exec)) {}
-}
+pub const SettleStep = enum { pending, again, done };
 
-// One settle turn: deliver the pending batch of request events (handlers may
-// enqueue more) and, once the queue stays empty, commit and fire `complete`.
-// Returns true while more batches remain.
-pub fn settleStep(self: *IDBTransaction, exec: *Execution) bool {
-    if (comptime lp.IS_DEBUG) {
-        // non versionchange mode goes through the scheduler + drain
-        std.debug.assert(self._mode == .versionchange);
-    }
-
-    if (self._settled) {
-        return false;
-    }
-
-    if (self._queue.items.len > 0) {
+// A versionchange transaction is driven by its enclosing open request.
+pub fn settleStep(self: *IDBTransaction, exec: *Execution) SettleStep {
+    if (comptime lp.IS_DEBUG) std.debug.assert(self._mode == .versionchange);
+    if (self._settled) return if (self.finishAbort(exec)) .done else .pending;
+    if (self._batch != null or self._queue.items.len > 0) {
         self.deliverBatch(exec);
-        if (self._settled) {
-            // a request handler settled this (e.g. called abort) mid-batch
-            return false;
-        }
-        if (self._queue.items.len > 0) {
-            return true;
-        }
+        if (self._settled) return if (self.finishAbort(exec)) .done else .pending;
+        if (self._request_pending) return .pending;
+        if (self._batch != null or self._queue.items.len > 0) return .again;
     }
-    self.commitAndComplete(exec);
-    return false;
+    return if (self.commitAndComplete(exec)) .done else .pending;
 }
 
 // Commit the underlying sqlite transaction (if begun), release the connection
 // gate, then fire `complete` — or `abort` if the commit fails.
-fn commitAndComplete(self: *IDBTransaction, exec: *Execution) void {
+fn commitAndComplete(self: *IDBTransaction, exec: *Execution) bool {
+    if (self._schema) |*schema| {
+        if (self._published_schema == null) {
+            const allocator = RuntimeMemory.allocator(self._engine.remote.?.allocator) catch |err| {
+                self._committing = false;
+                self.abortWith(exec, err) catch {};
+                return !self._abort_cleanup;
+            };
+            self._published_arena = std.heap.ArenaAllocator.init(allocator);
+            self._published_schema = schema.clone(self._published_arena.?.allocator()) catch |err| {
+                self._committing = false;
+                self.abortWith(exec, err) catch {};
+                return !self._abort_cleanup;
+            };
+        }
+    }
+    self._committing = true;
     if (self._begun) {
-        self._engine.commit() catch |err| {
+        const complete = self.runCommand(.commit) catch |err| {
             log.warn(.storage, "idb commit", .{ .err = err, .sqlite = self._engine.lastError() });
-            // Reuse the real abort path: restore upgrade metadata, expose the
-            // failure on transaction.error and make IDBFactory.open fail too.
+            if (err == error.ProfileSideEffectUnknown) {
+                // The owner may already have committed. Revoke the principal
+                // rather than treating a subsequent rollback as proof it did not.
+                self._begun = false;
+                self._engine.failRemote(err);
+            }
             self._committing = false;
-            self.abortWith(exec, err) catch unreachable;
-            return;
+            self.abortWith(exec, err) catch {};
+            return !self._abort_cleanup;
         };
+        if (!complete) return false;
         self._begun = false;
+    }
+    if (self._published_schema) |schema| {
+        self._db.replaceSnapshot(self._published_arena.?, schema);
+        self._published_arena = null;
+        self._published_schema = null;
     }
     _ = self._engine.releaseGate(&self._gate_waiter);
     self.fire(exec, comptime .wrap("complete"));
+    return true;
+}
+
+const Command = @FieldType(IDBTransaction, "_command");
+
+// An accepted owner command has exactly one later callback. Its independent
+// pin covers scheduler teardown as well as normal suspend/resume.
+fn runCommand(self: *IDBTransaction, command: Command) !bool {
+    if (self._command_ready) {
+        std.debug.assert(self._command == command);
+        self._command_ready = false;
+        self._command = .none;
+        if (self._command_error) |err| {
+            self._command_error = null;
+            return err;
+        }
+        return true;
+    }
+    if (self._command_pending) return false;
+    self.acquireRef();
+    const state = switch (command) {
+        .begin => self._engine.beginAsync(self.gateWaiter(), self, commandCompleted, &self._command_id),
+        .commit => self._engine.commitAsync(self.gateWaiter(), self, commandCompleted, &self._command_id),
+        .rollback => self._engine.rollbackAsync(self.gateWaiter(), self, commandCompleted, &self._command_id),
+        .none => unreachable,
+    } catch |err| {
+        self.releaseRef(self._exec.page);
+        return err;
+    };
+    if (state == .completed) {
+        self.releaseRef(self._exec.page);
+        return true;
+    }
+    self._command = command;
+    self._command_pending = true;
+    self._command_reset = self._exec.js.scheduler.resets;
+    self._exec.js.scheduler.blocking += 1;
+    return false;
+}
+
+fn commandCompleted(ctx: *anyopaque, result: ?anyerror) void {
+    const self: *IDBTransaction = @ptrCast(@alignCast(ctx));
+    const exec = self._exec;
+    if (self._command_reset == exec.js.scheduler.resets) exec.js.scheduler.blocking -= 1;
+    self._command_pending = false;
+    self._command_id = null;
+    self._command_ready = true;
+    self._command_error = result;
+    defer self.releaseRef(exec.page);
+    self.wakeAfterRpc();
+}
+
+fn wakeAfterRpc(self: *IDBTransaction) void {
+    if (self._detached) return;
+    if (self._mode == .versionchange) {
+        if (self._upgrade_wake) |wake| wake(self._upgrade_wake_ctx.?);
+    } else {
+        self.scheduleDrain() catch |err| {
+            self._committing = false;
+            self.abortWith(self._exec, err) catch {};
+        };
+    }
+}
+
+pub fn schemaSnapshot(self: *IDBTransaction) *SchemaSnapshot {
+    if (!self._settled) {
+        if (self._schema) |*schema| return schema;
+    }
+    return &self._db._snapshot;
 }
 
 // "is this transaction still usable". Once settled or explicitly committing, it
@@ -499,7 +633,7 @@ pub fn ensureBegun(self: *IDBTransaction) !void {
     if (self._begun) {
         return;
     }
-    try self._engine.begin();
+    try self._engine.begin(self.gateWaiter());
     self._begun = true;
 }
 
@@ -508,6 +642,18 @@ pub fn newRequest(self: *IDBTransaction) !*IDBRequest {
     request._txn = .{ .owned = self };
     try self._requests.append(self._arena.allocator(), request);
     return request;
+}
+
+pub fn schemaAllocator(self: *IDBTransaction) std.mem.Allocator {
+    if (self._schema_arena) |*schema_arena| return schema_arena.allocator();
+    return self._arena.allocator();
+}
+
+// Reserve the marker before mutating the synchronous schema view so an OOM
+// cannot leave a visible mutation without its corresponding owner operation.
+pub fn reserveSchemaRequest(self: *IDBTransaction) !*IDBRequest {
+    try self._queue.ensureUnusedCapacity(self._arena.allocator(), 1);
+    return self.newRequest();
 }
 
 pub fn enqueue(self: *IDBTransaction, request: *IDBRequest) !void {
@@ -519,6 +665,16 @@ fn objectStore(self: *IDBTransaction, name: []const u8) !*IDBObjectStore {
     if (self._settled) {
         return error.InvalidStateError;
     }
+    if (self._mode != .versionchange) {
+        var in_scope = false;
+        for (self._scope) |scoped| {
+            if (std.mem.eql(u8, scoped, name)) {
+                in_scope = true;
+                break;
+            }
+        }
+        if (!in_scope) return error.NotFound;
+    }
     for (self._stores.items) |store| {
         if (std.mem.eql(u8, store._name, name)) {
             return store;
@@ -526,9 +682,10 @@ fn objectStore(self: *IDBTransaction, name: []const u8) !*IDBObjectStore {
     }
 
     const database_id = self._db._database_id;
-    const info = (try self._engine.objectStoreInfo(self._arena.allocator(), database_id, name)) orelse {
-        return error.NotFound;
-    };
+    const info = if (self._engine.profile_async != null)
+        if (self.schemaSnapshot().findStore(name)) |store| store.info else return error.NotFound
+    else
+        (try self._engine.objectStoreInfo(self.metadataWaiter(), self._arena.allocator(), database_id, name)) orelse return error.NotFound;
 
     const owned_name = try self.dupe(name);
     const store = try IDBObjectStore.init(self, info.id, owned_name, info.key_path, info.auto_increment);
@@ -573,15 +730,14 @@ pub fn getObjectStoreNames(self: *IDBTransaction, exec: *Execution) !*DOMStringL
     // upgrade creates/deletes stores, so resolve it live rather than caching.
     // The list is refcounted and can outlive the transaction, so the scope
     // names are copied onto the list's own arena.
-    const names = if (self._mode == .versionchange)
-        try self._engine.objectStoreNames(arena.allocator(), self._db._database_id)
-    else blk: {
-        const copy = try arena.alloc([]const u8, self._scope.len);
-        for (self._scope, 0..) |name, i| {
-            copy[i] = try arena.dupe(u8, name);
-        }
-        break :blk copy;
-    };
+    const source = if (self._mode != .versionchange)
+        self._scope
+    else if (self._engine.profile_async != null)
+        try self.schemaSnapshot().storeNames(arena.allocator())
+    else
+        try self._engine.objectStoreNames(self.metadataWaiter(), arena.allocator(), self._db._database_id);
+    const names = try arena.alloc([]const u8, source.len);
+    for (source, 0..) |name, i| names[i] = try arena.dupe(u8, name);
 
     const list = try arena.create(DOMStringList);
     list.* = .{ ._items = names, ._arena = arena };
@@ -615,8 +771,17 @@ fn scheduleDrain(self: *IDBTransaction) !void {
     errdefer self.releaseRef(self._exec.page);
     try self._exec.js.scheduler.add(self, drain, 0, .{
         .name = "IDBTransaction.drain",
+        .repeat_blocks_done = true,
+        .repeat_failure = drainRepeatFailed,
         .finalizer = finalize,
     });
+}
+
+fn drainRepeatFailed(ctx: *anyopaque, err: anyerror) void {
+    const self: *IDBTransaction = @ptrCast(@alignCast(ctx));
+    self._committing = false;
+    self.abortWith(self._exec, err) catch {};
+    self.releaseRef(self._exec.page);
 }
 
 fn drain(ctx: *anyopaque) !?u32 {
@@ -632,37 +797,46 @@ fn drain(ctx: *anyopaque) !?u32 {
 
 fn drainInner(self: *IDBTransaction) ?u32 {
     if (self._settled) {
-        // Already settled (e.g. via an abort, which released the gate; the
-        // release here is a defensive no-op in that case).
-        _ = self._engine.releaseGate(&self._gate_waiter);
+        if (self._aborted) _ = self.finishAbort(self._exec);
         return null;
     }
 
     const exec = self._exec;
 
-    if (self._queue.items.len > 0) {
-        if (self._engine.acquireGate(&self._gate_waiter) == false) {
-            // Parked: no drain task exists while we wait for the gate, and our
-            // wrappers may all be collected, so the registration itself must
-            // pin us until resumeDrain (or a detach cancel) unparks.
-            self._parked = true;
-            self.acquireRef();
-            return null;
-        }
+    // Empty transactions must also wait behind earlier admissions.
+    const acquired = self._engine.acquireGate(&self._gate_waiter) catch |err| {
+        self._engine.cancelGate(&self._gate_waiter);
+        self._committing = false;
+        self.abortWith(exec, err) catch {};
+        return null;
+    };
+    if (!acquired) {
+        self._parked = true;
+        self._parked_reset = exec.js.scheduler.resets;
+        exec.js.scheduler.blocking += 1;
+        self.acquireRef();
+        return null;
+    }
 
-        self.deliverBatch(exec);
-        if (self._settled) {
-            // a handler aborted us mid-delivery; abort() released the gate.
+    if ((self._batch != null or self._queue.items.len > 0) and !self._begun) {
+        const complete = self.runCommand(.begin) catch |err| {
+            if (err == error.ProfileSideEffectUnknown) self._engine.failRemote(err);
+            self._committing = false;
+            self.abortWith(exec, err) catch {};
             return null;
-        }
-        if (self._queue.items.len > 0) {
-            // handlers enqueued more — keep the gate and resume next turn.
-            return 1;
-        }
+        };
+        if (!complete) return null;
+        self._begun = true;
+    }
+
+    if (self._batch != null or self._queue.items.len > 0) {
+        self.deliverBatch(exec);
+        if (self._settled or self._request_pending) return null;
+        if (self._batch != null or self._queue.items.len > 0) return 1;
     }
 
     // Nothing left to deliver: commit and fire `complete` (releases the gate).
-    self.commitAndComplete(exec);
+    _ = self.commitAndComplete(exec);
     return null;
 }
 
@@ -670,6 +844,7 @@ fn unpark(self: *IDBTransaction) void {
     if (comptime lp.IS_DEBUG) {
         std.debug.assert(self._parked);
     }
+    if (self._parked_reset == self._exec.js.scheduler.resets) self._exec.js.scheduler.blocking -= 1;
     self._parked = false;
     self.releaseRef(self._exec.page);
 }
@@ -681,12 +856,15 @@ fn resumeDrain(waiter: *Engine.GateWaiter) void {
         std.debug.assert(self._mode != .versionchange);
     }
 
-    defer self.unpark();
+    // Keep the registration pin until the callback returns, but mark it no
+    // longer parked before abortWith can attempt to remove that pin.
+    if (self._parked_reset == self._exec.js.scheduler.resets) self._exec.js.scheduler.blocking -= 1;
+    self._parked = false;
+    defer self.releaseRef(self._exec.page);
     self.scheduleDrain() catch |err| {
-        // We were handed the gate; if we can't reschedule, hand it off so the
-        // waiters behind us aren't stranded. Unpark may free self — last touch.
         log.debug(.storage, "idb resume drain", .{ .err = err });
-        _ = self._engine.releaseGate(&self._gate_waiter);
+        self._committing = false;
+        self.abortWith(self._exec, err) catch {};
     };
 }
 
@@ -696,26 +874,27 @@ fn resumeDrain(waiter: *Engine.GateWaiter) void {
 // Never parked here — a parked transaction has no task to finalize.
 fn finalize(ctx: *anyopaque) void {
     const self: *IDBTransaction = @ptrCast(@alignCast(ctx));
-    if (self._begun and !self._settled) {
-        self._engine.rollback();
-        self._begun = false;
-    }
+    self.detachAsync();
+    // Remote gate cancellation rolls back owner work asynchronously; never
+    // issue a blocking rollback while tearing down a scheduler.
+    if (self._begun and !self._settled and self._engine.remote == null)
+        self._engine.rollback(self.gateWaiter());
+    self._begun = false;
     self._settled = true;
-    _ = self._engine.releaseGate(&self._gate_waiter);
+    self._engine.cancelGate(&self._gate_waiter);
     // The task pin; may free the transaction — must be the last touch.
     self.releaseRef(self._exec.page);
 }
 
-// Engine.detach cancel: our context is going away; the unlink/hand-off is
-// detach's job. The one site that runs in either gate state: parked, the
-// registration held our pin; as owner, a drain task exists and its finalizer
-// releases that pin instead.
+// Engine.detach can call this while the only other reference belongs to an
+// in-flight RPC. Cancellation may synchronously drop that reference.
 fn cancelGate(waiter: *Engine.GateWaiter) void {
     const self: *IDBTransaction = @fieldParentPtr("_gate_waiter", waiter);
-    if (self._begun) {
-        self._engine.rollback();
-        self._begun = false;
-    }
+    self.acquireRef();
+    defer self.releaseRef(self._exec.page);
+    self.detachAsync();
+    // Engine.detach rolls back before handing admission on.
+    self._begun = false;
     self._settled = true;
     if (self._parked == true) {
         self.unpark();
@@ -726,10 +905,13 @@ fn cancelGate(waiter: *Engine.GateWaiter) void {
 // by handlers during delivery go to the other queue and are handled on a later
 // turn.
 fn deliverBatch(self: *IDBTransaction, exec: *Execution) void {
-    const batch = self._queue;
-    // New requests now accumulate in the other queue.
-    self._queue = if (batch == &self._queue_a) &self._queue_b else &self._queue_a;
-    defer batch.clearRetainingCapacity();
+    if (self._batch == null) {
+        const batch = self._queue;
+        self._queue = if (batch == &self._queue_a) &self._queue_b else &self._queue_a;
+        self._batch = batch;
+        self._batch_index = 0;
+    }
+    const batch = self._batch.?;
 
     // exec.js.local must be non-null. In some cases it is (e.g. tx.commit()
     // called directly from JS), in others is isn't (drain schedule tasks).
@@ -748,25 +930,89 @@ fn deliverBatch(self: *IDBTransaction, exec: *Execution) void {
     // within a task, so stamp it once.
     self._active_turn = exec.js.scheduler.generation;
 
-    for (batch.items) |request| {
-        // A handler may have aborted the transaction mid-delivery; abort()
-        // collected the remaining requests for its own delivery, so stop here.
-        if (self._settled) {
-            return;
-        }
+    while (self._batch_index < batch.items.len) {
+        const request = batch.items[self._batch_index];
+        if (self._settled) return;
         if (request._abort_reason) |reason| {
-            // see queueAbort
             self.abortWith(exec, reason) catch {};
             return;
         }
-        request.execute(exec) catch |err| {
-            log.debug(.storage, "idb request execute", .{ .err = err });
-            request.setError(err);
-        };
+        if (self._request_pending) return;
+        if (self._request_ready) {
+            self._request_ready = false;
+        } else {
+            // A pending owner operation pins the arena independently of the
+            // drain task. Its callback only schedules work; it never runs JS.
+            self.acquireRef();
+            const state = request.executeAsync(exec, self, requestCompleted) catch |err| blk: {
+                request.setError(err);
+                break :blk .completed;
+            };
+            if (state == .pending) {
+                self._request_pending = true;
+                self._request_reset = exec.js.scheduler.resets;
+                exec.js.scheduler.blocking += 1;
+                return;
+            }
+            self.releaseRef(exec.page);
+        }
+        if (request.isSchema()) {
+            if (request._error) |err| {
+                self._committing = false;
+                self.abortWith(exec, err) catch {};
+                return;
+            }
+            self._batch_index += 1;
+            continue;
+        }
+        // Advance before dispatch: a handler may abort or re-arm this request.
+        self._batch_index += 1;
         request.deliver(exec) catch |err| {
             log.debug(.storage, "idb request deliver", .{ .err = err });
         };
     }
+    batch.clearRetainingCapacity();
+    self._batch = null;
+    self._batch_index = 0;
+}
+
+fn cancelPendingRequest(self: *IDBTransaction) void {
+    if (!self._request_pending) return;
+    const batch = self._batch orelse return;
+    batch.items[self._batch_index].cancelAsync();
+}
+
+// Called before the execution/page is destroyed. Cancellation completes the
+// callbacks synchronously; dispatched commands remain tombstoned in the client.
+pub fn detachAsync(self: *IDBTransaction) void {
+    self._detached = true;
+    self._upgrade_wake = null;
+    self._upgrade_wake_ctx = null;
+    // The enclosing gate cancellation owns remote rollback after this point.
+    // No continuation may keep waiting for an acknowledgement after the
+    // scheduler/page that would consume it has been detached.
+    self._abort_cleanup = false;
+    self.cancelPendingRequest();
+    if (self._command_id) |id| {
+        self._command_id = null;
+        if (self._engine.profile_async) |client| client.cancel(id);
+    }
+}
+
+fn requestCompleted(ctx: *anyopaque, result: ?anyerror) void {
+    const self: *IDBTransaction = @ptrCast(@alignCast(ctx));
+    const exec = self._exec;
+    if (self._request_reset == exec.js.scheduler.resets) exec.js.scheduler.blocking -= 1;
+    self._request_pending = false;
+    defer self.releaseRef(exec.page);
+    if (self._settled) {
+        if (self._abort_cleanup) self.wakeAfterRpc();
+        return;
+    }
+    const batch = self._batch orelse return;
+    if (result) |err| batch.items[self._batch_index].setError(err);
+    self._request_ready = true;
+    self.wakeAfterRpc();
 }
 
 pub const JsApi = struct {

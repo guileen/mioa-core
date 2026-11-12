@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<script id=empty_actions_ignore_base type=module>
+{
+  const state = await testing.async();
+  const results = [];
+  for (const method of ['get', 'post']) {
+    for (const override of [false, true]) {
+      const frame = document.createElement('iframe');
+      await new Promise(resolve => {
+        frame.onload = resolve;
+        frame.src = location.origin + '/echo_method?before=1';
+        document.body.appendChild(frame);
+      });
+      const doc = frame.contentDocument;
+      const base = doc.createElement('base');
+      base.href = location.origin + '/must-not-submit-here/';
+      doc.head.appendChild(base);
+      const form = doc.createElement('form');
+      form.method = method;
+      form.setAttribute('action', override ? '/also-wrong' : '');
+      form.innerHTML = '<input name=q value=kept><button type=submit formaction="">send</button>';
+      doc.body.appendChild(form);
+      await new Promise(resolve => {
+        frame.onload = resolve;
+        if (override) form.requestSubmit(form.querySelector('button'));
+        else form.submit();
+      });
+      results.push({method, path:frame.contentWindow.location.pathname,
+        query:frame.contentWindow.location.search, body:frame.contentDocument.body.textContent.trim()});
+      frame.remove();
+    }
+  }
+  state.resolve();
+  await state.done(() => {
+    for (const result of results) {
+      testing.expectEqual('/echo_method', result.path);
+      testing.expectEqual(result.method === 'get' ? '?q=kept' : '?before=1', result.query);
+      testing.expectEqual('method=' + result.method.toUpperCase(), result.body);
+    }
+  });
+}
+</script>

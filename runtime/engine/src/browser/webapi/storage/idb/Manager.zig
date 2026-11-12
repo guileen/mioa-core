@@ -19,6 +19,8 @@
 const std = @import("std");
 
 const Engine = @import("Engine.zig");
+const ProfileIpc = @import("../ProfileIpc.zig");
+const ProfileAsync = @import("../ProfileAsync.zig");
 const repeat = @import("../../../../string.zig").repeat;
 
 const Allocator = std.mem.Allocator;
@@ -28,6 +30,8 @@ const Manager = @This();
 allocator: Allocator,
 engines: std.StringHashMapUnmanaged(*Engine) = .empty,
 path: ?[]const u8 = null,
+profile_client: ?*ProfileIpc.Client = null,
+profile_async: ?*ProfileAsync.Client = null,
 
 pub fn init(allocator: Allocator) Manager {
     return .{ .allocator = allocator };
@@ -53,6 +57,21 @@ pub fn detachContext(self: *Manager, ctx: *anyopaque) void {
     }
 }
 
+pub fn receiveGrant(self: *Manager, origin: []const u8, ticket: []const u8) void {
+    if (self.engines.get(origin)) |engine| engine.receiveGateEvent(ticket, false);
+}
+
+pub fn receiveCancellation(self: *Manager, origin: []const u8, ticket: []const u8) void {
+    if (self.engines.get(origin)) |engine| engine.receiveGateEvent(ticket, true);
+}
+
+pub fn failAll(self: *Manager, err: anyerror) void {
+    if (self.profile_client) |client| client.failed = true;
+    if (self.profile_async) |client| client.deinit();
+    var it = self.engines.valueIterator();
+    while (it.next()) |engine| engine.*.failAll(err);
+}
+
 // Gets or creates the engine for the given origin.
 pub fn engineForOrigin(self: *Manager, origin: []const u8) !*Engine {
     const gop = try self.engines.getOrPut(self.allocator, origin);
@@ -64,13 +83,17 @@ pub fn engineForOrigin(self: *Manager, origin: []const u8) !*Engine {
     const engine = try self.allocator.create(Engine);
     errdefer self.allocator.destroy(engine);
 
-    const path: [:0]const u8 = if (self.path) |dir| blk: {
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(origin, &digest, .{});
-        break :blk try self.allocator.printSentinel("{s}/idb-{s}.sqlite", .{ dir, std.fmt.bytesToHex(digest, .lower) }, 0);
-    } else ":memory:";
-    defer if (self.path != null) self.allocator.free(path);
-    engine.* = try Engine.open(path);
+    if (self.profile_client) |client| {
+        engine.* = try Engine.openRemote(self.allocator, client, self.profile_async orelse return error.QualificationRequired, origin);
+    } else {
+        const path: [:0]const u8 = if (self.path) |dir| blk: {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(origin, &digest, .{});
+            break :blk try self.allocator.printSentinel("{s}/idb-{s}.sqlite", .{ dir, std.fmt.bytesToHex(digest, .lower) }, 0);
+        } else ":memory:";
+        defer if (self.path != null) self.allocator.free(path);
+        engine.* = try Engine.open(path);
+    }
     errdefer engine.close();
 
     gop.key_ptr.* = try self.allocator.dupe(u8, origin);
@@ -98,8 +121,8 @@ test "IDB - Manager: in-memory engines are origin-isolated" {
     const a = try mgr.engineForOrigin("https://a.com");
     const b = try mgr.engineForOrigin("https://b.com");
 
-    _ = try a.upsertDatabase("db", 1);
-    try testing.expectEqual(null, try b.databaseVersion("db"));
+    _ = try a.upsertDatabase(null, "db", 1);
+    try testing.expectEqual(null, try b.databaseVersion(null, "db"));
 }
 
 test "IDB - Manager: on-disk engines hash to per-origin files, isolated" {
@@ -111,11 +134,11 @@ test "IDB - Manager: on-disk engines hash to per-origin files, isolated" {
     // not.
     const long_host = "https://" ++ (repeat("a", 250)) ++ ".com";
     const a = try mgr.engineForOrigin(long_host);
-    _ = try a.upsertDatabase("db", 7);
+    _ = try a.upsertDatabase(null, "db", 7);
 
     const b = try mgr.engineForOrigin("https://b.com");
-    try testing.expectEqual(null, try b.databaseVersion("db"));
-    try testing.expectEqual(7, (try a.databaseVersion("db")).?);
+    try testing.expectEqual(null, try b.databaseVersion(null, "db"));
+    try testing.expectEqual(7, (try a.databaseVersion(null, "db")).?);
 }
 
 test "IDB durable commit and rollback are visible across independent managers" {
@@ -128,18 +151,18 @@ test "IDB durable commit and rollback are visible across independent managers" {
     mgr.path = path;
     const a = try mgr.engineForOrigin("https://a.example");
     try testing.expectEqual(@as(i64, 2), (try a.conn.scalar(i64, "pragma synchronous", .{})).?);
-    try a.begin();
-    _ = try a.upsertDatabase("committed", 4);
-    try a.commit();
-    try a.begin();
-    _ = try a.upsertDatabase("aborted", 9);
-    a.rollback();
+    try a.begin(null);
+    _ = try a.upsertDatabase(null, "committed", 4);
+    try a.commit(null);
+    try a.begin(null);
+    _ = try a.upsertDatabase(null, "aborted", 9);
+    a.rollback(null);
     var restored = Manager.init(testing.allocator);
     defer restored.deinit();
     restored.path = path;
     const a_again = try restored.engineForOrigin("https://a.example");
     const b = try restored.engineForOrigin("https://b.example");
-    try testing.expectEqual(@as(i64, 4), (try a_again.databaseVersion("committed")).?);
-    try testing.expectEqual(null, try a_again.databaseVersion("aborted"));
-    try testing.expectEqual(null, try b.databaseVersion("committed"));
+    try testing.expectEqual(@as(i64, 4), (try a_again.databaseVersion(null, "committed")).?);
+    try testing.expectEqual(null, try a_again.databaseVersion(null, "aborted"));
+    try testing.expectEqual(null, try b.databaseVersion(null, "committed"));
 }

@@ -24,6 +24,7 @@ const EventTarget = @import("../../EventTarget.zig");
 
 const Key = @import("Key.zig");
 const Engine = @import("Engine.zig");
+const SchemaSnapshot = @import("SchemaSnapshot.zig");
 const IDBTransaction = @import("IDBTransaction.zig");
 const IDBObjectStore = @import("IDBObjectStore.zig");
 const DOMStringList = @import("../../collections.zig").DOMStringList;
@@ -41,22 +42,43 @@ _engine: *Engine,
 _database_id: i64,
 _name: []const u8,
 _version: i64,
+_snapshot: SchemaSnapshot.Snapshot = .{},
+_snapshot_arena: ?std.heap.ArenaAllocator = null,
+_snapshot_resource: Engine.ContextResource,
 _txn: ?*IDBTransaction = null, // only set during upgradeneeded
 _closed: bool = false,
 
 pub fn init(exec: *Execution, engine: *Engine, database_id: i64, name: []const u8, version: i64) !*IDBDatabase {
-    return exec._factory.eventTarget(IDBDatabase{
+    const self = try exec._factory.eventTarget(IDBDatabase{
         ._proto = undefined,
         ._exec = exec,
         ._engine = engine,
         ._database_id = database_id,
         ._name = name,
+        ._snapshot_resource = .{ .ctx = exec.js, .release = releaseSnapshot },
         ._version = version,
     });
+    if (engine.profile_async != null) engine.registerContextResource(&self._snapshot_resource);
+    return self;
 }
 
 pub fn asEventTarget(self: *IDBDatabase) *EventTarget {
     return self._proto;
+}
+
+// Takes ownership of an arena allocated against the negotiated Profile grant.
+// The replacement is fully prepared before commit, so publication cannot fail.
+pub fn replaceSnapshot(self: *IDBDatabase, arena: std.heap.ArenaAllocator, snapshot: SchemaSnapshot.Snapshot) void {
+    if (self._snapshot_arena) |*old| old.deinit();
+    self._snapshot_arena = arena;
+    self._snapshot = snapshot;
+}
+
+fn releaseSnapshot(resource: *Engine.ContextResource) void {
+    const self: *IDBDatabase = @fieldParentPtr("_snapshot_resource", resource);
+    if (self._snapshot_arena) |*arena| arena.deinit();
+    self._snapshot_arena = null;
+    self._snapshot = .{};
 }
 
 const CreateObjectStoreOptions = struct {
@@ -84,7 +106,11 @@ pub fn createObjectStore(
             return error.SyntaxError;
         }
     }
-    if ((try self._engine.objectStoreId(self._database_id, name)) != null) {
+    const exists = if (self._engine.profile_async != null)
+        txn.schemaSnapshot().findStore(name) != null
+    else
+        (try self._engine.objectStoreId(txn.gateWaiter(), self._database_id, name)) != null;
+    if (exists) {
         return error.ConstraintError;
     }
 
@@ -97,7 +123,32 @@ pub fn createObjectStore(
         break :blk try Key.dupeKeyPath(txn._arena.allocator(), kp);
     } else null;
 
+    const owned_name = try txn.dupe(name);
+    if (self._engine.profile_async != null) {
+        const snapshot = txn.schemaSnapshot();
+        const request = try txn.reserveSchemaRequest();
+        const id = try snapshot.allocStoreId();
+        try snapshot.addStore(txn.schemaAllocator(), owned_name, .{
+            .id = id,
+            .key_path = key_path,
+            .auto_increment = opts.autoIncrement,
+        });
+        errdefer snapshot.removeStore(owned_name) catch {};
+        const store = try IDBObjectStore.init(txn, id, owned_name, key_path, opts.autoIncrement);
+        store._created = true;
+        try txn.cacheStore(store);
+        errdefer txn.uncacheStore(owned_name);
+        try request.submitSchema(.{ .create_store = .{
+            .id = id,
+            .database_id = self._database_id,
+            .name = owned_name,
+            .key_path = key_path,
+            .auto_increment = opts.autoIncrement,
+        } });
+        return store;
+    }
     const store_id = self._engine.createObjectStore(
+        txn.gateWaiter(),
         txn._arena.allocator(),
         self._database_id,
         name,
@@ -107,8 +158,6 @@ pub fn createObjectStore(
         error.Constraint => return error.ConstraintError,
         else => return err,
     };
-
-    const owned_name = try txn.dupe(name);
     const store = try IDBObjectStore.init(txn, store_id, owned_name, key_path, opts.autoIncrement);
     store._created = true;
     try txn.cacheStore(store);
@@ -131,7 +180,19 @@ fn deleteObjectStore(self: *IDBDatabase, name: []const u8, _: *Execution) !void 
         return error.InvalidStateError;
     }
     try txn.assertActive();
-    try self._engine.deleteObjectStore(self._database_id, name);
+    if (self._engine.profile_async != null) {
+        const snapshot = txn.schemaSnapshot();
+        if (snapshot.findStore(name) == null) return error.NotFoundError;
+        const owned_name = try txn.dupe(name);
+        const request = try txn.reserveSchemaRequest();
+        try request.submitSchema(.{ .delete_store = .{
+            .database_id = self._database_id,
+            .name = owned_name,
+        } });
+        try snapshot.removeStore(name);
+    } else {
+        try self._engine.deleteObjectStore(txn.gateWaiter(), self._database_id, name);
+    }
     txn.uncacheStore(name);
 }
 
@@ -195,7 +256,11 @@ pub fn transaction(
 }
 
 fn assertStoreExists(self: *const IDBDatabase, name: []const u8) !void {
-    if ((try self._engine.objectStoreId(self._database_id, name)) == null) {
+    if (self._engine.profile_async != null) {
+        if (self._snapshot.findStore(name) == null) return error.NotFound;
+        return;
+    }
+    if ((try self._engine.objectStoreId(null, self._database_id, name)) == null) {
         return error.NotFound;
     }
 }
@@ -247,7 +312,12 @@ pub fn getObjectStoreNames(self: *IDBDatabase, exec: *Execution) !*DOMStringList
     const arena = try exec.getArena(.small, "IDB.getObjectStoreNames");
     errdefer arena.release();
 
-    const names = try self._engine.objectStoreNames(arena.allocator(), self._database_id);
+    const names = if (self._engine.profile_async != null)
+        try (if (self._txn) |txn| txn.schemaSnapshot() else &self._snapshot).storeNames(arena.allocator())
+    else blk: {
+        const waiter = if (self._txn) |txn| txn.metadataWaiter() else null;
+        break :blk try self._engine.objectStoreNames(waiter, arena.allocator(), self._database_id);
+    };
     const list = try arena.create(DOMStringList);
     list.* = .{ ._items = names, ._arena = arena };
     return list;

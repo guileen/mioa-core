@@ -58,9 +58,26 @@ fonts retain their respective notices. Neither the root MIT license nor
 Python package metadata relicenses native components or a linked executable.
 Source migration is not a legal clearance for a composite binary release.
 
+HTML named character reference data
+----------------------------------
+
+runtime/engine/src/browser/entities_data.zig retains all 2,231 entries from
+web_atoms 0.3.0/entities.rs under its MIT option, including the complete notice.
+The file records the locked crate hash, original data hash, upstream revision
+and lossless transformation. This data extraction does not relicense native
+engine code or replace the Rust HTML tokenizer's remaining internal tables.
+
 Test fixture
 ------------
 
 The string "hunter2" in mioa-headless/tests/test_axtree_observation.py is a
 literal used to verify that password values are masked. It is not a
 credential.
+
+Web Platform Tests
+------------------
+
+tests/web/wpt/ and tests/web/resources/testharness.js contain selected unmodified
+web-platform-tests sources, copyright web-platform-tests contributors,
+under BSD-3-Clause; see tests/web/wpt/LICENSE.md. Upstream revision and file
+hashes are recorded in tests/wpt-manifest.json.

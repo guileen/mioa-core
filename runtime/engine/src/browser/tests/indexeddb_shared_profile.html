@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<body>
+<script src="testing.js"></script>
+<!-- Run only with a negotiated shared IndexedDB Profile owner. -->
+<script id="upgrade_committed_metadata_snapshot" type=module>
+{
+    const state = await testing.async();
+    const setup = indexedDB.open("metadata-snapshot-db", 1);
+    setup.onupgradeneeded = () => setup.result.createObjectStore("old");
+    setup.onsuccess = () => {
+        const previous = setup.result;
+        previous.close();
+        const upgrade = indexedDB.open("metadata-snapshot-db", 2);
+        upgrade.onupgradeneeded = () => {
+            const db = upgrade.result;
+            db.createObjectStore("new");
+            testing.expectEqual(["new", "old"], [...db.objectStoreNames]);
+            testing.expectEqual(["old"], [...previous.objectStoreNames]);
+        };
+        upgrade.onsuccess = () => {
+            testing.expectEqual(["new", "old"], [...upgrade.result.objectStoreNames]);
+            upgrade.result.close();
+            state.resolve(true);
+        };
+    };
+    await state.done((done) => testing.expectEqual(true, done));
+}
+</script>
+</body>
