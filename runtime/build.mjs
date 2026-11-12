@@ -31,6 +31,7 @@ const guardPath = join(output, '.build-lock');
 const guard = await open(guardPath, 'wx').catch(error => {
   throw new Error(`Cannot acquire ${guardPath}: another build may own it. After a terminated build, remove only this lock once its process has stopped.`, { cause: error });
 });
+const target = 'engine';
 const receipt = { schema: 1, status: 'started', target, started_utc: new Date().toISOString(), commands: [], qualification: 'Source-bound compilation only; functionality, release acceptance and bit-identical reproducibility are separate.' };
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const json = value => JSON.stringify(value, null, 2) + '\n';
