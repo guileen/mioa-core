@@ -34,17 +34,16 @@ const Projection = struct {
 /// them (author rules, inline style, inheritance). The kernel applies these
 /// values; it is not a second CSS engine.
 const style_properties = [_][]const u8{
-    "display",          "font-size",          "font-weight",         "text-decoration",
-    "margin-top",       "margin-bottom",      "margin-left",         "width",
-    "height",
+    "display",            "font-size",           "font-weight",       "text-decoration",
+    "margin-top",         "margin-bottom",       "margin-left",       "width",
+    "height",             "position",            "left",              "top",
     // Shorthands come first: the kernel applies declarations in order, so the
     // longhands below win.
-              "padding",            "padding-top",         "padding-right",
-    "padding-bottom",   "padding-left",       "border",              "border-width",
-    "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
-    "box-sizing",
+    "padding",            "padding-top",         "padding-right",     "padding-bottom",
+    "padding-left",       "border",              "border-width",      "border-top-width",
+    "border-right-width", "border-bottom-width", "border-left-width", "box-sizing",
     // Shorthand first so background-color wins over a background color token.
-          "background",         "background-color",    "color",
+    "background",         "background-color",    "color",
 };
 
 /// CSS-wide keywords leave the kernel's own default (UA style, or the value
