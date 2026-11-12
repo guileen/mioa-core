@@ -43,6 +43,8 @@ const style_properties = [_][]const u8{
     "padding-bottom",   "padding-left",       "border",              "border-width",
     "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
     "box-sizing",
+    // Shorthand first so background-color wins over a background color token.
+    "background",        "background-color",  "color",
 };
 
 /// CSS-wide keywords leave the kernel's own default (UA style, or the value
