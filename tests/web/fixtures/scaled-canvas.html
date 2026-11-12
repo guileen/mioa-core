@@ -1,0 +1,8 @@
+<!doctype html><meta charset="utf-8"><style>
+body{margin:0;background:white}
+#port{position:absolute;left:100px;top:40px;width:100px;height:80px;overflow:hidden;border-radius:16px}
+canvas{position:absolute;left:0;top:0;width:80px;height:60px;border:2px solid black;padding:4px;object-fit:contain;object-position:right bottom}
+#extent{position:absolute;top:150px;width:1px;height:1px}
+</style><div id="port"><canvas id="surface" width="40" height="20"></canvas><div id="extent"></div></div>
+<script>window.ctx=document.getElementById('surface').getContext('2d');ctx.fillStyle='#d02040';ctx.fillRect(0,0,20,20);ctx.fillStyle='#2563eb';ctx.fillRect(20,0,20,20);</script>
+<script>window.caseReady=true;</script>

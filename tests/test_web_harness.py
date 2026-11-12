@@ -71,6 +71,24 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(web.failure_record(RuntimeError('PASS'), -11)['status'], 'CRASH')
         self.assertEqual(web.failure_record(RuntimeError('PASS'))['status'], 'ERROR')
 
+    def test_wpt_nonpassing_subtests_and_harness_errors_preserve_outcomes(self):
+        for statuses, expected in [([0, 1], "FAIL"), ([1, 2], "TIMEOUT"),
+                                   ([0, 3], "UNSUPPORTED"), ([0, 4], "UNSUPPORTED")]:
+            value = {"complete": True, "harness": {"status": 0},
+                     "subtests": [{"name": str(i), "status": status} for i, status in enumerate(statuses)]}
+            with self.subTest(statuses=statuses), self.assertRaises(web.CaseFailure) as caught:
+                web.validate_wpt(value)
+            self.assertEqual(caught.exception.status, expected)
+        with self.assertRaises(web.CaseFailure) as caught:
+            web.validate_wpt({"complete": True, "harness": {"status": 1}, "subtests": []})
+        self.assertEqual(caught.exception.status, "ERROR")
+
+    def test_wpt_empty_duplicate_and_unknown_results_are_not_semantic_passes(self):
+        for rows in ([], [{"name": "test", "status": 99}],
+                     [{"name": "same", "status": 0}] * 2):
+            with self.subTest(rows=rows), self.assertRaises(web.CaseFailure) as caught:
+                web.validate_wpt({"complete": True, "harness": {"status": 0}, "subtests": rows})
+            self.assertEqual(caught.exception.status, "ERROR")
 
     def test_malformed_script_results_remain_readable_error_evidence(self):
         for invalid in (7, True, "invalid", {"status": "PASS"}, None):
@@ -106,6 +124,7 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("node retained", evidence_view.render(report))
 
 
+
 class ToonStructureTests(unittest.TestCase):
     def test_nested_evidence_preserves_value_types_and_scope(self):
         cases = [
@@ -124,6 +143,30 @@ class ToonStructureTests(unittest.TestCase):
 
 
 class AsyncHarnessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_deadline_cancels_unfinished_work_and_reports_timeout(self):
+        cancelled = asyncio.Event()
+        async def unfinished():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        with self.assertRaises(web.CaseFailure) as caught:
+            await web.bounded(unfinished(), 0.01)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(web.failure_record(caught.exception)['status'], 'TIMEOUT')
+        self.assertEqual(await web.bounded(asyncio.sleep(0, result=17), 1), 17)
+
+    async def test_missing_binary_writes_nonpassing_machine_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = argparse.Namespace(binary=str(root / 'missing-engine'), suite='web', format='toon')
+            code = await web.run(args, web.load_suite('web')[:1], root)
+            result = json.loads((root / 'results.json').read_text())
+            self.assertEqual(code, 1)
+            self.assertEqual(result['status'], 'ERROR')
+            self.assertNotEqual(result['error']['status'], 'PASS')
+            self.assertEqual(result['results'], [])
+
     async def _assert_pending_request_cleanup(self, *, cancel):
         connected, entered = asyncio.Event(), asyncio.Event()
         connections = []
@@ -179,30 +222,6 @@ class AsyncHarnessTests(unittest.IsolatedAsyncioTestCase):
     async def test_fixture_cancellation_closes_unfinished_http_client(self):
         await self._assert_pending_request_cleanup(cancel=True)
 
-    async def test_real_deadline_cancels_unfinished_work_and_reports_timeout(self):
-        cancelled = asyncio.Event()
-        async def unfinished():
-            try:
-                await asyncio.Event().wait()
-            finally:
-                cancelled.set()
-        with self.assertRaises(web.CaseFailure) as caught:
-            await web.bounded(unfinished(), 0.01)
-        self.assertTrue(cancelled.is_set())
-        self.assertEqual(web.failure_record(caught.exception)['status'], 'TIMEOUT')
-        self.assertEqual(await web.bounded(asyncio.sleep(0, result=17), 1), 17)
-
-    async def test_missing_binary_writes_nonpassing_machine_report(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            args = argparse.Namespace(binary=str(root / 'missing-engine'), suite='web')
-            code = await web.run(args, web.load_suite('web')[:1], root)
-            result = json.loads((root / 'results.json').read_text())
-            self.assertEqual(code, 1)
-            self.assertEqual(result['status'], 'ERROR')
-            self.assertNotEqual(result['error']['status'], 'PASS')
-            self.assertEqual(result['results'], [])
-
     async def test_loopback_server_serves_exact_fixture_not_repository_files(self):
         async with web.fixture_server() as origin:
             from urllib.parse import urlsplit
@@ -220,6 +239,48 @@ class AsyncHarnessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(served.split(b'\r\n\r\n', 1)[1], (web.HERE / 'web/fixtures/empty.html').read_bytes())
             for path in ('/../run_web.py', '/%2e%2e/run_web.py', '/cases.json'):
                 self.assertIn(b'404 Not Found', await request(path))
+
+    async def test_http_session_fixture_rejects_wrong_credentials_and_revoked_cookie(self):
+        async with web.fixture_server(authentication=True) as origin:
+            address = web.urlsplit(origin)
+            async def request(path, *, form=None, cookie=None):
+                reader, writer = await asyncio.open_connection(address.hostname, address.port)
+                body = (form or "").encode()
+                headers = (f"{'POST' if form is not None else 'GET'} {path} HTTP/1.1\r\n"
+                           f"Host: {address.netloc}\r\nContent-Length: {len(body)}\r\n"
+                           "Content-Type: application/x-www-form-urlencoded\r\n")
+                if cookie is not None:
+                    headers += f"Cookie: {cookie}\r\n"
+                try:
+                    writer.write((headers + "\r\n").encode() + body)
+                    await writer.drain()
+                    response = await asyncio.wait_for(reader.read(), 2)
+                    head, content = response.split(b"\r\n\r\n", 1)
+                    return head.decode("latin-1"), content
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+            private = "/session/private"
+            head, content = await request(private)
+            self.assertTrue(head.startswith("HTTP/1.1 401 "))
+            self.assertNotIn(b"server-only draft", content)
+            head, _ = await request("/session/login", form="username=local-user&password=wrong")
+            self.assertTrue(head.startswith("HTTP/1.1 401 "))
+            self.assertNotIn("Set-Cookie:", head)
+            head, _ = await request("/session/login", form="username=local-user&password=fixture-password")
+            self.assertTrue(head.startswith("HTTP/1.1 303 "))
+            value = next(line.removeprefix("Set-Cookie: ") for line in head.split("\r\n") if line.startswith("Set-Cookie: "))
+            self.assertIn("HttpOnly", value)
+            cookie = value.split(";", 1)[0]
+            head, content = await request(private, cookie=cookie)
+            self.assertTrue(head.startswith("HTTP/1.1 200 "))
+            self.assertIn(b"server-only draft", content)
+            head, _ = await request("/session/logout", form="", cookie=cookie)
+            self.assertTrue(head.startswith("HTTP/1.1 303 "))
+            self.assertIn("Max-Age=0", head)
+            head, content = await request(private, cookie=cookie)
+            self.assertTrue(head.startswith("HTTP/1.1 401 "))
+            self.assertNotIn(b"server-only draft", content)
 
 
 if __name__ == '__main__':

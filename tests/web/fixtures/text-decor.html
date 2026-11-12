@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>css text decoration module 3 fixture</title>
+  <style>
+    .decor-underline {
+      text-decoration-line: underline;
+      text-decoration-color: rgb(255, 0, 0);
+      text-decoration-style: solid;
+    }
+    .decor-through {
+      text-decoration: line-through;
+    }
+  </style>
+</head>
+<body>
+  <div id="target-underline" class="decor-underline">Underlined text with red border</div>
+  <div id="target-through" class="decor-through">Strikethrough text</div>
+  <div id="target-dynamic">Dynamic text decoration</div>
+</body>
+</html>
+<script>window.caseReady = true;</script>

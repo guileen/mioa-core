@@ -11,6 +11,7 @@ import sys
 import tempfile
 
 import run_web
+import toon
 
 
 def main(argv=None):
@@ -19,7 +20,7 @@ def main(argv=None):
     parser.add_argument('--binary', help='actual native binary; required for all/web')
     parser.add_argument('--output', type=Path, help='new/empty artifact directory outside source (or core/.local)')
     parser.add_argument('--filter', action='append', default=[], help='native web case-id substring, repeatable')
-    parser.add_argument('--kind', choices=('assertion', 'reftest', 'native'))
+    parser.add_argument('--kind', choices=('assertion', 'reftest', 'native', 'wpt'))
     parser.add_argument('--suite', choices=('web', 'controls'), default='web')
     args = parser.parse_args(argv)
     if args.layer != 'unit' and not args.binary:
@@ -34,7 +35,7 @@ def main(argv=None):
     report = {'schema': 1, 'layer': args.layer, 'status': 'PASS', 'layers': {}}
     if args.layer in ('all', 'unit'):
         environment = os.environ.copy()
-        environment['PYTHONPATH'] = os.pathsep.join((str(run_web.CORE / 'mioa-core'), str(run_web.CORE / 'mioa-headless')))
+        environment['PYTHONPATH'] = os.pathsep.join(str(run_web.CORE / name) for name in ('mioa-core', 'mioa-headless', 'mioa-os/api/system', 'mioa-os'))
         unit_results = []
         # Separate discover processes avoid cross-directory module-name collisions and
         # preserve the original suites' isolation. No duplicate or copied unit tests.
@@ -63,10 +64,11 @@ def main(argv=None):
         if args.kind:
             arguments += ['--kind', args.kind]
         code = run_web.main(arguments)
-        report['layers']['web'] = {'status': 'PASS' if code == 0 else 'FAIL', 'report': 'web/results.json'}
+        report['layers']['web'] = {'status': 'PASS' if code == 0 else 'FAIL', 'report': 'web/results.toon'}
         if code:
             report['status'] = 'FAIL'
     run_web.json_write(output / 'results.json', report)
+    (output / 'results.toon').write_text(toon.encode(report) + '\n')
     return 0 if report['status'] == 'PASS' else 1
 
 

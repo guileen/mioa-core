@@ -1,0 +1,34 @@
+<!doctype html><meta charset="utf-8"><title>Scaled overflow capture</title>
+<style>
+html,body { margin:0; background:white }
+body { height:1000px }
+#port { position:absolute; left:10px; top:10px; width:80px; height:80px; overflow:auto }
+#red { height:80px; background:red }
+#blue { height:160px; background:blue }
+#round { position:absolute; left:120px; top:10px; width:90px; height:90px; border-radius:30px; overflow:hidden }
+#inner { width:100px; height:100px; border-radius:20px; overflow:hidden }
+#fill { width:140px; height:140px; background:lime }
+#text { position:absolute; left:10px; top:130px; width:80px; height:30px; overflow:hidden; white-space:nowrap; color:black; font:24px/30px sans-serif }
+#pseudo { position:absolute; left:120px; top:130px; width:80px; height:30px; overflow:hidden }
+#pseudo::before { content:""; display:block; width:120px; height:60px; background:magenta }
+#shadow { position:absolute; left:240px; top:20px; width:30px; height:30px; box-shadow:8px 0 0 black }
+#shadowclip { position:absolute; left:230px; top:80px; width:70px; height:30px; overflow:hidden; border-radius:12px }
+#offset { position:absolute; left:45px; top:5px; width:20px; height:20px; box-shadow:-45px 0 0 black }
+#soft { position:absolute; left:240px; top:135px; width:40px; height:30px; border-radius:12px; box-shadow:4px 4px 6px rgba(0,0,0,.5) }
+#translated { position:absolute; left:10px; top:180px; width:80px; height:40px; overflow:hidden; border-radius:10px; transform:translate(50%,5px); translate:10px 0 }
+#translated .red { height:40px; background:red }
+#translated .blue { height:120px; background:blue }
+#translation-clip { position:absolute; left:180px; top:185px; width:60px; height:40px; overflow:hidden; border-radius:10px }
+#translation-child { position:absolute; left:0; top:0; width:60px; height:40px; background:cyan; transform:translateX(20px) }
+#zero-group { position:absolute; left:250px; top:185px; width:50px; height:40px; opacity:0 }
+#zero-group>div { position:absolute; left:0; top:0; width:30px; height:40px; background:black }
+#zero-group>.second { left:20px }
+</style>
+<div id="port"><div id="red"></div><div id="blue"></div></div>
+<div id="round"><div id="inner"><div id="fill"></div></div></div>
+<div id="text">MMMMMMMMMMMM</div><div id="pseudo"></div>
+<div id="shadow"></div><div id="shadowclip"><div id="offset"></div></div><div id="soft"></div>
+<div id="translated"><div class="red"></div><div class="blue"></div></div>
+<div id="translation-clip"><div id="translation-child"></div></div>
+<div id="zero-group"><div></div><div class="second"></div></div>
+<script>window.caseReady=true;</script>

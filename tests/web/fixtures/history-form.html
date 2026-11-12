@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>History form</title>
+<style>
+html,body{margin:0}
+#query{position:absolute;left:20px;top:20px;width:180px;height:30px;box-sizing:border-box}
+#notes{position:absolute;left:20px;top:65px;width:180px;height:45px;box-sizing:border-box}
+#controls{position:absolute;left:20px;top:120px}
+</style>
+<form>
+  <input id="query" name="query">
+  <textarea id="notes" name="notes"></textarea>
+  <div id="controls">
+    <input id="remember" type="checkbox" name="remember">
+    <input id="weekly" type="radio" name="frequency" value="weekly" checked>
+    <input id="daily" type="radio" name="frequency" value="daily">
+    <select id="category" name="category"><option value="all">All</option><option value="music">Music</option><option value="books">Books</option></select>
+    <input id="secret" type="password" name="secret">
+    <input id="upload" type="file" name="upload">
+    <input id="removed" name="removed" value="original">
+    <input id="survivor" name="survivor" value="default">
+  </div>
+</form>
+<script>window.caseReady = true;</script>

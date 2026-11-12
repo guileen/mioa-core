@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Platform Compatibility, UI Events, and Media Queries</title>
+  <style>
+    #box {
+      width: 100px;
+      height: 100px;
+      background-color: rgb(200, 200, 200);
+    }
+  </style>
+</head>
+<body>
+  <div id="box">Target Content</div>
+  <svg id="svg-root" width="50" height="50" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vector Graphics Box">
+    <title id="svg-title">Box Title</title>
+    <circle cx="25" cy="25" r="20" fill="blue" />
+    <path id="svg-path" d="M 10 10 L 40 40 Z" stroke="red" stroke-width="2" stroke-linecap="round" fill="none" />
+  </svg>
+  <div id="hidden-accessible-box" style="display: none;" aria-hidden="true">Hidden</div>
+  <script>window.caseReady = true;</script>
+</body>
+</html>

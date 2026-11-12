@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "repository": "https://github.com/web-platform-tests/wpt",
+  "revision": "dcfd7ea3c7074466c6a9a671865fa147e0f0bd85",
+  "scope": "DOM appendChild, removeChild, contains, textContent; selected unmodified official HTML testharness tests, not full WPT runner qualification",
+  "files": [
+    {
+      "upstream": "resources/testharness.js",
+      "path": "tests/web/resources/testharness.js",
+      "sha256": "7a108d7cfa98ac413ddb38f82fd509fb2037dfcc25ccf466567520cbb6bdf1fa"
+    },
+    {
+      "upstream": "dom/common.js",
+      "path": "tests/web/wpt/dom/common.js",
+      "sha256": "732f485014a4c6a6633439b24dfc442ab89391199504a1163b421a02374dfad3"
+    },
+    {
+      "upstream": "dom/nodes/creators.js",
+      "path": "tests/web/wpt/dom/nodes/creators.js",
+      "sha256": "40439d36de1fbff92ffd771fcf8ce02215df1815c55a23f4be3c585b63796989"
+    },
+    {
+      "upstream": "dom/nodes/Node-appendChild.html",
+      "path": "tests/web/wpt/dom/nodes/Node-appendChild.html",
+      "sha256": "5cfaace1133d43be405c6395c29b6dd84032f8f632f89d2c7d32af8d186dd600"
+    },
+    {
+      "upstream": "dom/nodes/Node-removeChild.html",
+      "path": "tests/web/wpt/dom/nodes/Node-removeChild.html",
+      "sha256": "c1f30e6ec83e2a15ec2dbe9d40aae716a106ffdf42d57f89e154dceb8b799d76"
+    },
+    {
+      "upstream": "dom/nodes/Node-contains.html",
+      "path": "tests/web/wpt/dom/nodes/Node-contains.html",
+      "sha256": "c6a83057cbe24094aa8ad32e8b937e35f485d2f8685e5302e82e21b0850662b3"
+    },
+    {
+      "upstream": "dom/nodes/Node-textContent.html",
+      "path": "tests/web/wpt/dom/nodes/Node-textContent.html",
+      "sha256": "7c1c6ed8d44f08026fdbf8d851147fa09ff0bec5ff0f730979fade639bd75cbe"
+    },
+    {
+      "upstream": "LICENSE.md",
+      "path": "tests/web/wpt/LICENSE.md",
+      "sha256": "5fac07febb0e2a97fb0d7b0def149ec08b642e1ba4b9c345283ab1cbd2af6570"
+    }
+  ]
+}

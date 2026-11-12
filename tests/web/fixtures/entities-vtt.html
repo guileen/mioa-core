@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebVTT named character reference providers</title>
+<body>
+<video id="entities-video"></video>
+<script id="entities-vtt-source" type="text/vtt">WEBVTT
+
+unicode
+00:00.000 --> 00:01.000
+<b>&amp;&AMP;&lt;&gt;&quot;&apos;|&Aacute;&aacute;|&Afr;&NotEqualTilde;&fjlig;|&Tab;&NewLine;</b>
+
+longest
+00:01.000 --> 00:02.000
+&notit;|&notin;|&notin|&notinX|&ampersand;|&notAName;|&CounterClockwiseContourIntegral;|&CounterClockwiseContourIntegralX;|&zzzz;|&Amp;
+
+annotation
+00:02.000 --> 00:03.000
+<v Voice&NotEqualTilde;>&lt;b&gt;&amp;notin;</v>
+</script>
+<script>
+window.caseReady = false;
+window.entitiesTrackEvent = null;
+const entitiesVttUrl = URL.createObjectURL(new Blob(
+  [document.getElementById('entities-vtt-source').textContent],
+  { type: 'text/vtt' }
+));
+const entitiesTrack = document.createElement('track');
+entitiesTrack.id = 'entities-track';
+entitiesTrack.kind = 'subtitles';
+entitiesTrack.default = true;
+for (const type of ['load', 'error']) {
+  entitiesTrack.addEventListener(type, () => {
+    window.entitiesTrackEvent = type;
+    URL.revokeObjectURL(entitiesVttUrl);
+    window.caseReady = true;
+  });
+}
+entitiesTrack.src = entitiesVttUrl;
+document.getElementById('entities-video').appendChild(entitiesTrack);
+</script>
