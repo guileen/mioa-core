@@ -182,7 +182,7 @@ try {
   {
     const binary = join(output, 'engine/zig-out/bin/lightpanda');
     await rm(binary, { force: true });
-    execute(config.zig, ['build', '-Doptimize=fast', '-Ddev_fast=false', '-Dshared_v8=false', `-Dprebuilt_v8_path=${receipt.v8_archive.path}`, `-j${jobs}`, '--cache-dir', env.ZIG_LOCAL_CACHE_DIR], join(output, 'engine'), env);
+    execute(config.zig, ['build', '-Doptimize=fast', '-Ddev_fast=false', '-Dshared_v8=false', `-Dprebuilt_v8_path=${receipt.v8_archive.path}`, `-Dmioa_os_dir=${join(core, 'mioa-os')}`, `-j${jobs}`, '--cache-dir', env.ZIG_LOCAL_CACHE_DIR], join(output, 'engine'), env);
     receipt.artifacts.engine = { path: binary, ...await fileInfo(binary) };
     receipt.binary = receipt.artifacts.engine;
   }

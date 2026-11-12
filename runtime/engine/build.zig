@@ -95,6 +95,11 @@ pub fn build(b: *Build) !void {
     const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
     const v8_headers = b.option([]const u8, "v8-headers", "Candidate-only matching V8 include directory");
     if (v8_headers != null and shared_v8) return error.CandidateRequiresStaticV8;
+    const mioa_os_dir = b.option([]const u8, "mioa_os_dir", "Path to mioa-os when the engine is built outside runtime/engine") orelse "../../mioa-os";
+    const mioa_os: std.Build.LazyPath = if (std.fs.path.isAbsolute(mioa_os_dir))
+        .{ .cwd_relative = mioa_os_dir }
+    else
+        b.path(mioa_os_dir);
     const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
     // Hot-code layout for the Linux release artifacts, see orderfile/README.md.
     // Opt-in (CI passes it): it needs LLD and costs link time on every build.
@@ -133,14 +138,14 @@ pub fn build(b: *Build) !void {
     });
     lightpanda_module.addImport("environment_api", environment_api_module);
     const process_api_module = b.createModule(.{
-        .root_source_file = b.path("../../mioa-os/process.zig"),
+        .root_source_file = mioa_os.path("process.zig"),
         .target = target,
         .optimize = optimize,
     });
     lightpanda_module.addImport("process_api", process_api_module);
     process_api_module.addImport("lightpanda", lightpanda_module);
     const thread_api_module = b.createModule(.{
-        .root_source_file = b.path("../../mioa-os/thread.zig"),
+        .root_source_file = mioa_os.path("thread.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -155,33 +160,33 @@ pub fn build(b: *Build) !void {
         .optimize = optimize,
     });
     lightpanda_module.addImport("render_kernel", render_kernel_module);
-    lightpanda_module.addIncludePath(b.path("../../mioa-os/api/system"));
+    lightpanda_module.addIncludePath(mioa_os.path("api/system"));
     lightpanda_module.addCSourceFile(.{
-        .file = b.path("../../mioa-os/app_data.c"),
+        .file = mioa_os.path("app_data.c"),
         .flags = &.{"-std=c11"},
     });
     lightpanda_module.addCSourceFile(.{
-        .file = b.path("../../mioa-os/environment.c"),
+        .file = mioa_os.path("environment.c"),
         .flags = &.{"-std=c11"},
     });
     lightpanda_module.addCSourceFile(.{
-        .file = b.path("../../mioa-os/executable_path.c"),
+        .file = mioa_os.path("executable_path.c"),
         .flags = &.{"-std=c11"},
     });
     lightpanda_module.addCSourceFile(.{
-        .file = b.path("../../mioa-os/terminal.c"),
+        .file = mioa_os.path("terminal.c"),
         .flags = &.{"-std=c11"},
     });
     lightpanda_module.addCSourceFile(.{
-        .file = b.path("../../mioa-os/files.c"),
+        .file = mioa_os.path("files.c"),
         .flags = &.{"-std=c11"},
     });
     lightpanda_module.addCSourceFile(.{
-        .file = b.path("../../mioa-os/random.c"),
+        .file = mioa_os.path("random.c"),
         .flags = &.{"-std=c11"},
     });
     lightpanda_module.addCSourceFile(.{
-        .file = b.path("../../mioa-os/clock.c"),
+        .file = mioa_os.path("clock.c"),
         .flags = &.{"-std=c11"},
     });
     lightpanda_module.addIncludePath(b.path("src/c"));
@@ -528,7 +533,7 @@ fn linkV8(
 fn linkNativePlatform(b: *Build, mod: *Build.Module, deps: Deps) void {
     if (deps.target.result.os.tag == .macos) {
         const sdk = deps.macos_sdk orelse @panic("macOS native build requires -Dmacos_sdk or SDKROOT");
-        mod.addCSourceFile(.{ .file = b.path("../../mioa-os/broker.c"), .flags = &.{ "-isysroot", sdk } });
+        mod.addCSourceFile(.{ .file = mioa_os.path("broker.c"), .flags = &.{ "-isysroot", sdk } });
         mod.linkFramework("IOSurface", .{});
         mod.linkFramework("CoreFoundation", .{});
         mod.linkSystemLibrary("bsm", .{});
