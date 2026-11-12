@@ -6,6 +6,8 @@ import json
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
+from mioa_os_api import HttpRequestDenied, HttpRequests
+
 PROXY_SCHEMES = {"http": 8080, "https": 8443, "socks5": 1080, "socks5h": 1080}
 
 
@@ -17,14 +19,26 @@ def parse_proxy(url: str | None) -> dict[str, str] | None:
     """Playwright proxy dict for a proxy URL, or None for a direct connection."""
     if not url or url.strip().upper() in {"", "DIRECT", "NONE"}:
         return None
-    parts = urlsplit(url.strip())
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        parts = None
+    if parts is None:
+        raise NetworkError("invalid proxy URL")
     if parts.scheme not in PROXY_SCHEMES:
         raise NetworkError(
             f"unsupported proxy scheme {parts.scheme!r}; use one of {', '.join(sorted(PROXY_SCHEMES))}"
         )
     if not parts.hostname:
-        raise NetworkError(f"proxy URL has no host: {url!r}")
-    port = parts.port or PROXY_SCHEMES[parts.scheme]
+        raise NetworkError("proxy URL has no host")
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    if port == -1:
+        raise NetworkError("invalid proxy URL")
+    if port is None:
+        port = PROXY_SCHEMES[parts.scheme]
     host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
     proxy: dict[str, str] = {"server": f"{parts.scheme}://{host}:{port}"}
     if parts.username:
@@ -48,9 +62,8 @@ def _authenticated_proxy_url(server: str, username: str, password: str) -> str:
     )
 
 
-def probe_egress(proxy: dict[str, str] | None, timeout: float = 8.0) -> dict[str, Any]:
-    """Exit IP and geography, measured through the proxy. Fails closed."""
-    import requests
+def probe_egress(proxy: dict[str, str] | None, timeout: float = 8.0, *, http: HttpRequests) -> dict[str, Any]:
+    """Exit IP and geography through explicitly Host-authorized HTTP."""
 
     server = (proxy or {}).get("server")
     if server:
@@ -64,10 +77,9 @@ def probe_egress(proxy: dict[str, str] | None, timeout: float = 8.0) -> dict[str
         proxies = None
 
     attempts: list[str] = []
+    denied = False
     try:
-        response = requests.get("https://ipinfo.io/json", proxies=proxies, timeout=timeout)
-        response.raise_for_status()
-        data = response.json()
+        data = http.get_json("https://ipinfo.io/json", proxies=proxies, timeout=timeout)
         loc = (data.get("loc") or "").split(",")
         return {
             "ip": data.get("ip"),
@@ -78,17 +90,21 @@ def probe_egress(proxy: dict[str, str] | None, timeout: float = 8.0) -> dict[str
             "longitude": float(loc[1]) if len(loc) == 2 else None,
             "source": "ipinfo.io",
         }
+    except HttpRequestDenied:
+        if not server:
+            raise
+        denied = True
     except Exception as exc:  # noqa: BLE001 - any failure falls through
-        attempts.append(f"ipinfo.io: {exc}")
+        attempts.append(f"ipinfo.io: {'request failed' if server else str(exc)}")
+    if denied:
+        raise HttpRequestDenied("HTTP request denied by Host")
 
     try:
-        response = requests.get(
+        data = http.get_json(
             "http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,timezone,lat,lon",
             proxies=proxies,
             timeout=timeout,
         )
-        response.raise_for_status()
-        data = response.json()
         if data.get("status") != "success":
             raise NetworkError(str(data.get("message") or data))
         return {
@@ -100,12 +116,18 @@ def probe_egress(proxy: dict[str, str] | None, timeout: float = 8.0) -> dict[str
             "longitude": data.get("lon"),
             "source": "ip-api.com",
         }
+    except HttpRequestDenied:
+        if not server:
+            raise
+        denied = True
     except Exception as exc:  # noqa: BLE001
-        attempts.append(f"ip-api.com: {exc}")
+        attempts.append(f"ip-api.com: {'request failed' if server else str(exc)}")
+    if denied:
+        raise HttpRequestDenied("HTTP request denied by Host")
 
     raise NetworkError(
         "cannot determine the exit identity"
-        + (f" through {server}" if server else " on this host")
+        + (" through configured proxy" if server else " on this host")
         + "; "
         + " | ".join(attempts)
     )

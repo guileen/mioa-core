@@ -1,15 +1,15 @@
 """Opaque document/view/node references for the owned native runtime.
 
-Derived from `cli/anti_trace/actions.py` (RefStore slice). The only source
-change removes the unused `playwright.async_api.Page` annotation import, so the
-core runtime has no ATB or Playwright package dependency. Runtime behavior and
-error codes are unchanged.
+Derived from the ATB reference store. The active viewer retains its existing
+node-reference semantics; independent visual observations are scoped per page.
 """
 
 from __future__ import annotations
 
-import uuid
 from typing import Any, Callable
+from mioa_os_api import SecureRandom
+
+from .native_spec import NativeError, _secure_bytes
 
 MAX_ELEMENTS = 300
 MAX_TEXT = 120
@@ -56,10 +56,19 @@ SNAPSHOT_JS = r"""options => {
   return state;
 }"""
 
-_CHECK_JS = """(s, checkMutations) => {
+_VISUAL_JS = """() => {
+  const state = {document, epoch: 0, view: [scrollX, scrollY, innerWidth, innerHeight]};
+  state.observer = new MutationObserver(records => { state.epoch += records.length; });
+  state.observer.observe(document, {subtree:true,childList:true,attributes:true,characterData:true});
+  return state;
+}"""
+
+_CHECK_JS = """(s, {checkMutations, viewport}) => {
   if (checkMutations) s.epoch += s.observer.takeRecords().length;
-  return document === s.document && (!checkMutations || s.epoch === 0)
-    && s.view.every((value,index) => value === [scrollX,scrollY,innerWidth,innerHeight][index]);
+  if (document !== s.document || (checkMutations && s.epoch !== 0)
+      || !s.view.every((value,index) => value === [scrollX,scrollY,innerWidth,innerHeight][index]))
+    return false;
+  return viewport ? {width:s.view[2],height:s.view[3]} : true;
 }"""
 
 
@@ -72,7 +81,8 @@ class ActionError(RuntimeError):
 class RefStore:
     """Opaque IDs bound to real documents and original nodes, never re-queries."""
     def __init__(self, page_id: Callable[[Any], str] | None = None,
-                 versions: Callable[[], Any] | None = None):
+                 versions: Callable[[], Any] | None = None, *, random: SecureRandom | None = None):
+        self.random = random
         self._pages: dict[Any, str] = {}
         self._frames: dict[Any, str] = {}
         self.page_id = page_id or self._page_id
@@ -80,14 +90,26 @@ class RefStore:
         self.references: dict[str, tuple[dict[str, Any], int]] = {}
         self.snapshot: dict[str, Any] | None = None
         self.visual: dict[str, Any] | None = None
+        self.page_visuals: dict[Any, dict[str, Any]] = {}
         self.next_ref = 1
 
+    def _new_id(self, prefix: str) -> str:
+        if self.random is None:
+            raise NativeError("capability_unavailable", "Host secure randomness capability is required")
+        return prefix + _secure_bytes(self.random, 16).hex()
+
     def _page_id(self, page: Any) -> str:
-        return self._pages.setdefault(page, "page-" + uuid.uuid4().hex)
+        if page not in self._pages:
+            self._pages[page] = self._new_id("page-")
+        return self._pages[page]
 
     def frame_id(self, frame: Any) -> str:
         actual = getattr(frame, "frame_id", None)
-        return actual or self._frames.setdefault(frame, "frame-" + uuid.uuid4().hex)
+        if actual:
+            return actual
+        if frame not in self._frames:
+            self._frames[frame] = self._new_id("frame-")
+        return self._frames[frame]
 
     async def _release(self, record: dict[str, Any] | None) -> None:
         if record:
@@ -107,17 +129,28 @@ class RefStore:
             except Exception:
                 pass
 
-    async def clear(self) -> None:
+    async def clear(self, *, all_pages: bool = False) -> None:
         self.references.clear()
         await self._release(self.snapshot)
         await self._release(self.visual)
+        if all_pages:
+            for record in self.page_visuals.values():
+                await self._release(record)
+            self.page_visuals.clear()
         self.snapshot = self.visual = None
 
-    async def _capture(self, page: Any, frame: Any, limit: int, text: int) -> dict[str, Any]:
-        handle = await frame.evaluate_handle(SNAPSHOT_JS, {"limit":limit,"text":text})
-        return {"page":page,"frame":frame,"handle":handle,"page_id":self.page_id(page),
-                "frame_id":self.frame_id(frame),"observation_id":"observation-"+uuid.uuid4().hex,
-                "versions":self.versions(),"node_handles":{},"children":[]}
+    async def forget_page(self, page: Any) -> None:
+        await self._release(self.page_visuals.pop(page, None))
+
+    async def _capture(self, page: Any, frame: Any, limit: int, text: int, *,
+                       independent: bool = False) -> dict[str, Any]:
+        versions = self.versions()
+        page_id, frame_id, observation_id = self.page_id(page), self.frame_id(frame), self._new_id("observation-")
+        handle = await frame.evaluate_handle(_VISUAL_JS if independent else SNAPSHOT_JS,
+                                             {"limit":limit,"text":text})
+        return {"page":page,"frame":frame,"handle":handle,"page_id":page_id,
+                "frame_id":frame_id,"observation_id":observation_id,
+                "versions":versions,"independent":independent,"node_handles":{},"children":[]}
 
     async def capture(self, page: Any, *, max_elements: int = MAX_ELEMENTS,
                       max_text: int = MAX_TEXT, frame: str | None = None) -> dict[str, Any]:
@@ -140,10 +173,11 @@ class RefStore:
               total:s.total,truncated:s.total>s.rows.length,shadow_roots:s.roots-1,
               frames:document.querySelectorAll('iframe,frame').length})""")
             await self.validate(record,page)
+            await self._release(self.snapshot)
+            self._check_binding(record, page)
         except BaseException:
             await self._release(record)
             raise
-        await self._release(self.snapshot)
         self.snapshot = record
         self.references.clear()
         for index, row in enumerate(data["elements"]):
@@ -156,18 +190,27 @@ class RefStore:
                 "source":"dom","coverage":{"selected_frame":True,"subframes":"explicit --frame selection",
                   "open_shadow_dom":True,"closed_shadow_dom":False,"accessibility_tree":False}}
 
-    async def validate(self, record: dict[str, Any] | None, page: Any, *, check_mutations: bool = True) -> None:
-        """Keep realm/view/lease checks; only native SHM may defer mutations to its atomic guard."""
-        if not record or record["page"] is not page or page.is_closed() or record["versions"] != self.versions():
+    def _check_binding(self, record: dict[str, Any] | None, page: Any) -> dict[str, Any]:
+        if (not record or record["page"] is not page or page.is_closed()
+                or (not record.get("independent") and record["versions"] != self.versions())):
             raise ActionError("page or control ownership changed; observe again", code="stale_reference")
+        return record
+
+    async def validate(self, record: dict[str, Any] | None, page: Any, *,
+                       check_mutations: bool = True, viewport: bool = False) -> dict[str, Any] | None:
+        """Validate realm/view/lease; optionally return dimensions in the same remote turn."""
+        record = self._check_binding(record, page)
         try:
-            valid = await record["handle"].evaluate(_CHECK_JS, check_mutations)
+            valid = await record["handle"].evaluate(
+                _CHECK_JS, {"checkMutations": check_mutations, "viewport": viewport})
         except Exception as exc:
             raise ActionError("document or frame was replaced; observe again", code="stale_reference") from exc
         if not valid:
             raise ActionError("DOM, scroll or viewport changed; observe again", code="stale_reference")
         for child in record.get("children",[]):
             await self.validate(child,page,check_mutations=check_mutations)
+        self._check_binding(record, page)
+        return valid if viewport else None
 
     async def resolve(self, page: Any, reference: str) -> Any:
         item = self.references.get(reference)
@@ -187,22 +230,27 @@ class RefStore:
         if not await element.evaluate("el => el.isConnected && el.ownerDocument === document"):
             await element.dispose()
             raise ActionError("original node was detached", code="stale_reference")
+        self._check_binding(record, page)
         return element
 
-    async def viewport(self, page: Any, *, raw_destination: tuple[str, int] | None = None) -> dict[str, Any]:
+    async def viewport(self, page: Any, *, raw_destination: tuple[str, int] | None = None,
+                       independent: bool = False) -> dict[str, Any]:
+        # Independent exports do not replace the active viewer's observation.
         # Native SHM pixels and semantics are guarded atomically at dispatch.
-        # Observer delivery is not their authority; document/view/control still are.
         check_mutations = raw_destination is None
-        record = self.visual
+        record = self.page_visuals.get(page) if independent else self.visual
+        previous = record
         try:
             await self.validate(record,page,check_mutations=check_mutations)
         except ActionError:
-            record = await self._capture(page,getattr(page,"main_frame",page),0,0)
+            record = await self._capture(page,getattr(page,"main_frame",page),0,0,
+                                         independent=independent)
             try:
                 documents = await page.frame_documents() if hasattr(page,"frame_documents") else page.frames
                 for frame in documents:
                     if frame is not record["frame"]:
-                        record["children"].append(await self._capture(page,frame,0,0))
+                        record["children"].append(await self._capture(page,frame,0,0,
+                                                                      independent=independent))
             except BaseException:
                 await self._release(record)
                 raise
@@ -211,14 +259,18 @@ class RefStore:
                 pixels = {"png": await page.screenshot(full_page=False, timeout=20000, caret="initial")}
             else:
                 pixels = await page.capture_raw_frame(*raw_destination)
-            await self.validate(record,page,check_mutations=check_mutations)
-            dimensions = await record["handle"].evaluate("s => ({width:s.view[2],height:s.view[3]})")
+            dimensions = await self.validate(record,page,check_mutations=check_mutations,viewport=True)
+            if record is not previous:
+                await self._release(previous)
+            self._check_binding(record, page)
         except BaseException:
-            if record is not self.visual:
+            if record is not previous:
                 await self._release(record)
             raise
-        if record is not self.visual:
-            await self._release(self.visual)
-            self.visual = record
+        if record is not previous:
+            if independent:
+                self.page_visuals[page] = record
+            else:
+                self.visual = record
         return {**pixels,"viewport":dimensions,
                 **{key:record[key] for key in ("page_id","frame_id","observation_id")}}

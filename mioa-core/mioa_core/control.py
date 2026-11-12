@@ -26,10 +26,10 @@ class ControlError(RuntimeError):
 class ControlState:
     """Single-loop lease state; a check alone does NOT reserve an action boundary.
 
-    ``begin_run`` and ``finish_run`` are synchronous. Ownership transitions are
-    asynchronous and wait for the previously accepted action to finish. Call
-    ``pause`` after uncertain/cancelled side effects. No timeout or disconnect
-    silently transfers ownership back to the agent.
+    ``begin_run`` and ``finish_run`` are synchronous. Ownership transitions fence
+    every accepted domain action before granting the global human/Agent lease.
+    Domain boundaries serialize related work, not independent remote execution.
+    The default boundary is exclusive for active-page/legacy operations.
     """
 
     def __init__(self, *, page_id: str | None = None, frame_id: str | None = None):
@@ -46,8 +46,8 @@ class ControlState:
         self.reason: str | None = None
         self._pending_human: str | None = None
         self._condition = asyncio.Condition()
-        self._active_task: asyncio.Task[Any] | None = None
-        self._active_lease: tuple[str, str] | None = None
+        self._active: dict[int | None, tuple[asyncio.Task[Any], tuple[str, str]]] = {}
+        self._waiters: list[tuple[object, int | None]] = []
         self._revision_event = asyncio.Event()
 
     def snapshot(self) -> dict[str, Any]:
@@ -59,7 +59,7 @@ class ControlState:
                 "observation_id": self.observation_id,
                 "observation_revision": self.observation_revision,
                 "pending_human": self._pending_human is not None,
-                "in_flight": self._active_task is not None, "reason": self.reason}
+                "in_flight": bool(self._active), "reason": self.reason}
 
     def begin_run(self, run_id: str, *, page_id: str | None = None,
                   frame_id: str | None = None) -> dict[str, Any]:
@@ -67,7 +67,7 @@ class ControlState:
             raise ControlError("invalid_config", "run_id is required")
         if self.owner != "agent" or self._pending_human:
             raise ControlError("paused", "人工接管或暂停中；请显式恢复 Agent")
-        if self.run_id is not None or self._active_task is not None:
+        if self.run_id is not None or self._active:
             raise ControlError("busy", "已有运行或动作尚未结束")
         self.run_id = run_id
         self.owner_id = run_id
@@ -83,7 +83,7 @@ class ControlState:
     def finish_run(self, run_id: str) -> dict[str, Any]:
         if run_id != self.run_id:
             raise ControlError("stale_reference", "运行版本已改变")
-        if self._active_task is not None:
+        if self._active:
             raise ControlError("busy", "动作仍在执行，不能释放运行")
         self.run_id = None
         self.run_revision += 1
@@ -94,7 +94,7 @@ class ControlState:
         self._signal_revision()
         return self.snapshot()
 
-    def set_page(self, page_id: str, frame_id: str | None) -> None:
+    def set_page(self, page_id: str | None, frame_id: str | None) -> None:
         if (page_id, frame_id) != (self.page_id, self.frame_id):
             self.page_id, self.frame_id = page_id, frame_id
             self.page_revision += 1
@@ -156,7 +156,7 @@ class ControlState:
             self.pause("waiting_for_action_boundary")
             self._pending_human = viewer_id
             try:
-                await self._condition.wait_for(lambda: self._active_task is None)
+                await self._condition.wait_for(lambda: not self._active)
                 if self._pending_human != viewer_id:
                     raise ControlError("paused", "接管请求已断开或取消")
                 self.owner, self.owner_id = "human", viewer_id
@@ -177,7 +177,7 @@ class ControlState:
                 raise ControlError("stale_reference", "不能恢复已结束的运行")
             self.pause(reason)
             transition = self.owner_revision
-            await self._condition.wait_for(lambda: self._active_task is None)
+            await self._condition.wait_for(lambda: not self._active)
             if transition != self.owner_revision:
                 raise ControlError("busy", "恢复期间控制权再次改变")
             self.owner, self.owner_id = "agent", self.run_id
@@ -225,53 +225,86 @@ class ControlState:
             if expected is not None and expected != actual:
                 raise ControlError("stale_reference", "页面、画面或控制版本已改变，请重新观察")
 
+    def in_flight(self, execution_domain: int | None = None) -> bool:
+        """Return whether accepted work conflicts with this boundary."""
+        return any(self._conflicts(execution_domain, domain) for domain in self._active)
+
+    @staticmethod
+    def _conflicts(left: int | None, right: int | None) -> bool:
+        return left is None or right is None or left == right
+
     @asynccontextmanager
-    async def action(self, actor: str, owner_id: str, **versions: Any) -> AsyncIterator[None]:
+    async def _boundary(self, execution_domain: int | None, lease: tuple[str, str],
+                        validate: Any = None) -> AsyncIterator[None]:
+        if execution_domain is not None and (type(execution_domain) is not int or execution_domain < 0):
+            raise ControlError("invalid_config", "invalid execution domain")
         task = asyncio.current_task()
-        if task is self._active_task:
-            if self._active_lease != (actor, owner_id):
-                raise ControlError("busy", "嵌套动作不能改变控制租约")
-            self._check_versions(versions.get("page_id"), versions.get("frame_id"),
-                                 versions.get("observation_id"), versions.get("owner_revision"))
-            yield
-            return
-        expected_run = self.run_id if actor == "agent" else None
-        if expected_run is not None and owner_id != expected_run:
-            raise ControlError("busy", "此动作不属于当前运行")
-        while True:
-            if actor == "agent":
-                await self.wait_agent(expected_run)
-            async with self._condition:
-                if actor == "agent" and (self.owner != "agent" or self._pending_human):
-                    continue
-                self.check_write(actor, owner_id, **versions)
-                if self._active_task is not None:
+        for domain, (active, active_lease) in self._active.items():
+            if active is task:
+                if domain != execution_domain or (lease[0] != "observation" and active_lease != lease):
+                    raise ControlError("busy", "嵌套动作不能改变控制租约或执行域")
+                if validate is not None:
+                    validate()
+                yield
+                return
+        waiter = (object(), execution_domain)
+        async with self._condition:
+            self._waiters.append(waiter)
+            try:
+                while True:
+                    if validate is not None:
+                        validate()
+                    earlier = self._waiters[:self._waiters.index(waiter)]
+                    if (not self.in_flight(execution_domain)
+                            and not any(self._conflicts(execution_domain, domain) for _, domain in earlier)):
+                        if len(self._active) >= 8:
+                            raise ControlError("busy", "execution domain capacity exhausted")
+                        self._active[execution_domain] = (task, lease)
+                        break
                     await self._condition.wait()
-                    continue
-                self._active_task, self._active_lease = task, (actor, owner_id)
-                break
+            finally:
+                self._waiters.remove(waiter)
+                self._condition.notify_all()
         try:
             yield
-        except asyncio.CancelledError:
-            self.pause("action_cancelled_side_effects_unknown")
-            raise
         finally:
             async with self._condition:
-                self._active_task = self._active_lease = None
+                del self._active[execution_domain]
                 self._condition.notify_all()
 
     @asynccontextmanager
-    async def observation(self) -> AsyncIterator[None]:
-        task = asyncio.current_task()
-        if task is self._active_task:
+    async def action(self, actor: str, owner_id: str, *,
+                     execution_domain: int | None = None, **versions: Any) -> AsyncIterator[None]:
+        expected_run = self.run_id if actor == "agent" else None
+        nested = any(active is asyncio.current_task() for active, _ in self._active.values())
+
+        def validate() -> None:
+            if expected_run is not None and self.run_id != expected_run:
+                raise ControlError("stale_reference", "等待中的运行已经结束或改变")
+            if nested:
+                self._check_versions(versions.get("page_id"), versions.get("frame_id"),
+                                     versions.get("observation_id"), versions.get("owner_revision"))
+            else:
+                self.check_write(actor, owner_id, **versions)
+
+        while True:
+            if actor == "agent" and not nested:
+                await self.wait_agent(expected_run)
+            accepted = False
+            try:
+                async with self._boundary(execution_domain, (actor, owner_id), validate):
+                    accepted = True
+                    try:
+                        yield
+                    except asyncio.CancelledError:
+                        self.pause("action_cancelled_side_effects_unknown")
+                        raise
+                return
+            except ControlError as exc:
+                if accepted or nested or actor != "agent" or exc.code != "paused":
+                    raise
+
+    @asynccontextmanager
+    async def observation(self, *, execution_domain: int | None = None) -> AsyncIterator[None]:
+        async with self._boundary(execution_domain, ("observation", "")):
             yield
-            return
-        async with self._condition:
-            await self._condition.wait_for(lambda: self._active_task is None)
-            self._active_task, self._active_lease = task, ("observation", "")
-        try:
-            yield
-        finally:
-            async with self._condition:
-                self._active_task = self._active_lease = None
-                self._condition.notify_all()

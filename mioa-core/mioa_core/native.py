@@ -14,24 +14,22 @@ import hashlib
 import inspect
 import json
 import math
-import os
 import re
-import secrets
-import signal
-import socket
 import struct
-import time
 from dataclasses import dataclass
 from functools import wraps
-from pathlib import Path
-from typing import Any, Callable
+from pathlib import PurePath
+from typing import Any, AsyncIterator, Callable
 from urllib.parse import unquote, urlsplit
+from mioa_os_api import ArtifactContent, BlockingCalls, ChildProcess, ChildProcesses, FileExports, HostFiles, ManagedPeerIdentity, ProcessEnvironment, ProcessIdentity, ProcessOutput, ProfileLease, ProfileLeaseCopy, ProfileLeases, ProxySecrets, SecureRandom, StreamConnections, SupervisorChannel, UnixEndpoint, UnixEndpoints, UnixMessages
 
-from .native_spec import NativeError, resolve_proxy, validate_native_spec
+from .native_spec import NativeError, _secure_bytes, resolve_proxy, validate_native_spec
 
 MAX_MESSAGE = 32 * 1024 * 1024
 MAX_LOG = 1024 * 1024
 DEFAULT_TIMEOUT = 30000
+# POSIX SIGTERM as encoded in a negative wait status; native runtimes are macOS-only.
+_EXIT_SIGTERM = -15
 # A render-only native rejection is a certain non-dispatch, so a rebind retry is
 # never a replay of input that may already have been delivered.
 RENDER_REBINDS = 2
@@ -54,15 +52,20 @@ def _render_only_rejection(exc: ProtocolError) -> bool:
     return details.get("code") == -32042 and details.get("message") == RENDER_ONLY_REJECTION
 
 
-def _deadline(timeout: float | None) -> float:
-    return time.monotonic() + (DEFAULT_TIMEOUT if timeout is None else timeout) / 1000
+def _deadline(page: NativePage | NativeFrame, timeout: float | None) -> float:
+    return page.context.owner.monotonic_time() + (DEFAULT_TIMEOUT if timeout is None else timeout) / 1000
 
 
-def _remaining(deadline: float) -> float:
-    value = deadline - time.monotonic()
+def _remaining(page: NativePage | NativeFrame, deadline: float) -> float:
+    value = deadline - page.context.owner.monotonic_time()
     if value <= 0:
         raise NativeError("timeout", "native operation deadline exceeded")
     return value
+
+
+def _validate_load_state(state: str) -> None:
+    if state not in {"load", "domcontentloaded", "networkidle", "commit"}:
+        raise NativeError("invalid_config", f"unknown load state {state!r}")
 
 
 def _bounded(function: Callable) -> Callable:
@@ -75,55 +78,86 @@ def _bounded(function: Callable) -> Callable:
             async with asyncio.timeout(timeout / 1000):
                 return await function(*args, **kwargs)
         except TimeoutError as exc:
-            raise NativeError("timeout", f"{function.__qualname__} exceeded {timeout:g}ms; action side effects may be unknown") from exc
+            error = NativeError("timeout", f"{function.__qualname__} exceeded {timeout:g}ms; action side effects may be unknown")
+            error.startup_stage = getattr(exc, "startup_stage", "engine_start")
+            raise error from exc
     return bounded
 
 
 class _WebSocket:
     """RFC6455 client: no extensions, masked client frames, bounded messages."""
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        self.reader, self.writer = reader, writer
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, random: SecureRandom):
+        self.reader, self.writer, self.random = reader, writer, random
         self.lock = asyncio.Lock()
         self.closed = False
 
     @classmethod
-    async def connect(cls, url: str) -> _WebSocket:
+    async def connect(cls, url: str, random: SecureRandom, *,
+                      connections: StreamConnections) -> _WebSocket:
         parsed = urlsplit(url)
         if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "::1", "localhost"} or parsed.username:
             raise NativeError("verification_failed", "native endpoint must be a loopback ws URL")
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(parsed.hostname, parsed.port or 80, limit=MAX_MESSAGE + 65536), 5)
+        reader, writer = await asyncio.wait_for(
+            connections.connect_tcp(parsed.hostname, parsed.port or 80, limit=MAX_MESSAGE + 65536), 5)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        return await cls._upgrade(reader, writer, path, f"{host}:{parsed.port or 80}", random)
+
+    @classmethod
+    async def connect_owned_unix(cls, sock: Any, peer: object,
+                                 managed_identity: ManagedPeerIdentity, random: SecureRandom, *,
+                                 connections: StreamConnections) -> _WebSocket:
+        """Adopt a connected Unix socket only after OS peer verification."""
         try:
-            key = base64.b64encode(secrets.token_bytes(16)).decode()
-            path = parsed.path or "/"
-            if parsed.query:
-                path += "?" + parsed.query
-            host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-            writer.write((f"GET {path} HTTP/1.1\r\nHost: {host}:{parsed.port or 80}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode("ascii"))
+            verified = managed_identity.verify_child(sock, peer)
+            if not verified:
+                raise NativeError("verification_failed", "native peer identity does not match supervised child")
+            reader, writer = await connections.adopt_unix(sock, limit=MAX_MESSAGE + 65536)
+        except BaseException:
+            sock.close()
+            raise
+        return await cls._upgrade(reader, writer, "/", "localhost:0", random)
+
+    @classmethod
+    async def _upgrade(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                       path: str, host: str, random: SecureRandom) -> _WebSocket:
+        try:
+            key = base64.b64encode(_secure_bytes(random, 16)).decode()
+            writer.write((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode("ascii"))
             await writer.drain()
             raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
             lines = raw.decode("latin1").split("\r\n")
             headers = {name.lower():value.strip() for name,value in (line.split(":",1) for line in lines[1:] if ":" in line)}
             expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-            if len(raw) > 65536 or " 101 " not in lines[0] or headers.get("sec-websocket-accept", "") != expected or headers.get("upgrade", "").lower() != "websocket" or "upgrade" not in headers.get("connection", "").lower() or "sec-websocket-extensions" in headers:
+            status = lines[0].split(" ", 2)
+            connection = {token.strip().lower() for token in headers.get("connection", "").split(",")}
+            if (len(raw) > 65536 or status[:2] != ["HTTP/1.1", "101"]
+                    or headers.get("sec-websocket-accept", "") != expected
+                    or headers.get("upgrade", "").lower() != "websocket" or "upgrade" not in connection
+                    or "sec-websocket-extensions" in headers):
                 raise NativeError("protocol_error", "invalid native websocket handshake")
-            return cls(reader, writer)
+            return cls(reader, writer, random)
         except BaseException:
             writer.close()
             await writer.wait_closed()
             raise
 
-    async def send(self, payload: bytes, opcode: int = 1) -> None:
+    async def send(self, payload: bytes, opcode: int = 1, *, abort: Callable[[], bool] | None = None) -> None:
         if self.closed:
             raise NativeError("protocol_error", "native websocket closed")
         if len(payload) > MAX_MESSAGE:
             raise NativeError("invalid_config", "CDP message exceeds transport bound")
-        mask = secrets.token_bytes(4)
+        mask = _secure_bytes(self.random, 4)
         length = len(payload)
         header = bytes((0x80 | opcode, 0x80 | length)) if length < 126 else bytes((0x80 | opcode, 0x80 | (126 if length <= 65535 else 127))) + struct.pack("!H" if length <= 65535 else "!Q", length)
         masked = bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
         async with self.lock:
             if self.closed:
                 raise NativeError("protocol_error", "native websocket closed")
+            if abort is not None and abort():
+                raise NativeError("protocol_error", "native command no longer pending")
             if opcode == 8:
                 self.closed = True
             self.writer.write(header + mask + masked)
@@ -184,6 +218,8 @@ class _CDP:
         self.sequence = 0
         self.pending: dict[int, tuple[asyncio.Future, str, str | None]] = {}
         self.listeners: list[Callable] = []
+        self.execution_domain = 0
+        self.execution_epoch = 0
         self.event_tasks: set[asyncio.Future] = set()
         self.event_errors: list[str] = []
         self.failure: BaseException | None = None
@@ -233,6 +269,8 @@ class _CDP:
                             future.set_result(result or {})
                     self.pending.pop(message["id"], None)
                 else:
+                    message["_execution_domain"] = self.execution_domain
+                    message["_execution_epoch"] = self.execution_epoch
                     for listener in tuple(self.listeners):
                         self._task(listener(message))
         except asyncio.CancelledError:
@@ -246,6 +284,8 @@ class _CDP:
             self.pending.clear()
 
     async def send(self, method: str, params: dict[str, Any] | None = None, session: str | None = None, *, timeout: float = 30) -> dict[str, Any]:
+        if getattr(self, "revoked", False):
+            raise NativeError("stale_reference", "execution incarnation is revoked")
         if self.failure or self.reader.done():
             raise NativeError("protocol_error", f"native connection unavailable: {self.failure}")
         self.sequence += 1
@@ -255,16 +295,28 @@ class _CDP:
         frame = {"id": sequence, "method": method, "params": params or {}}
         if session:
             frame["sessionId"] = session
+        write_task = None
         try:
             async with asyncio.timeout(timeout):
-                await self.socket.send(json.dumps(frame, ensure_ascii=False, allow_nan=False).encode())
+                payload = json.dumps(frame, ensure_ascii=False, allow_nan=False).encode()
+                write_task = asyncio.create_task(self.socket.send(payload, abort=future.done))
+                done, _ = await asyncio.wait((write_task, future), return_when=asyncio.FIRST_COMPLETED)
+                if future in done and not future.cancelled() and future.exception() is not None:
+                    return await future
+                await write_task
                 return await future
         except TimeoutError as exc:
             raise NativeError("timeout", f"{method} exceeded {timeout:g}s; action side effects may be unknown") from exc
         finally:
             self.pending.pop(sequence, None)
+            if write_task is not None:
+                if not write_task.done():
+                    write_task.cancel()
+                await asyncio.gather(write_task, return_exceptions=True)
             if not future.done():
                 future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     async def close(self) -> None:
         try:
@@ -317,12 +369,16 @@ class NativeContext:
         self._pages: dict[str, NativePage] = {}
         self._adopting: dict[str, asyncio.Task] = {}
         self._callbacks: dict[str, list[Callable]] = {}
+        self._peer_sessions: list[NativeSession] = []
+        self._application_root = self
+        self._application_lock = asyncio.Lock()
         self.closed = False
         cdp.listeners.append(self._event)
 
     @property
     def pages(self) -> list[NativePage]:
-        return [page for page in self._pages.values() if not page.is_closed()]
+        return ([page for page in self._pages.values() if not page.is_closed() and getattr(self.cdp, "failure", None) is None]
+                + [page for session in self._peer_sessions for page in session.context.pages])
 
     def on(self, event: str, callback: Callable) -> None:
         if event not in {"request", "page", "close"}:
@@ -344,7 +400,7 @@ class NativeContext:
     async def initialize(self) -> None:
         # Native LP's pre-context STARTUP target is not a page. Create the real
         # persistent target explicitly before enabling target discovery.
-        await self.new_page()
+        await self._new_local_page()
         await self.cdp.send("Target.setDiscoverTargets", {"discover": True})
         targets = await self.cdp.send("Target.getTargets")
         if not isinstance(targets.get("targetInfos"), list):
@@ -354,6 +410,8 @@ class NativeContext:
                 await self._adopt(target)
 
     def _event(self, event: dict[str, Any]) -> None:
+        if self.closed or getattr(self.cdp, "revoked", False):
+            return
         method, params = event.get("method"), event.get("params", {})
         if method == "Target.targetCreated" and params.get("targetInfo", {}).get("type") == "page":
             self.cdp._task(self._adopt(params["targetInfo"]))
@@ -368,7 +426,12 @@ class NativeContext:
             info = params.get("targetInfo", {})
             page = self._pages.get(info.get("targetId"))
             if page:
-                page._url = info.get("url", page._url)
+                url = info.get("url", page._url)
+                if url != page._url:
+                    page._target_url_revision += 1
+                    page._url = url
+                if isinstance(info.get("title"), str):
+                    page._title = info["title"]
         else:
             for page in tuple(self._pages.values()):
                 if event.get("sessionId") == page.session_id:
@@ -376,42 +439,109 @@ class NativeContext:
                     break
 
     async def _adopt(self, target: dict[str, Any]) -> NativePage:
+        if self.closed or getattr(self.cdp, "revoked", False):
+            raise NativeError("stale_reference", "execution incarnation is revoked")
         target_id = target.get("targetId")
         if not isinstance(target_id, str) or not target_id or target_id == "TID-STARTUP":
             raise NativeError("protocol_error", "native runtime returned invalid/uninitialized page target")
-        existing = self._pages.get(target_id)
-        if existing:
-            if target_id in self._adopting:
-                await self._adopting[target_id]
-            return existing
-        if target_id in self._adopting:
-            return await self._adopting[target_id]
-        async def attach() -> NativePage:
-            reply = await self.cdp.send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
-            session_id = reply.get("sessionId")
-            if not isinstance(session_id, str) or not session_id or session_id == "STARTUP":
-                raise NativeError("protocol_error", "native target attach omitted real session ID")
-            page = NativePage(self, target_id, session_id, target.get("url", "about:blank"))
-            self._pages[target_id] = page
-            try:
-                await page._initialize()
-            except BaseException:
-                self._pages.pop(target_id, None)
-                raise
-            self._emit("page", page)
-            return page
-        task = asyncio.create_task(attach())
-        self._adopting[target_id] = task
-        try:
-            return await task
-        finally:
-            self._adopting.pop(target_id, None)
+        task = self._adopting.get(target_id)
+        if task is None:
+            existing = self._pages.get(target_id)
+            if existing is not None:
+                if existing.is_closed():
+                    raise NativeError("stale_reference", "page target is no longer live")
+                return existing
 
-    async def new_page(self) -> NativePage:
-        if self.closed:
-            raise NativeError("protocol_error", "context is closed")
+            async def attach() -> NativePage:
+                reply = await self.cdp.send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+                session_id = reply.get("sessionId")
+                if not isinstance(session_id, str) or not session_id or session_id == "STARTUP":
+                    raise NativeError("protocol_error", "native target attach omitted real session ID")
+                page = NativePage(self, target_id, session_id, target.get("url", "about:blank"))
+                if isinstance(target.get("title"), str):
+                    page._title = target["title"]
+                self._pages[target_id] = page
+                try:
+                    await page._initialize()
+                    if self.closed or page.is_closed():
+                        raise NativeError("stale_reference", "page target was revoked while attaching")
+                except BaseException:
+                    self._pages.pop(target_id, None)
+                    raise
+                self._emit("page", page)
+                return page
+
+            def finished(done: asyncio.Task) -> None:
+                if self._adopting.get(target_id) is done:
+                    self._adopting.pop(target_id)
+                if not done.cancelled():
+                    done.exception()  # The context owns completion even if every waiter cancels.
+
+            task = asyncio.create_task(attach())
+            self._adopting[target_id] = task
+            task.add_done_callback(finished)
+        page = await asyncio.shield(task)
+        if self.closed or page.is_closed():
+            raise NativeError("stale_reference", "page target is no longer live")
+        return page
+
+    async def _new_local_page(self) -> NativePage:
+        if self.closed or getattr(self.cdp, "revoked", False):
+            raise NativeError("stale_reference", "execution domain is closed")
         reply = await self.cdp.send("Target.createTarget", {"url": "about:blank"})
         return await self._adopt({"targetId": reply.get("targetId"), "url": "about:blank"})
+
+    async def new_page(self, *, synchronize_with: NativePage | None = None) -> NativePage:
+        root = self._application_root
+        if root.closed:
+            raise NativeError("stale_reference", "context is closed")
+        if synchronize_with is not None:
+            if synchronize_with not in root.pages or synchronize_with.is_closed():
+                raise NativeError("stale_reference", "synchronous page group is no longer live")
+            return await synchronize_with.context._new_local_page()
+        process = root.owner.process
+        if not isinstance(process, _SupervisedProcess):
+            return await self._new_local_page()
+        return await root._new_application()
+
+    def application_domain(self) -> int:
+        """Choose local admission identity; Host still decides actual admission."""
+        root = self._application_root
+        if root.closed:
+            raise NativeError("stale_reference", "context is closed")
+        process = root.owner.process
+        if not isinstance(process, _SupervisedProcess):
+            raise NativeError("capability_unavailable", "managed application creation requires supervision")
+        domain = next((item for item in process.supervisor.application_domains
+                       if item not in process.supervisor._reserved_domains), None)
+        if domain is None:
+            raise NativeError("busy", "managed application domain capacity is exhausted")
+        return domain
+
+    async def _new_application(self, domain: int | None = None) -> NativePage:
+        root = self._application_root
+        process = root.owner.process
+        async with root._application_lock:
+            if domain is None:
+                domain = root.application_domain()
+            elif (root.closed or domain not in process.supervisor.application_domains
+                  or domain in process.supervisor._reserved_domains):
+                raise NativeError("busy", "application admission changed before dispatch")
+            supervisor = process.supervisor
+            peer = await adopt_supervised_native(
+                process.profile_name, root.owner.config, supervisor,
+                process.profile_launch_id, process.profile_control, domain=domain,
+                random=root.owner.random, artifact_content=root.owner.artifact_content,
+                connections=root.owner.connections, files=root.owner.files)
+            root._peer_sessions.append(peer)
+            peer.context._application_root = root
+            peer.context._callbacks = root._callbacks
+            for listener in root.cdp.listeners:
+                if listener != root._event:
+                    peer.cdp.listeners.append(listener)
+            page = peer.context.pages[0]
+            root._emit("page", page)
+            return page
 
     async def cookies(self, urls: str | list[str] | None = None) -> list[dict[str, Any]]:
         page = self.pages[0] if self.pages else await self.new_page()
@@ -438,15 +568,22 @@ class NativePage:
         self.frame_id: str | None = None
         self.observation_id = 0
         self._main_frame_commit = 0
+        self._committed_loader: str | None = None
         self._url, self._closed = url, False
+        self._target_url_revision = 0
+        self._title = ""
         self._responses: dict[str, NativeResponse] = {}
         self._requests: dict[str, str | None] = {}
+        self._request_generation = 0
         self._document_response: NativeResponse | None = None
         self._execution_context: int | None = None
         self._frame_contexts: dict[str, int] = {}
         self._frame_ids: set[str] = set()
         self._frames: dict[str, NativeFrame] = {}
-        self.mouse, self.keyboard = NativeMouse(self), NativeKeyboard(self)
+        session = getattr(context, "owner", None)
+        platform = getattr(session, "platform", "Darwin")
+        self.mouse = NativeMouse(self)
+        self.keyboard = NativeKeyboard(self, platform=platform)
         self._native_input_batch: tuple[asyncio.Task, list[dict[str, Any]]] | None = None
         self._site_icon: NativeSiteIcon | None = None
         self._site_icon_version: tuple[str, int] | None = None
@@ -456,8 +593,18 @@ class NativePage:
     def url(self) -> str:
         return self._url
 
+    @property
+    def cached_title(self) -> str:
+        """Last observed title; reading inventory must not execute page script."""
+        return self._title
+
+    @property
+    def cached_site_icon(self) -> NativeSiteIcon | None:
+        return self._site_icon
+
     def is_closed(self) -> bool:
-        return self._closed
+        return (self._closed or getattr(self.context.cdp, "revoked", False)
+                or getattr(self.context.cdp, "failure", None) is not None)
 
     def _take_frames(self) -> list[NativeFrame]:
         frames = list(self._frames.values())
@@ -489,7 +636,12 @@ class NativePage:
 
     async def frame_documents(self) -> list[NativePage | NativeFrame]:
         """Return actual target documents; every child requires its own context."""
+        revision = self.observation_id
+        def check_revision() -> None:
+            if self.is_closed() or self.observation_id != revision:
+                raise NativeError("stale_reference", "native document changed during frame enumeration")
         tree = await self._send("Page.getFrameTree")
+        check_revision()
         identifiers: list[str] = []
         def collect(branch: dict[str, Any]) -> None:
             identifier = branch.get("frame", {}).get("id")
@@ -512,6 +664,7 @@ class NativePage:
         for identifier in identifiers[1:]:
             frame = self._frame_document(identifier)
             await frame._ensure_context()
+            check_revision()
             documents.append(frame)
         return documents
 
@@ -530,12 +683,20 @@ class NativePage:
     async def _initialize(self) -> None:
         await self._send("Page.enable")
         await self._send("Network.enable")
-        tree = await self._send("Page.getFrameTree")
+        deadline = _deadline(self, DEFAULT_TIMEOUT)
+        while True:
+            revision = self.observation_id, self._target_url_revision
+            tree = await self._send("Page.getFrameTree", timeout=_remaining(self, deadline))
+            if self.is_closed():
+                raise NativeError("stale_reference", "page target was revoked while reading its frame tree")
+            if revision == (self.observation_id, self._target_url_revision):
+                break
         frame = tree.get("frameTree", {}).get("frame", {})
         if not isinstance(frame.get("id"), str) or not frame["id"]:
             raise NativeError("protocol_error", "native page omitted main frame identity")
         self.frame_id = frame["id"]
-        self._url = frame.get("url", self._url)
+        if "url" in frame:
+            self._url = frame["url"] + frame.get("urlFragment", "")
         def register(branch: dict[str, Any]) -> None:
             identifier = branch.get("frame", {}).get("id")
             if isinstance(identifier, str):
@@ -556,8 +717,12 @@ class NativePage:
             self._discard_frames()
             if not frame.get("parentId"):
                 self._main_frame_commit += 1
+                loader = frame.get("loaderId")
+                self._committed_loader = loader if isinstance(loader, str) and loader else None
                 self.frame_id = frame.get("id", self.frame_id)
-                self._url = frame.get("url", self._url)
+                if "url" in frame:
+                    self._url = frame["url"] + frame.get("urlFragment", "")
+                self._title = ""
                 self._execution_context = None
                 self._frame_ids = {self.frame_id}
                 self._frame_contexts.clear()
@@ -565,6 +730,8 @@ class NativePage:
                 self._site_icon_version = None
         elif method == "Page.frameAttached":
             self._frame_ids.add(params["frameId"])
+            self.observation_id += 1
+            self._discard_frames()
         elif method == "Page.frameDetached":
             self._frame_ids.discard(params.get("frameId"))
             self._frame_contexts.pop(params.get("frameId"), None)
@@ -573,6 +740,7 @@ class NativePage:
         elif method == "Page.navigatedWithinDocument":
             if params.get("frameId") == self.frame_id:
                 self._main_frame_commit += 1
+                self._committed_loader = None
                 self._url = params.get("url", self._url)
             self.observation_id += 1
             self._discard_frames()
@@ -599,15 +767,18 @@ class NativePage:
             request = params.get("request", {})
             request_id = params.get("requestId")
             if request_id:
+                self._request_generation += 1
                 self._requests[request_id] = params.get("frameId")
             headers = {str(k).lower(): str(v) for k, v in request.get("headers", {}).items()}
             self.context._emit("request", NativeRequest(request.get("url", ""), headers, str(params.get("type", "other")).lower(), request.get("method", "GET")))
         elif method == "Network.responseReceived":
             response = params.get("response", {})
             item = NativeResponse(response.get("url", ""), int(response.get("status", 0)), {str(k).lower(): str(v) for k, v in response.get("headers", {}).items()})
-            self._responses[params.get("requestId", "")] = item
-            if len(self._responses) > 256:
-                self._responses.pop(next(iter(self._responses)))
+            loader_id = params.get("loaderId")
+            if params.get("type") == "Document" and isinstance(loader_id, str) and loader_id:
+                self._responses[loader_id] = item
+                if len(self._responses) > 256:
+                    self._responses.pop(next(iter(self._responses)))
             if params.get("type") == "Document" and params.get("frameId") == self.frame_id:
                 self._document_response = item
         elif method in {"Network.loadingFinished", "Network.loadingFailed"}:
@@ -643,10 +814,16 @@ class NativePage:
         return _remote_value(await self._evaluate_remote(expression, arg, True))
 
     async def evaluate_handle(self, expression: str, arg: Any = _MISSING) -> NativeJSHandle:
-        reply = await self._evaluate_remote(expression, arg, False)
+        revision = self.observation_id
+        try:
+            reply = await self._evaluate_remote(expression, arg, False)
+        except ProtocolError as exc:
+            if self.is_closed() or revision != self.observation_id:
+                raise NativeError("stale_reference", "target changed while creating remote handle") from exc
+            raise
         if not isinstance(reply.get("result"), dict):
             raise NativeError("protocol_error", "native handle evaluation omitted result")
-        return _make_handle(self, reply["result"])
+        return await _make_handle(self, reply["result"], revision)
 
     async def query_selector(self, selector: str) -> NativeElementHandle | None:
         handle = await self.evaluate_handle("selector => document.querySelector(selector)", selector)
@@ -656,7 +833,18 @@ class NativePage:
         return element
 
     async def title(self) -> str:
-        return await self.evaluate("document.title")
+        epoch = self.observation_id
+        try:
+            title = await self.evaluate("document.title")
+        except ProtocolError as exc:
+            if self.is_closed() or epoch != self.observation_id:
+                raise NativeError("stale_reference", "target changed while reading title") from exc
+            raise
+        if self.is_closed() or epoch != self.observation_id:
+            raise NativeError("stale_reference", "target changed while reading title")
+        if isinstance(title, str):
+            self._title = title
+        return title
 
     async def site_icon(self) -> NativeSiteIcon | None:
         """Read document icon metadata; unchanged revisions omit image bytes."""
@@ -681,13 +869,14 @@ class NativePage:
                 raise NativeError("protocol_error", "native icon returned an unknown revision")
             return self._site_icon
         state = reply.get("state")
-        if state not in {"missing", "loading", "ready", "failed", "unsupported"}:
+        if not isinstance(state, str) or state not in {"missing", "loading", "ready", "failed", "unsupported"}:
             raise NativeError("protocol_error", "native icon returned an invalid resource state")
         icon = None
         if state == "ready":
             digest, mime, encoded = (reply.get(key) for key in ("sha256", "mime", "data"))
             if (not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-                    or mime not in {"image/png", "image/x-icon"} or not isinstance(encoded, str)
+                    or not isinstance(mime, str) or mime not in {"image/png", "image/x-icon"}
+                    or not isinstance(encoded, str)
                     or not 0 < len(encoded) <= ((512 * 1024 + 2) // 3) * 4):
                 raise NativeError("protocol_error", "native icon exceeded its resource bounds")
             try:
@@ -702,53 +891,85 @@ class NativePage:
         self._site_icon_version, self._site_icon = version, icon
         return icon
 
-    async def _wait_for_commit(self, previous_epoch: int, deadline: float) -> None:
-        # A command response alone is not proof the old document was replaced.
-        # Both native protocols emit frameNavigated/navigatedWithinDocument.
-        while self.observation_id == previous_epoch:
+    async def _wait_for_commit(self, previous_commit: int, deadline: float) -> None:
+        # Context invalidation and child-frame events are not main-frame commits.
+        while True:
             if self.is_closed():
                 raise NativeError("stale_reference", "target closed during navigation")
-            await asyncio.sleep(min(0.01, _remaining(deadline)))
+            if self._main_frame_commit != previous_commit:
+                return
+            await asyncio.sleep(min(0.01, _remaining(self, deadline)))
 
+    async def _finish_navigation(self, previous_commit: int, wait_until: str, deadline: float,
+                                 loader_id: str | None = None) -> NativeResponse | None:
+        await self._wait_for_commit(previous_commit, deadline)
+        while True:
+            await self.wait_for_load_state(wait_until, timeout=_remaining(self, deadline) * 1000)
+            if wait_until == "commit":
+                break
+            revision = self._main_frame_commit, self._target_url_revision
+            current_url = await self.evaluate("location.href")
+            if self.is_closed():
+                raise NativeError("stale_reference", "target closed during navigation")
+            if revision != (self._main_frame_commit, self._target_url_revision):
+                continue
+            self._url = current_url
+            break
+        self.observation_id += 1
+        if self._committed_loader is not None:
+            return self._responses.get(self._committed_loader)
+        if self._document_response is None and loader_id:
+            self._document_response = self._responses.get(loader_id)
+        return self._document_response
 
     @_bounded
     async def goto(self, url: str, *, wait_until: str = "load", timeout: float = DEFAULT_TIMEOUT) -> NativeResponse | None:
-        deadline = _deadline(timeout)
+        _validate_load_state(wait_until)
+        deadline = _deadline(self, timeout)
         self._document_response = None
-        previous_epoch = self.observation_id
-        reply = await self._send("Page.navigate", {"url": url}, timeout=_remaining(deadline))
+        previous_commit = self._main_frame_commit
+        reply = await self._send("Page.navigate", {"url": url}, timeout=_remaining(self, deadline))
         if reply.get("errorText"):
             raise NativeError("network_unavailable", str(reply["errorText"]), details=reply)
         if reply.get("isDownload"):
             raise NativeError("capability_unavailable", "navigation produced a download, not a page")
         if reply.get("frameId"):
             self.frame_id = reply["frameId"]
-        await self._wait_for_commit(previous_epoch, deadline)
-        await self.wait_for_load_state(wait_until, timeout=_remaining(deadline) * 1000)
-        self._url = await self.evaluate("location.href")
-        self.observation_id += 1
-        if self._document_response is None and reply.get("loaderId"):
-            self._document_response = self._responses.get(reply["loaderId"])
-        return self._document_response
+        return await self._finish_navigation(previous_commit, wait_until, deadline, reply.get("loaderId"))
 
     @_bounded
     async def wait_for_load_state(self, state: str = "load", *, timeout: float = DEFAULT_TIMEOUT) -> None:
-        if state not in {"load", "domcontentloaded", "networkidle", "commit"}:
-            raise NativeError("invalid_config", f"unknown load state {state!r}")
-        deadline = _deadline(timeout)
+        _validate_load_state(state)
+        deadline = _deadline(self, timeout)
+        if state == "commit":
+            if self.is_closed():
+                raise NativeError("stale_reference", "target closed while waiting for commit")
+            _remaining(self, deadline)
+            return
         quiet_since: float | None = None
+        quiet_generation = self._request_generation
+        quiet_commit = self._main_frame_commit
         while True:
-            _remaining(deadline)
+            _remaining(self, deadline)
+            commit = self._main_frame_commit
             ready = await self.evaluate("document.readyState")
-            if state == "commit" or state == "domcontentloaded" and ready in {"interactive", "complete"} or state == "load" and ready == "complete":
+            if self.is_closed():
+                raise NativeError("stale_reference", "target closed while waiting for load state")
+            if commit != self._main_frame_commit:
+                quiet_since = None
+                continue
+            if state == "domcontentloaded" and ready in {"interactive", "complete"} or state == "load" and ready == "complete":
                 return
             if state == "networkidle" and ready == "complete" and not self._requests:
-                quiet_since = quiet_since or time.monotonic()
-                if time.monotonic() - quiet_since >= 0.5:
+                if quiet_since is None or quiet_generation != self._request_generation or quiet_commit != commit:
+                    quiet_since = self.context.owner.monotonic_time()
+                    quiet_generation = self._request_generation
+                    quiet_commit = commit
+                if self.context.owner.monotonic_time() - quiet_since >= 0.5:
                     return
             else:
                 quiet_since = None
-            await asyncio.sleep(min(0.05, _remaining(deadline)))
+            await asyncio.sleep(min(0.05, _remaining(self, deadline)))
 
     async def wait_for_timeout(self, timeout: float) -> None:
         if timeout < 0:
@@ -757,45 +978,52 @@ class NativePage:
 
     @_bounded
     async def wait_for_url(self, url: str, *, timeout: float = DEFAULT_TIMEOUT, wait_until: str = "load") -> None:
-        deadline = _deadline(timeout)
+        _validate_load_state(wait_until)
+        deadline = _deadline(self, timeout)
         while True:
-            self._url = await self.evaluate("location.href")
-            if fnmatch.fnmatchcase(self._url, url):
-                return await self.wait_for_load_state(wait_until, timeout=_remaining(deadline) * 1000)
-            await asyncio.sleep(min(0.05, _remaining(deadline)))
+            _remaining(self, deadline)
+            revision = self._main_frame_commit, self._target_url_revision
+            current_url = await self.evaluate("location.href")
+            if self.is_closed():
+                raise NativeError("stale_reference", "target closed while waiting for URL")
+            if revision != (self._main_frame_commit, self._target_url_revision):
+                continue
+            self._url = current_url
+            if self._url == url or fnmatch.fnmatchcase(self._url, url):
+                await self.wait_for_load_state(wait_until, timeout=_remaining(self, deadline) * 1000)
+                if revision == (self._main_frame_commit, self._target_url_revision):
+                    return
+                continue
+            await asyncio.sleep(min(0.05, _remaining(self, deadline)))
 
     @_bounded
     async def reload(self, *, wait_until: str = "load", timeout: float = DEFAULT_TIMEOUT) -> NativeResponse | None:
-        deadline = _deadline(timeout)
+        _validate_load_state(wait_until)
+        deadline = _deadline(self, timeout)
         self._document_response = None
-        previous_epoch = self.observation_id
-        await self._send("Page.reload", timeout=_remaining(deadline))
-        await self._wait_for_commit(previous_epoch, deadline)
-        await self.wait_for_load_state(wait_until, timeout=_remaining(deadline) * 1000)
-        self._url = await self.evaluate("location.href")
-        self.observation_id += 1
-        return self._document_response
+        previous_commit = self._main_frame_commit
+        await self._send("Page.reload", timeout=_remaining(self, deadline))
+        return await self._finish_navigation(previous_commit, wait_until, deadline)
 
     @_bounded
     async def go_back(self, *, wait_until: str = "load", timeout: float = DEFAULT_TIMEOUT) -> NativeResponse | None:
-        deadline = _deadline(timeout)
+        _validate_load_state(wait_until)
+        deadline = _deadline(self, timeout)
         history_commit = self._main_frame_commit
-        history = await self._send("Page.getNavigationHistory", timeout=_remaining(deadline))
+        history = await self._send("Page.getNavigationHistory", timeout=_remaining(self, deadline))
         if self.is_closed() or history_commit != self._main_frame_commit:
             raise NativeError("stale_reference", "target changed while reading navigation history")
         entries, index = history.get("entries"), history.get("currentIndex")
-        if not isinstance(entries, list) or type(index) is not int:
+        if not isinstance(entries, list) or type(index) is not int or not 0 <= index < len(entries):
             raise NativeError("protocol_error", "native navigation history is malformed")
-        if index <= 0:
+        if index == 0:
             return None
+        if not isinstance(entries[index - 1], dict) or type(entries[index - 1].get("id")) is not int:
+            raise NativeError("protocol_error", "native navigation history is malformed")
         self._document_response = None
-        previous_epoch = self.observation_id
-        await self._send("Page.navigateToHistoryEntry", {"entryId": entries[index - 1]["id"]}, timeout=_remaining(deadline))
-        await self._wait_for_commit(previous_epoch, deadline)
-        await self.wait_for_load_state(wait_until, timeout=_remaining(deadline) * 1000)
-        self._url = await self.evaluate("location.href")
-        self.observation_id += 1
-        return self._document_response
+        previous_commit = self._main_frame_commit
+        await self._send("Page.navigateToHistoryEntry", {"entryId": entries[index - 1]["id"]}, timeout=_remaining(self, deadline))
+        return await self._finish_navigation(previous_commit, wait_until, deadline)
 
     async def bring_to_front(self) -> None:
         await self._send("Page.bringToFront")
@@ -811,44 +1039,79 @@ class NativePage:
         self._site_icon = None
         self._site_icon_version = None
 
-    async def guarded_input(self, operation: str, args: dict[str, Any], fingerprint: str, *,
-                            rebind: Callable[[], Any] | None = None) -> None:
-        """Collect existing input semantics, then verify-and-dispatch in one native turn.
-
-        ``rebind`` refreshes the expected fingerprint from the current live render
-        after the caller revalidated its authorization scope. The runtime compares
-        that fingerprint before enqueuing any event, so only a render-only rejection
-        is retried; a document change mid-sequence is never replayed.
-        """
-        if (not isinstance(fingerprint, str) or len(fingerprint) != 64
+    async def guarded_input(self, operation: str, args: dict[str, Any], fingerprint: str | None = None, *,
+                            rebind: Callable[[], Any] | None = None,
+                            displayed: tuple[int, int] | None = None,
+                            channel_id: int | None = None) -> dict[str, Any] | None:
+        """Dispatch once; physical channels retain independent terminal authority."""
+        begin = operation in {"mouse.down", "keyboard.down"}
+        terminal = operation in {"mouse.up", "keyboard.up", "input.cancel"}
+        if (begin or terminal) != (channel_id is not None) or (channel_id is not None and
+                (type(channel_id) is not int or not 0 < channel_id <= 2**53 - 1)):
+            raise NativeError("invalid_config", "physical input requires a bounded channel identity")
+        if not terminal and displayed is None and (not isinstance(fingerprint, str) or len(fingerprint) != 64
                 or any(char not in "0123456789abcdef" for char in fingerprint)):
             raise NativeError("stale_reference", "native input requires the displayed render fingerprint")
+        if displayed is not None and (rebind is not None or len(displayed) != 2
+                or any(type(value) is not int or not 0 < value <= 2**53 - 1 for value in displayed)):
+            raise NativeError("invalid_config", "invalid displayed native input binding")
+        if channel_id is not None and rebind is not None:
+            raise NativeError("invalid_config", "physical input cannot be replayed")
         if self._native_input_batch is not None:
             raise NativeError("busy", "native input sequence is already being prepared")
-        family, method = operation.split(".", 1)
-        if family not in {"mouse", "keyboard"} or method not in {"move", "click", "wheel", "press", "insert_text"}:
-            raise NativeError("invalid_config", "unsupported guarded input operation")
-        events: list[dict[str, Any]] = []
-        self._native_input_batch = (asyncio.current_task(), events)
-        try:
-            await getattr(getattr(self, family), method)(**args)
-        finally:
-            self._native_input_batch = None
-        if not events:
-            raise NativeError("invalid_config", "native input sequence is empty")
-        rebinds = 0
-        while True:
+        if operation == "input.cancel":
             try:
-                await self._send("Input.dispatchNativeAction", {"expectedRenderFingerprint": fingerprint, "events": events}, timeout=20)
-                return
-            except ProtocolError as exc:
-                if rebind is None or rebinds >= RENDER_REBINDS or not _render_only_rejection(exc):
-                    raise
-                rebinds += 1
-            fingerprint = await rebind()
-            if (not isinstance(fingerprint, str) or len(fingerprint) != 64
-                    or any(char not in "0123456789abcdef" for char in fingerprint)):
-                raise NativeError("stale_reference", "native input requires the displayed render fingerprint")
+                return await self._send("Input.dispatchNativeAction", {"channelId": channel_id,
+                                        "channelPhase": "cancel", "events": []}, timeout=20)
+            finally:
+                self.mouse.buttons = 0
+                self.keyboard.modifiers = 0
+        family, method = operation.split(".", 1)
+        if family not in {"mouse", "keyboard"} or method not in {"move", "click", "wheel", "press", "insert_text", "down", "up"}:
+            raise NativeError("invalid_config", "unsupported guarded input operation")
+        state = self.mouse.x, self.mouse.y, self.mouse.buttons, self.keyboard.modifiers
+        events: list[dict[str, Any]] = []
+        try:
+            self._native_input_batch = (asyncio.current_task(), events)
+            try:
+                prepared = dict(args)
+                if operation == "mouse.down":
+                    await self.mouse.move(prepared.pop("x"), prepared.pop("y"))
+                if family == "keyboard" and method in {"down", "up"}:
+                    parts = prepared["key"].split("+") if prepared["key"] != "+" else ["+"]
+                    if not 0 < len(parts) <= 8 or len(set(parts)) != len(parts):
+                        raise NativeError("invalid_config", "invalid physical key chord")
+                    for part in parts if method == "down" else reversed(parts):
+                        await getattr(self.keyboard, method)(part)
+                else:
+                    await getattr(getattr(self, family), method)(**prepared)
+            finally:
+                self._native_input_batch = None
+            if not events:
+                raise NativeError("invalid_config", "native input sequence is empty")
+            rebinds = 0
+            while True:
+                try:
+                    guard = ({"expectedSceneRevision": displayed[0], "expectedVisualGeneration": displayed[1]}
+                             if displayed is not None else {"expectedRenderFingerprint": fingerprint})
+                    channel = ({"channelId": channel_id, "channelPhase": "begin" if begin else "end"}
+                               if channel_id is not None else {})
+                    result = await self._send("Input.dispatchNativeAction", {**guard, **channel, "events": events}, timeout=20)
+                    if terminal and result.get("status") == "reset":
+                        self.mouse.buttons = 0
+                        self.keyboard.modifiers = 0
+                    return result if terminal else None
+                except ProtocolError as exc:
+                    if rebind is None or rebinds >= RENDER_REBINDS or not _render_only_rejection(exc):
+                        raise
+                    rebinds += 1
+                fingerprint = await rebind()
+                if (not isinstance(fingerprint, str) or len(fingerprint) != 64
+                        or any(char not in "0123456789abcdef" for char in fingerprint)):
+                    raise NativeError("stale_reference", "native input requires the displayed render fingerprint")
+        except BaseException:
+            self.mouse.x, self.mouse.y, self.mouse.buttons, self.keyboard.modifiers = state
+            raise
 
     async def capture_raw_frame(self, path: str, slot: int) -> dict[str, Any]:
         """Raster directly into an LPFR producer-owned slot, with metadata-only CDP."""
@@ -875,11 +1138,14 @@ class NativePage:
         return reply
 
     @_bounded
-    async def screenshot(self, *, path: str | Path | None = None, full_page: bool = False, timeout: float = DEFAULT_TIMEOUT, type: str = "png", quality: int | None = None, caret: str = "initial") -> bytes:
+    async def screenshot(self, *, path: str | PurePath | None = None, full_page: bool = False, timeout: float = DEFAULT_TIMEOUT, type: str = "png", quality: int | None = None, caret: str = "initial") -> bytes:
         if caret != "initial":
             raise NativeError("capability_unavailable","native capture does not alter page caret styling")
         if type not in {"png", "jpeg"}:
             raise NativeError("capability_unavailable", f"screenshot format {type!r}")
+        exports = self.context._application_root.owner.file_exports if path is not None else None
+        if path is not None and exports is None:
+            raise NativeError("capability_unavailable", "Host has not installed file export authority")
         params: dict[str, Any] = {"format": type, "captureBeyondViewport": full_page}
         if quality is not None:
             params["quality"] = quality
@@ -898,7 +1164,7 @@ class NativePage:
         if not result.startswith(signature):
             raise NativeError("protocol_error", "native screenshot has wrong image signature")
         if path is not None:
-            Path(path).write_bytes(result)
+            exports.write_bytes(path, result)
         return result
 
     def locator(self, selector: str) -> NativeLocator:
@@ -942,11 +1208,14 @@ class _FrameMouse:
                 raise NativeError("capability_unavailable", "native frame owner geometry is unavailable")
             if abs(quad[1] - quad[3]) > 0.01 or abs(quad[0] - quad[6]) > 0.01 or abs(quad[2] - quad[4]) > 0.01 or abs(quad[5] - quad[7]) > 0.01:
                 raise NativeError("capability_unavailable", "transformed iframe pointer coordinates are unsupported")
-            return quad[0] + x * (quad[2] - quad[0]) / size[0], quad[1] + y * (quad[7] - quad[1]) / size[1]
+            point = quad[0] + x * (quad[2] - quad[0]) / size[0], quad[1] + y * (quad[7] - quad[1]) / size[1]
         finally:
             owner.disposed = True
             if not self.frame.root.is_closed() and owner.remote.get("objectId"):
                 await self.frame.root._send("Runtime.releaseObject", {"objectId": owner.remote["objectId"]})
+        if self.frame.is_closed():
+            raise NativeError("stale_reference", "child frame changed while resolving pointer coordinates")
+        return point
 
     async def move(self, x: float, y: float, **kwargs: Any) -> None:
         await self.frame.root.mouse.move(*await self._point(x, y), **kwargs)
@@ -997,6 +1266,8 @@ class NativeFrame:
                 if self.is_closed():
                     raise NativeError("stale_reference", "child document changed while resolving its execution context") from exc
                 raise NativeError("capability_unavailable", "child execution context is unavailable in this CDP target session", details=exc.details) from exc
+            if self.is_closed():
+                raise NativeError("stale_reference", "child document changed while resolving its execution context")
             identifier = reply.get("executionContextId")
             if type(identifier) is not int:
                 raise NativeError("capability_unavailable", "native runtime omitted child frame execution context")
@@ -1012,10 +1283,7 @@ class NativeFrame:
         return _remote_value(await self._evaluate_remote(expression, arg, True))
 
     async def evaluate_handle(self, expression: str, arg: Any = _MISSING) -> NativeJSHandle:
-        reply = await self._evaluate_remote(expression, arg, False)
-        if not isinstance(reply.get("result"), dict):
-            raise NativeError("protocol_error", "native frame evaluation omitted result")
-        return _make_handle(self, reply["result"])
+        return await NativePage.evaluate_handle(self, expression, arg)
 
     async def query_selector(self, selector: str) -> NativeElementHandle | None:
         handle = await self.evaluate_handle("selector => document.querySelector(selector)", selector)
@@ -1119,20 +1387,39 @@ class NativeLocator:
     async def wait_for(self, *, state: str = "visible", timeout: float = DEFAULT_TIMEOUT) -> None:
         if state not in {"attached", "detached", "visible", "hidden"}:
             raise NativeError("invalid_config", f"unknown locator wait state {state!r}")
-        deadline = _deadline(timeout)
+        deadline = _deadline(self.page, timeout)
         while True:
+            _remaining(self.page, deadline)
+            revision = self.page.observation_id
             count = await self.count()
+            if self.page.is_closed():
+                raise NativeError("stale_reference", "target closed while waiting for locator")
+            if revision != self.page.observation_id:
+                continue
             if state == "attached" and count or state == "detached" and not count:
                 return
             if state in {"visible", "hidden"}:
                 visible = await self.is_visible()
+                if self.page.is_closed():
+                    raise NativeError("stale_reference", "target closed while waiting for locator")
+                if revision != self.page.observation_id:
+                    continue
                 if visible == (state == "visible"):
                     return
-            await asyncio.sleep(min(0.05, _remaining(deadline)))
+            await asyncio.sleep(min(0.05, _remaining(self.page, deadline)))
 
-    async def _value(self, body: str, timeout: float) -> Any:
-        await self.wait_for(state="attached", timeout=timeout)
-        return await self._read("if (!el) throw new Error('locator detached'); " + body)
+    async def _value(self, body: str, timeout: float, *, side_effect: bool = False) -> Any:
+        deadline = _deadline(self.page, timeout)
+        while True:
+            await self.wait_for(state="attached", timeout=_remaining(self.page, deadline) * 1000)
+            revision = self.page.observation_id
+            value = await self._read("if (!el) throw new Error('locator detached'); " + body)
+            if self.page.is_closed():
+                raise NativeError("stale_reference", "target closed while reading locator")
+            if revision == self.page.observation_id:
+                return value
+            if side_effect:
+                raise NativeError("stale_reference", "target changed during locator action; outcome may have applied")
 
     @_bounded
     async def inner_text(self, *, timeout: float = DEFAULT_TIMEOUT) -> str:
@@ -1154,9 +1441,10 @@ class NativeLocator:
         return await self._read("return els.map(el => el.textContent || '');", strict=False)
 
     async def _point(self, timeout: float) -> tuple[float, float]:
-        deadline = _deadline(timeout)
-        await self.wait_for(state="visible", timeout=_remaining(deadline) * 1000)
+        deadline = _deadline(self.page, timeout)
+        await self.wait_for(state="visible", timeout=_remaining(self.page, deadline) * 1000)
         while True:
+            revision = self.page.observation_id
             point = await self._read("""if (!el) return null;
               if (el.disabled || el.getAttribute('aria-disabled')==='true') return null;
               el.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
@@ -1168,9 +1456,14 @@ class NativeLocator:
               const hit=document.elementFromPoint(x,y);
               if (hit!==el && !el.contains(hit) && hit!==el.getRootNode()?.host) return null;
               return {x,y};""")
+            if self.page.is_closed():
+                raise NativeError("stale_reference", "target closed while locating input point")
+            if revision != self.page.observation_id:
+                await self.wait_for(state="visible", timeout=_remaining(self.page, deadline) * 1000)
+                continue
             if point is not None:
                 return point["x"], point["y"]
-            await asyncio.sleep(min(0.05, _remaining(deadline)))
+            await asyncio.sleep(min(0.05, _remaining(self.page, deadline)))
 
     @_bounded
     async def click(self, *, timeout: float = DEFAULT_TIMEOUT, button: str = "left", click_count: int = 1, position: dict[str, float] | None = None) -> None:
@@ -1184,41 +1477,70 @@ class NativeLocator:
     async def hover(self, *, timeout: float = DEFAULT_TIMEOUT) -> None:
         await self.page.mouse.move(*await self._point(timeout))
 
+    async def _input_handle(self, timeout: float) -> NativeElementHandle:
+        if isinstance(self, NativeElementHandle):
+            self._check()
+            return self
+        await self.wait_for(state="attached", timeout=timeout)
+        steps = json.dumps(self.steps, ensure_ascii=False, allow_nan=False)
+        handle = await self.page.evaluate_handle(f"""(() => {{
+          const els=({_QUERY})({steps});
+          if (els.length!==1) throw new Error('input requires exactly one attached element');
+          return els[0];
+        }})()""")
+        if not isinstance(handle, NativeElementHandle):
+            await handle.dispose()
+            raise NativeError("stale_reference", "input element detached")
+        return handle
+
+    @contextlib.asynccontextmanager
+    async def _input_target(self, timeout: float) -> AsyncIterator[tuple[NativeElementHandle, NativeJSHandle]]:
+        handle = await self._input_handle(timeout)
+        try:
+            document = await handle.evaluate_handle("el => el.ownerDocument")
+            try:
+                yield handle, document
+            finally:
+                await document.dispose()
+        finally:
+            if handle is not self:
+                await handle.dispose()
+
     @_bounded
     async def fill(self, value: str, *, timeout: float = DEFAULT_TIMEOUT) -> None:
         await self.wait_for(state="visible", timeout=timeout)
-        await self._value("""if (el.disabled || el.readOnly) throw new Error('element is not editable');
-          el.focus();
-          if (el.tagName==='INPUT' || el.tagName==='TEXTAREA') {
-            if (typeof el.select !== 'function') throw new Error('input cannot select text');
-            el.select();
-          } else if (el.isContentEditable) {
-            const r=document.createRange();r.selectNodeContents(el);
-            const s=getSelection();s.removeAllRanges();s.addRange(r);
-          } else throw new Error('fill requires an input, textarea or contenteditable');
-          return true;""", timeout)
-        if value:
-            await self.page.keyboard.insert_text(value)
-        else:
-            await self.page.keyboard.press("Delete")
-        actual = await self._value("return el.isContentEditable ? el.textContent : el.value;", timeout)
-        if actual != value:
-            raise NativeError("verification_failed", "native text insertion did not produce requested editable value", details={"expected_length": len(value), "actual_length": len(actual or "")})
+        async with self._input_target(timeout) as (handle, document):
+            await handle._value("""if (el.disabled || el.readOnly) throw new Error('element is not editable');
+              el.focus();
+              if (el.tagName==='INPUT' || el.tagName==='TEXTAREA') {
+                if (typeof el.select !== 'function') throw new Error('input cannot select text');
+                el.select();
+              } else if (el.isContentEditable) {
+                const r=document.createRange();r.selectNodeContents(el);
+                const s=getSelection();s.removeAllRanges();s.addRange(r);
+              } else throw new Error('fill requires an input, textarea or contenteditable');
+              return true;""", timeout)
+            await handle._keyboard_input("insert_text" if value else "press", value or "Delete", document)
+            actual = await handle._value("return el.isContentEditable ? el.textContent : el.value;", timeout)
+            if actual != value:
+                raise NativeError("verification_failed", "native text insertion did not produce requested editable value", details={"expected_length": len(value), "actual_length": len(actual or "")})
 
     @_bounded
     async def press(self, key: str, *, timeout: float = DEFAULT_TIMEOUT) -> None:
-        await self._value("el.focus(); return true;", timeout)
-        await self.page.keyboard.press(key)
+        async with self._input_target(timeout) as (handle, document):
+            await handle._value("el.focus(); return true;", timeout)
+            await handle._keyboard_input("press", key, document)
 
     @_bounded
     async def press_sequentially(self, text: str, *, delay: float = 0, timeout: float = DEFAULT_TIMEOUT) -> None:
-        await self._value("el.focus(); return true;", timeout)
-        deadline = _deadline(timeout)
-        for character in text:
-            _remaining(deadline)
-            await self.page.keyboard.insert_text(character)
-            if delay:
-                await asyncio.sleep(min(delay / 1000, _remaining(deadline)))
+        async with self._input_target(timeout) as (handle, document):
+            await handle._value("el.focus(); return true;", timeout)
+            deadline = _deadline(self.page, timeout)
+            for character in text:
+                _remaining(self.page, deadline)
+                await handle._keyboard_input("insert_text", character, document)
+                if delay:
+                    await asyncio.sleep(min(delay / 1000, _remaining(self.page, deadline)))
 
     @_bounded
     async def select_option(self, values: str | dict[str, Any] | list[Any], *, timeout: float = DEFAULT_TIMEOUT) -> list[str]:
@@ -1230,7 +1552,7 @@ class NativeLocator:
           if (!el.multiple && matches.length>1) throw new Error('single select cannot choose multiple values');
           for (const option of el.options) option.selected=matches.includes(option);
           el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));
-          return matches.map(o=>o.value);""", timeout)
+          return matches.map(o=>o.value);""", timeout, side_effect=True)
         if selected is None:
             raise NativeError("invalid_config", "requested select option does not exist")
         return selected
@@ -1288,7 +1610,12 @@ class NativeMouse:
                 await asyncio.sleep(delay / 1000)
             await self.up(button=button, click_count=count)
 
-    async def wheel(self, delta_x: float, delta_y: float) -> None:
+    async def wheel(self, delta_x: float, delta_y: float, *,
+                    x: float | None = None, y: float | None = None) -> None:
+        if (x is None) != (y is None):
+            raise NativeError("invalid_config", "wheel requires both current coordinates")
+        if x is not None:
+            self.x, self.y = x, y
         await self.page._send("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": self.x, "y": self.y, "deltaX": delta_x, "deltaY": delta_y, "modifiers": self.page.keyboard.modifiers})
 
 
@@ -1305,12 +1632,12 @@ _MODIFIERS = {"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}
 
 
 class NativeKeyboard:
-    def __init__(self, page: NativePage):
-        self.page, self.modifiers = page, 0
+    def __init__(self, page: NativePage, *, platform: str = "Darwin"):
+        self.page, self.modifiers, self.platform = page, 0, platform
 
     def _key(self, key: str) -> tuple[str, str, int]:
         if key == "ControlOrMeta":
-            key = "Meta" if os.uname().sysname == "Darwin" else "Control"
+            key = "Meta" if self.platform == "Darwin" else "Control"
         if key in _KEYS:
             code, virtual = _KEYS[key]
             return (" " if key == "Space" else key), code, virtual
@@ -1361,8 +1688,9 @@ class NativeKeyboard:
                 await asyncio.sleep(delay / 1000)
 
 
-async def _version_endpoint(port: int) -> str:
-    reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 1)
+async def _version_endpoint(port: int, *, connections: StreamConnections) -> str:
+    reader, writer = await asyncio.wait_for(
+        connections.connect_tcp("127.0.0.1", port, limit=2**16), 1)
     try:
         writer.write(f"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode())
         await writer.drain()
@@ -1377,22 +1705,28 @@ async def _version_endpoint(port: int) -> str:
             body = await asyncio.wait_for(reader.readexactly(length), 1)
         elif headers.get(b"transfer-encoding", b"").strip() == b"chunked":
             chunks, length = [], 0
-            while True:
-                size = int((await reader.readline()).split(b";", 1)[0], 16)
-                if size == 0:
-                    break
-                length += size
-                if length > 65536:
-                    raise NativeError("protocol_error", "native discovery body exceeds bound")
-                chunks.append(await reader.readexactly(size))
-                if await reader.readexactly(2) != b"\r\n":
-                    raise NativeError("protocol_error", "malformed discovery chunk")
+            async with asyncio.timeout(1):
+                while True:
+                    size = int((await reader.readline()).split(b";", 1)[0], 16)
+                    if size == 0:
+                        break
+                    length += size
+                    if length > 65536:
+                        raise NativeError("protocol_error", "native discovery body exceeds bound")
+                    chunks.append(await reader.readexactly(size))
+                    if await reader.readexactly(2) != b"\r\n":
+                        raise NativeError("protocol_error", "malformed discovery chunk")
             body = b"".join(chunks)
         else:
-            body = await asyncio.wait_for(reader.read(65537), 1)
+            try:
+                body = await asyncio.wait_for(reader.readexactly(65537), 1)
+            except asyncio.IncompleteReadError as exc:
+                body = exc.partial
             if len(body) > 65536:
                 raise NativeError("protocol_error", "native discovery body exceeds bound")
         value = json.loads(body)
+        if not isinstance(value, dict):
+            raise NativeError("protocol_error", "native /json/version must return an object")
         endpoint = value.get("webSocketDebuggerUrl")
         if not isinstance(endpoint, str):
             raise NativeError("protocol_error", "native /json/version omitted websocket endpoint")
@@ -1403,9 +1737,348 @@ async def _version_endpoint(port: int) -> str:
             await writer.wait_closed()
 
 
+class _SpawnRejected(NativeError):
+    """Authenticated pre-admission rejection: no child or uncertain effects."""
+
+
+
+class _Supervisor:
+    """One inherited, authenticated host channel; failures make effects unknown."""
+    def __init__(self, channel: Any, *, endpoints: UnixEndpoints,
+                 blocking_calls: BlockingCalls, messages: UnixMessages,
+                 profile_command: tuple[str, ...], leases: ProfileLeases,
+                 identity: ProcessIdentity | None = None, managed_identity: ManagedPeerIdentity | None = None):
+        self.socket = channel
+        try:
+            if identity is None or managed_identity is None:
+                raise NativeError("capability_unavailable", "supervisor requires authorized identity capabilities")
+            self.identity = identity
+            self.managed_identity = managed_identity
+            verified = managed_identity.verify_supervisor(channel)
+            if not verified:
+                raise NativeError("verification_failed", "supervisor peer identity is unavailable")
+            channel.settimeout(25)
+        except BaseException:
+            channel.close()
+            raise
+        self.lock = asyncio.Lock()
+        self.owners_enrolled = False
+        self.profile_request_id = 3
+        self.profile_sessions = 0
+        self.fd_transfer_id = 0
+        self.application_domains: tuple[int, ...] = ()
+        self._reserved_domains: set[int] = set()
+        # Includes issued endpoints whose spawn/exit outcome is still unknown.
+        self._cdp_endpoints: set[UnixEndpoint] = set()
+        self.endpoints = endpoints
+        self.blocking_calls = blocking_calls
+        self.messages = messages
+        self.leases = leases
+        self.profile_command = profile_command
+
+
+    def _send(self, message: dict[str, Any]) -> None:
+        data = json.dumps(message, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode()
+        if not 0 < len(data) <= 16384:
+            raise NativeError("invalid_config", "supervisor request exceeds bound")
+        self.socket.sendall(struct.pack("!I", len(data)) + data)
+
+    def _send_file(self, message: dict[str, Any], file: ProfileLeaseCopy) -> None:
+        data = json.dumps(message, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode()
+        if not 0 < len(data) <= 16384:
+            raise NativeError("invalid_config", "supervisor request exceeds bound")
+        self.leases.send_copy(self.socket, data, file, max_bytes=16384)
+
+    def _receive(self, count: int = 0, *, spawn_domain: int | None = None,
+                 decoder: Callable | None = None, verification: bool = False) -> tuple[Any, list[Any]]:
+        try:
+            if decoder is not None:
+                transfer_id, value, endpoints = self.managed_identity.receive_frame(self.socket)
+            else:
+                body, endpoints = self.messages.receive(self.socket, max_bytes=16384, max_sockets=4)
+        except ValueError as exc:
+            raise NativeError("protocol_error", str(exc)) from exc
+        try:
+            if decoder is not None:
+                if endpoints and (type(transfer_id) is not int
+                                  or not self.fd_transfer_id < transfer_id <= 2**53 - 1):
+                    raise NativeError("protocol_error", "invalid supervisor descriptor receipt identity")
+            else:
+                transfer_id = None
+                value = json.loads(body)
+                if endpoints:
+                    if (not isinstance(value, dict) or set(value) != {"fd_transfer_id", "payload"}
+                            or type(value["fd_transfer_id"]) is not int
+                            or not self.fd_transfer_id < value["fd_transfer_id"] <= 2**53 - 1
+                            or not isinstance(value["payload"], dict)):
+                        raise NativeError("protocol_error", "invalid supervisor descriptor receipt identity")
+                    transfer_id, value = value["fd_transfer_id"], value["payload"]
+            if (spawn_domain is not None and isinstance(value, dict)
+                    and set(value) == {"op", "code", "domain"}
+                    and value.get("op") == "spawn_rejected" and not endpoints
+                    and type(value.get("domain")) is int and value["domain"] == spawn_domain
+                    and value.get("code") in {"busy", "invalid_argument"}):
+                raise _SpawnRejected("busy" if value["code"] == "busy" else "invalid_config",
+                                     "supervisor rejected application before admission")
+            if ((decoder is None or not endpoints) and not isinstance(value, dict)) or len(endpoints) != count:
+                raise NativeError("protocol_error", "invalid supervisor response or descriptor count")
+            if transfer_id is not None:
+                try:
+                    self._send({"op": "fd_received", "fd_transfer_id": transfer_id})
+                except BaseException:
+                    self.socket.close()
+                    raise
+                self.fd_transfer_id = transfer_id
+            if decoder is not None:
+                try:
+                    value = decoder(value)
+                except ValueError as exc:
+                    raise NativeError("verification_failed" if verification else "protocol_error", str(exc)) from exc
+            return value, endpoints
+        except BaseException:
+            for endpoint in endpoints:
+                endpoint.close()
+            raise
+
+    def _start_profile(self, name: str, home: PurePath) -> tuple[int, object, Any]:
+        from .profile_service import confirm_lease_escrow, receive_leases
+        argv = [*self.profile_command, "4", name, str(home)]
+        if any(len(arg.encode("utf-8")) >= 256 for arg in argv):
+            raise NativeError("invalid_config", "profile owner launch arguments exceed sidecar bounds")
+        self._send({"op": "profile_start", "argv": argv, "domain": 1})
+        (reply, profile_peer), rights = self._receive(1, decoder=self.managed_identity.profile_started)
+        control = rights[0]
+        domains = reply.get("application_domains")
+        if (not isinstance(domains, list) or not 1 <= len(domains) <= 256
+                or any(type(domain) is not int or not 0 <= domain < 256
+                       or domain in (1, 2, 3) for domain in domains)
+                or len(set(domains)) != len(domains) or domains[0] != 0):
+            control.close()
+            raise NativeError("protocol_error", "invalid managed application domain inventory")
+        self.application_domains = tuple(domains)
+        control.settimeout(20)
+        try:
+            try:
+                self.managed_identity.profile_ready(control, profile_peer)
+            except ValueError as exc:
+                raise NativeError("verification_failed", str(exc)) from exc
+            leases = receive_leases(control, 1, leases=self.leases)
+            try:
+                for slot, lease in enumerate(leases):
+                    self._send_file({"op": "escrow", "slot": slot, "domain": 1}, lease)
+                    accepted, _ = self._receive()
+                    if accepted != {"op": "escrowed", "slot": slot, "domain": 1}:
+                        raise NativeError("protocol_error", "Profile lease escrow was not confirmed")
+                confirm_lease_escrow(control, 2)
+            finally:
+                for lease in leases:
+                    lease.close()
+            return reply["launch_id"], profile_peer, control
+        except BaseException:
+            control.close()
+            raise
+
+    async def start_profile(self, name: str, home: PurePath) -> tuple[int, object, Any]:
+        async with self.lock:
+            try:
+                return await self.blocking_calls.run(lambda: self._start_profile(name, home),
+                                                     discard=lambda result: result[2].close())
+            except BaseException as exc:
+                exc.startup_stage = "profile_handshake"
+                self.socket.close()
+                raise
+
+    def _spawn(self, request: dict[str, Any], profile_control: Any) -> tuple[int, object, Any]:
+        from .profile_service import await_owner_ready, enroll_domain, enroll_owner
+        profile_control.settimeout(20)
+        self._send(request)
+        enrolled = set()
+        enrollment_ids = () if self.owners_enrolled else (self.profile_request_id, self.profile_request_id + 2)
+        for request_id in enrollment_ids:
+            owner, owner_fds = self._receive(1, decoder=self.managed_identity.owner_enrollment)
+            try:
+                kind, owner_launch = owner.get("kind"), owner.get("launch_id")
+                if (owner.get("op") != "enroll_owner" or kind not in {"cookie", "idb"} or kind in enrolled
+                        or type(owner_launch) is not int or owner_launch <= 0):
+                    raise NativeError("protocol_error", "invalid profile owner identity")
+                endpoint = owner_fds.pop()
+                try:
+                    enroll_owner(profile_control, endpoint, request_id, kind=kind, messages=self.messages)
+                finally:
+                    endpoint.close()
+                enrolled.add(kind)
+                self._send({"op": "enrolled_owner", "kind": kind, "launch_id": owner_launch})
+                started, _ = self._receive()
+                if (started.get("op") != "owner_started" or started.get("kind") != kind
+                        or type(started.get("launch_id")) is not int
+                        or started["launch_id"] != owner_launch):
+                    raise NativeError("protocol_error", "invalid profile owner startup identity")
+                await_owner_ready(profile_control, request_id + 1, kind=kind)
+                self._send({"op": "owner_ready", "kind": kind, "launch_id": owner_launch})
+            finally:
+                for endpoint in owner_fds:
+                    endpoint.close()
+        if enrollment_ids:
+            self.profile_request_id += 4
+            self.owners_enrolled = True
+        (reply, peer), fds = self._receive(4, spawn_domain=request["domain"],
+                                           decoder=self.managed_identity.child_enrollment)
+        try:
+            launch_id = reply["launch_id"]
+            rpc, events, idb, grant = fds
+            fds = []
+            try:
+                enroll_domain(profile_control, rpc, self.profile_request_id, events_endpoint=events, idb_endpoint=idb,
+                              grant_endpoint=grant, messages=self.messages)
+                self.profile_request_id += 1
+            finally:
+                rpc.close()
+                events.close()
+                idb.close()
+                grant.close()
+            self._send({"op": "enrolled", "launch_id": launch_id})
+            _, fds = self._receive(1, decoder=lambda message: self.managed_identity.child_ready(message, peer),
+                                   verification=True)
+            return launch_id, peer, fds.pop()
+        finally:
+            for endpoint in fds:
+                endpoint.close()
+
+    async def spawn(self, request: dict[str, Any], profile_control: Any) -> tuple[int, object, Any]:
+        async with self.lock:
+            try:
+                return await self.blocking_calls.run(lambda: self._spawn(request, profile_control),
+                                                     discard=lambda result: result[2].close())
+            except _SpawnRejected:
+                raise
+            except BaseException:
+                self.socket.close()
+                raise
+
+    def _request(self, op: str, launch_id: int) -> dict[str, Any]:
+        self._send({"op": op, "launch_id": launch_id})
+        reply, _ = self._receive()
+        if (reply.get("op") != op or type(reply.get("launch_id")) is not int
+                or reply["launch_id"] != launch_id
+                or reply.get("status") not in ("running", "exited")
+                or (reply["status"] == "exited" and type(reply.get("exit_status")) is not int)):
+            raise NativeError("protocol_error", "invalid supervisor lifecycle response")
+        return reply
+
+    async def request(self, op: str, launch_id: int) -> dict[str, Any]:
+        async with self.lock:
+            try:
+                return await self.blocking_calls.run(lambda: self._request(op, launch_id))
+            except BaseException:
+                self.socket.close()
+                raise
+
+
+
+def bind_supervisor(*, supervisor_channel: SupervisorChannel,
+                    endpoints: UnixEndpoints, blocking_calls: BlockingCalls,
+                    messages: UnixMessages, profile_command: tuple[str, ...],
+                    leases: ProfileLeases, identity: ProcessIdentity | None = None,
+                    managed_identity: ManagedPeerIdentity | None = None) -> _Supervisor:
+    """Consume and verify the inherited channel without starting a Profile owner."""
+    try:
+        channel = supervisor_channel.take()
+    except (KeyError, ValueError, OSError) as exc:
+        raise NativeError("verification_failed", "supervisor channel unavailable") from exc
+    return _Supervisor(channel, endpoints=endpoints, blocking_calls=blocking_calls,
+                       messages=messages, profile_command=profile_command, leases=leases,
+                       identity=identity, managed_identity=managed_identity)
+
+
+async def start_supervised_profile(name: str, home: PurePath, *,
+                                   supervisor_channel: SupervisorChannel,
+                                   endpoints: UnixEndpoints,
+                                   blocking_calls: BlockingCalls,
+                                   messages: UnixMessages,
+                                   profile_command: tuple[str, ...], leases: ProfileLeases,
+                                   identity: ProcessIdentity | None = None,
+                                   managed_identity: ManagedPeerIdentity | None = None) -> tuple[_Supervisor, int, Any]:
+    supervisor = bind_supervisor(supervisor_channel=supervisor_channel, endpoints=endpoints,
+                                 blocking_calls=blocking_calls, messages=messages,
+                                 profile_command=profile_command, leases=leases,
+                                 identity=identity, managed_identity=managed_identity)
+    try:
+        launch_id, _, control = await supervisor.start_profile(name, home)
+        return supervisor, launch_id, control
+    except BaseException:
+        supervisor.socket.close()
+        raise
+
+
+
+
+class _SupervisedProcess:
+    def __init__(self, supervisor: _Supervisor, launch_id: int,
+                 profile_launch_id: int, profile_control: Any, profile_name: str, domain: int,
+                 cdp_endpoint: UnixEndpoint):
+        self.supervisor, self.launch_id = supervisor, launch_id
+        self.profile_launch_id, self.profile_control = profile_launch_id, profile_control
+        self.profile_name, self.domain = profile_name, domain
+        self.cdp_endpoint = cdp_endpoint
+        supervisor.profile_sessions += 1
+        self.returncode = None
+        self.stdout = self.stderr = None
+        self._wait_task: asyncio.Task | None = None
+
+    def _record_exit(self, reply: dict[str, Any]) -> None:
+        # Call only with a response authenticated and correlated by _Supervisor.
+        if reply["status"] == "exited" and self.returncode is None:
+            self.returncode = reply["exit_status"]
+            self.cdp_endpoint.dispose()
+            self.supervisor._cdp_endpoints.discard(self.cdp_endpoint)
+            self.supervisor._reserved_domains.discard(self.domain)
+
+    async def stop(self) -> None:
+        reply = await self.supervisor.request("stop", self.launch_id)
+        self._record_exit(reply)
+
+    async def wait(self) -> int:
+        if self._wait_task is None:
+            self._wait_task = asyncio.create_task(self._poll_exit())
+        return await asyncio.shield(self._wait_task)
+
+    async def _poll_exit(self) -> int:
+        while self.returncode is None:
+            reply = await self.supervisor.request("query", self.launch_id)
+            self._record_exit(reply)
+            if self.returncode is not None:
+                break
+            await asyncio.sleep(0.1)
+        return self.returncode
+
+    async def finish_profile(self) -> None:
+        self.supervisor.profile_sessions -= 1
+        if self.supervisor.profile_sessions:
+            return
+        self.profile_control.close()
+        async with asyncio.timeout(13):
+            while True:
+                reply = await self.supervisor.request("query_profile", self.profile_launch_id)
+                if reply["status"] == "exited":
+                    if reply["exit_status"] != 0:
+                        raise NativeError("protocol_error", "Profile owner exited without durable shutdown")
+                    return
+                await asyncio.sleep(0.1)
+
+
 class NativeSession:
-    def __init__(self, process: asyncio.subprocess.Process, cfg: dict[str, Any], config_path: Path):
+    def __init__(self, process: ChildProcess | _SupervisedProcess, cfg: dict[str, Any], config_path: PurePath,
+                 *, proxy: str | None, identity: ProcessIdentity | None = None,
+                 artifact_content: ArtifactContent | None = None,
+                 connections: StreamConnections | None = None,
+                 files: HostFiles | None = None,
+                 random: SecureRandom | None = None):
         self.process, self.config, self.config_path = process, cfg, config_path
+        self.identity, self.random = identity, random
+        self.artifact_content = artifact_content
+        self.connections, self.files = connections, files
+        self.platform = identity.platform if identity is not None else "Darwin"
+        self.file_exports: FileExports | None = None
         self.context: NativeContext | None = None
         self.receipt: dict[str, Any] = {}
         self.cdp: _CDP | None = None
@@ -1413,16 +2086,17 @@ class NativeSession:
         self._log_tasks: list[asyncio.Task] = []
         self._close_task: asyncio.Task | None = None
         self._closed = False
-        self._secret = resolve_proxy(cfg)
+        self._secret = proxy
         for stream in (process.stdout, process.stderr):
             if stream:
                 self._log_tasks.append(asyncio.create_task(self._drain(stream)))
 
-    @property
-    def pid(self) -> int:
-        return self.process.pid
+    def monotonic_time(self) -> float:
+        if self.identity is not None:
+            return self.identity.monotonic_time()
+        raise NativeError("capability_unavailable", "session monotonic clock requires an authorized ProcessIdentity")
 
-    async def _drain(self, stream: asyncio.StreamReader) -> None:
+    async def _drain(self, stream: ProcessOutput) -> None:
         while block := await stream.read(8192):
             self.logs.extend(block)
             if len(self.logs) > MAX_LOG:
@@ -1441,6 +2115,13 @@ class NativeSession:
 
     async def _close(self) -> None:
         self._closed = True
+        error: BaseException | None = None
+        if self.context:
+            for peer in self.context._peer_sessions:
+                try:
+                    await peer.close()
+                except Exception as exc:
+                    error = error or exc
         if self.context:
             self.context.closed = True
             for page in self.context.pages:
@@ -1448,19 +2129,35 @@ class NativeSession:
                 page._closed = True
                 page._site_icon = None
                 page._site_icon_version = None
-        error: BaseException | None = None
+            adoptions = tuple(self.context._adopting.values())
+            for task in adoptions:
+                task.cancel()
+            if adoptions:
+                await asyncio.gather(*adoptions, return_exceptions=True)
         try:
-            # SIGTERM uses each runtime's normal storage flush path.
             if self.process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    self.process.send_signal(signal.SIGTERM)
-                try:
-                    await asyncio.wait_for(self.process.wait(), 10)
-                except TimeoutError:
+                if isinstance(self.process, _SupervisedProcess):
+                    await self.process.stop()
+                    try:
+                        await asyncio.wait_for(self.process.wait(), 13)
+                    except TimeoutError as exc:
+                        raise NativeError("timeout", "supervised child exit is unknown; durable flush is not verified") from exc
+                else:
+                    # SIGTERM uses each runtime's normal storage flush path.
                     with contextlib.suppress(ProcessLookupError):
-                        self.process.kill()
-                    await asyncio.wait_for(self.process.wait(), 3)
-                    error = NativeError("timeout", "native shutdown required SIGKILL; durable flush is not verified")
+                        self.process.terminate()
+                    try:
+                        await asyncio.wait_for(self.process.wait(), 10)
+                    except TimeoutError:
+                        with contextlib.suppress(ProcessLookupError):
+                            self.process.kill()
+                        await asyncio.wait_for(self.process.wait(), 3)
+                        error = NativeError("timeout", "native shutdown required SIGKILL; durable flush is not verified")
+            if isinstance(self.process, _SupervisedProcess):
+                try:
+                    await self.process.finish_profile()
+                except TimeoutError as exc:
+                    raise NativeError("timeout", "Profile owner exit is unknown; durable flush is not verified") from exc
         finally:
             try:
                 if self.cdp:
@@ -1470,9 +2167,13 @@ class NativeSession:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*self._log_tasks, return_exceptions=True)
+                if isinstance(self.process, _SupervisedProcess):
+                    if self.process.supervisor.profile_sessions == 0:
+                        self.process.profile_control.close()
+                        self.process.supervisor.socket.close()
         if error:
             raise error
-        if self.process.returncode not in (0, -signal.SIGTERM):
+        if self.process.returncode not in (0, _EXIT_SIGTERM):
             raise NativeError("protocol_error", f"native runtime exited {self.process.returncode}; durable flush is not verified")
 
     async def close(self) -> None:
@@ -1499,26 +2200,163 @@ def _verify_receipt(cfg: dict[str, Any], receipt: dict[str, Any], digest: str) -
 
 
 @_bounded
-async def launch_native(name: str, cfg: dict[str, Any], headless: bool) -> NativeSession:
+async def adopt_supervised_native(name: str, cfg: dict[str, Any], supervisor: _Supervisor,
+                                  profile_launch_id: int, profile_control: Any,
+                                  *, domain: int = 0, timeout: float = DEFAULT_TIMEOUT,
+                                  random: SecureRandom | None = None,
+                                  artifact_content: ArtifactContent | None = None,
+                                  connections: StreamConnections | None = None,
+                                  files: HostFiles | None = None) -> NativeSession:
+    """Start and adopt the supervisor's authenticated, private Unix CDP child."""
+    if random is None:
+        raise NativeError("capability_unavailable", "native launch requires an authorized SecureRandom")
+    if artifact_content is None or connections is None or files is None:
+        raise NativeError("capability_unavailable", "native launch requires authorized artifact, stream and file capabilities")
+    from . import native_spec as ns, profile
+    if type(domain) is not int or domain not in supervisor.application_domains:
+        raise NativeError("invalid_config", "execution domain was not admitted by supervisor")
+    if domain in supervisor._reserved_domains:
+        raise NativeError("busy", "execution domain is already reserved")
+    validate_native_spec(cfg, name=name, artifact_content=artifact_content)
+    if cfg["runtime"]["id"] not in {"mioa", "lightpanda"}:
+        raise NativeError("capability_unavailable", "supervised Unix CDP requires the Mioa runtime")
+    if cfg["network"].get("proxy_ref") is not None:
+        raise NativeError("capability_unavailable", "supervisor has no authenticated proxy-secret delivery")
+    try:
+        resolved = artifact_content.resolve(cfg["storage"]["path"])
+        expected = artifact_content.resolve(profile.profile_dir(name) / "data")
+    except OSError as exc:
+        raise NativeError("invalid_config", f"native storage path unavailable: {exc}") from exc
+    if resolved != expected:
+        raise NativeError("invalid_config", "native storage must be this environment's data directory")
+    directory = PurePath(resolved)
+    files.make_directory(directory, mode=0o700, parents=True)
+    private = directory / ".native"
+    files.make_directory(private, mode=0o700)
+    config_path = profile.profile_dir(name) / "config.json"
+    try:
+        raw = files.read_bytes(config_path)
+        if json.loads(raw) != cfg:
+            raise NativeError("verification_failed", "launch input differs from committed profile")
+    except (OSError, ValueError) as exc:
+        raise NativeError("invalid_config", "committed native configuration unavailable") from exc
+    engine_cfg = ns.native_engine_config(cfg)
+    if engine_cfg is cfg:
+        engine_path, engine_raw = config_path, raw
+    else:
+        engine_path = private / "engine-config.json"
+        engine_raw = ns.native_config_bytes(engine_cfg)
+        files.write_bytes(engine_path, engine_raw)
+    digest = hashlib.sha256(engine_raw).hexdigest()
+    endpoint = supervisor.endpoints.create()
+    try:
+        argv = [cfg["runtime"]["binary"], "serve", "--unix-socket", str(endpoint.path),
+                "--environment-config", str(engine_path)]
+        for resource in ("iframe", "worker", "image", "stylesheet"):
+            argv += ["--load-resources", resource]
+        if any(len(arg.encode("utf-8")) >= 256 for arg in argv) or len(argv) > 16:
+            raise NativeError("invalid_config", "supervised launch arguments exceed sidecar bounds")
+        if profile_control.fileno() < 0:
+            raise NativeError("verification_failed", "Profile owner control is closed")
+    except BaseException:
+        endpoint.dispose()  # No spawn request has been issued.
+        raise
+    supervisor._cdp_endpoints.add(endpoint)
+    supervisor._reserved_domains.add(domain)
+    try:
+        launch_id, peer, cdp_socket = await supervisor.spawn(
+            {"op": "spawn", "argv": argv, "profile": name, "config_sha256": digest,
+             "domain": domain, "storage_dir": str(directory)}, profile_control)
+    except _SpawnRejected as exc:
+        supervisor._reserved_domains.discard(domain)
+        supervisor._cdp_endpoints.discard(endpoint)
+        endpoint.dispose()
+        exc.startup_stage = "spawn"
+        raise
+    except BaseException as exc:
+        exc.startup_stage = "spawn"
+        # Draining a cancelled worker or losing its channel is not child-exit evidence.
+        exc.add_note(f"native spawn outcome unknown; CDP directory retained: {endpoint.directory}")
+        raise
+    process = _SupervisedProcess(supervisor, launch_id, profile_launch_id, profile_control, name, domain,
+                                 endpoint)
+    session = None
+    startup_stage = "cdp_connect"
+    try:
+        session = NativeSession(process, cfg, config_path, proxy=None, identity=supervisor.identity,
+                                artifact_content=artifact_content, connections=connections,
+                                files=files, random=random)
+        session.cdp = _CDP(await _WebSocket.connect_owned_unix(
+            cdp_socket, peer, supervisor.managed_identity, random, connections=connections))
+        session.cdp.execution_domain = domain
+        session.cdp.execution_epoch = launch_id
+        startup_stage = "receipt"
+        session.receipt = await session.cdp.send("Environment.getInfo")
+        _verify_receipt(cfg, session.receipt, digest)
+        reply = await supervisor.request("query", launch_id)
+        process._record_exit(reply)
+        if reply["status"] != "running":
+            raise NativeError("verification_failed", "supervised child exited before readiness")
+        session.context = NativeContext(session, session.cdp)
+        startup_stage = "target_initialize"
+        await session.context.initialize()
+        return session
+    except BaseException as exc:
+        exc.startup_stage = startup_stage
+        with contextlib.suppress(Exception):
+            if session is not None:
+                await session.close()
+            else:
+                cdp_socket.close()
+                await process.stop()
+                await asyncio.wait_for(process.wait(), 13)
+                await process.finish_profile()
+        if endpoint in supervisor._cdp_endpoints:
+            exc.add_note(f"native exit/endpoint disposal unconfirmed; CDP directory retained: {endpoint.directory}")
+        raise
+
+
+@_bounded
+async def launch_native(name: str, cfg: dict[str, Any], headless: bool,
+                        *, process_environment: ProcessEnvironment,
+                        child_processes: ChildProcesses, profile_lease: ProfileLease | None = None,
+                        identity: ProcessIdentity | None = None, proxy_secrets: ProxySecrets | None = None,
+                        random: SecureRandom | None = None,
+                        artifact_content: ArtifactContent | None = None,
+                        connections: StreamConnections | None = None,
+                        files: HostFiles | None = None) -> NativeSession:
     """Launch only the pinned source binary; verify raw-file receipt before use.
 
     Native GUI is the shared authenticated viewer over this very session. A
     headful request never launches an alternate browser or replaces screenshots.
     The manager must own its profile lease before invoking this function.
     """
-    validate_native_spec(cfg, name=name)
-    runtime = cfg["runtime"]["id"]
-    proxy = resolve_proxy(cfg)
+    if random is None:
+        raise NativeError("capability_unavailable", "native launch requires an authorized SecureRandom")
+    if identity is None:
+        raise NativeError("capability_unavailable", "native launch requires an authorized ProcessIdentity")
     from . import profile
-    directory = Path(cfg["storage"]["path"])
-    if directory.resolve() != profile.profile_dir(name).resolve() / "data":
+    if profile_lease is None or not profile_lease.authorizes(profile.BASE, profile.sanitize(name), "engine"):
+        raise NativeError("busy", "native launch requires the manager's active engine lease")
+    if artifact_content is None or connections is None or files is None:
+        raise NativeError("capability_unavailable", "native launch requires authorized artifact, stream and file capabilities")
+    validate_native_spec(cfg, name=name, artifact_content=artifact_content)
+    runtime = cfg["runtime"]["id"]
+    proxy = resolve_proxy(cfg, proxy_secrets=proxy_secrets)
+    try:
+        resolved = artifact_content.resolve(cfg["storage"]["path"])
+        expected = artifact_content.resolve(profile.profile_dir(name) / "data")
+    except OSError as exc:
+        raise NativeError("invalid_config", f"native storage path unavailable: {exc}") from exc
+    if resolved != expected:
         raise NativeError("invalid_config", "native storage must be this environment's isolated data directory")
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory = PurePath(resolved)
+    files.make_directory(directory, mode=0o700, parents=True)
     private = directory / ".native"
-    private.mkdir(mode=0o700, exist_ok=True)
+    files.make_directory(private, mode=0o700)
     config_path = profile.profile_dir(name) / "config.json"
     try:
-        raw = config_path.read_bytes()
+        raw = files.read_bytes(config_path)
         committed = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise NativeError("invalid_config", f"committed native configuration unavailable: {config_path}") from exc
@@ -1529,24 +2367,27 @@ async def launch_native(name: str, cfg: dict[str, Any], headless: bool) -> Nativ
     if engine_cfg is not cfg:
         engine_config_path = private / "engine-config.json"
         raw_engine = _ns.native_config_bytes(engine_cfg)
-        engine_config_path.write_bytes(raw_engine)
-        os.chmod(engine_config_path, 0o600)
+        files.write_bytes(engine_config_path, raw_engine)
     else:
         engine_config_path = config_path
         raw_engine = raw
     digest = hashlib.sha256(raw_engine).hexdigest()
-    environment = os.environ.copy()
-    # Runtime-specific inherited config must not supersede the committed file.
-    for key in ("OBSCURA_ENVIRONMENT", "OBSCURA_ENVIRONMENT_GL_BACKEND", "OBSCURA_PROXY", "LIGHTPANDA_ENVIRONMENT", "LIGHTPANDA_HTTP_PROXY", "MIOA_ENVIRONMENT", "MIOA_HTTP_PROXY"):
-        environment.pop(key, None)
-    # Native requests own proxy enforcement. Do not let ambient proxy variables
-    # add bypasses or silently route a profile configured DIRECT.
-    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
-        environment.pop(key, None)
-    environment["ANTI_TRACE_PARENT_EOF"] = "1"
+    # Core owns reserved-key policy; Host supplies the authorized base.
+    # No inherited runtime config, private service entrypoints or proxy bypass.
+    overlay = {"ANTI_TRACE_PARENT_EOF": "1"}
     if proxy and cfg["network"].get("proxy_ref"):
-        environment[cfg["network"]["proxy_ref"].removeprefix("env:")] = proxy
-    ready_path = private / f"ready-{secrets.token_hex(8)}.json"
+        overlay[cfg["network"]["proxy_ref"].removeprefix("env:")] = proxy
+    environment = process_environment.derive(remove=(
+        "OBSCURA_ENVIRONMENT", "OBSCURA_ENVIRONMENT_GL_BACKEND", "OBSCURA_PROXY",
+        "LIGHTPANDA_ENVIRONMENT", "LIGHTPANDA_HTTP_PROXY", "MIOA_ENVIRONMENT", "MIOA_HTTP_PROXY",
+        "MIOA_COOKIE_OWNER_FD", "MIOA_COOKIE_OWNER_DB", "MIOA_PROFILE_SERVICE_FD",
+        "MIOA_PROFILE_EVENTS_FD", "MIOA_IDB_OWNER_FD", "MIOA_IDB_OWNER_DIR",
+        "MIOA_TRUSTED_RASTER_HOST_PID", "MIOA_TRUSTED_RASTER_HOST_UID",
+        "MIOA_TRUSTED_RASTER_HOST_VERSION", "MIOA_TRUSTED_RASTER_SOCKET", "MIOA_SUPERVISOR_FD",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    ), overlay=overlay)
+    ready_path = private / f"ready-{_secure_bytes(random, 8).hex()}.json"
     args = [cfg["runtime"]["binary"]]
     if runtime == "obscura":
         if cfg["network"].get("allow_private_network"):
@@ -1559,34 +2400,33 @@ async def launch_native(name: str, cfg: dict[str, Any], headless: bool) -> Nativ
         # Lightpanda's current server has no ready-file/port-zero contract.
         # Reserve a kernel-selected loopback port, then require the child and
         # digest-bound receipt on it; another process cannot satisfy readiness.
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            port = reservation.getsockname()[1]
+        port = connections.reserve_loopback_port()
         args += ["serve", "--host", "127.0.0.1", "--port", str(port), "--environment-config", str(engine_config_path)]
         for resource in ("iframe", "worker", "image", "stylesheet"):
             args += ["--load-resources", resource]
         environment.update(LIGHTPANDA_DISABLE_TELEMETRY="true", LIGHTPANDA_DISABLE_CORE_DUMP="1", MIOA_DISABLE_TELEMETRY="true", MIOA_DISABLE_CORE_DUMP="1")
     try:
-        inherited_leases = profile.engine_lease_fds(name)
-        if not inherited_leases:
-            raise NativeError("busy","native launch requires the manager's active engine lease")
-        process = await asyncio.create_subprocess_exec(*args, env=environment, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,pass_fds=inherited_leases)
+        if profile_lease is None or not profile_lease.authorizes(profile.BASE, profile.sanitize(name), "engine"):
+            raise NativeError("busy", "native launch requires the manager's active engine lease")
+        process = await child_processes.start(args, environment=environment, profile_lease=profile_lease)
     except OSError as exc:
         raise NativeError("capability_unavailable", f"native executable could not launch: {exc}") from exc
-    session = NativeSession(process, cfg, config_path)
-    deadline = time.monotonic() + 30
+    session = NativeSession(process, cfg, config_path, proxy=proxy, identity=identity,
+                            artifact_content=artifact_content, connections=connections,
+                            files=files, random=random)
     try:
+        deadline = session.monotonic_time() + 30
         endpoint = None
         last_discovery_error: BaseException | None = None
-        while time.monotonic() < deadline:
+        while session.monotonic_time() < deadline:
             if process.returncode is not None:
                 raise NativeError("invalid_config", f"native startup exited {process.returncode}: {session.log_text()[-8192:]}")
             try:
                 if runtime == "obscura":
-                    if not ready_path.exists():
+                    if not files.exists(ready_path):
                         await asyncio.sleep(0.05)
                         continue
-                    ready = json.loads(ready_path.read_bytes())
+                    ready = json.loads(files.read_bytes(ready_path))
                     port = ready.get("port")
                     endpoint = ready.get("ws_url") or ready.get("websocket_url")
                     if not endpoint:
@@ -1594,14 +2434,14 @@ async def launch_native(name: str, cfg: dict[str, Any], headless: bool) -> Nativ
                             raise NativeError("protocol_error", "native ready file omitted actual port")
                         endpoint = f"ws://127.0.0.1:{port}{ready.get('websocket_path', '/devtools/browser')}"
                 else:
-                    endpoint = await _version_endpoint(port)
+                    endpoint = await _version_endpoint(port, connections=connections)
                 break
             except (OSError, ValueError, TimeoutError, asyncio.IncompleteReadError) as exc:
                 last_discovery_error = exc
                 await asyncio.sleep(0.05)
         if endpoint is None:
             raise NativeError("timeout", f"native startup discovery failed: {last_discovery_error}; {session.log_text()[-4096:]}")
-        session.cdp = _CDP(await _WebSocket.connect(endpoint))
+        session.cdp = _CDP(await _WebSocket.connect(endpoint, random, connections=connections))
         session.receipt = await session.cdp.send("Environment.getInfo")
         _verify_receipt(cfg, session.receipt, digest)
         if process.returncode is not None:
@@ -1614,7 +2454,7 @@ async def launch_native(name: str, cfg: dict[str, Any], headless: bool) -> Nativ
             await session.close()
         raise
     finally:
-        ready_path.unlink(missing_ok=True)
+        files.remove(ready_path, missing_ok=True)
 
 
 def _remote_value(reply: dict[str, Any]) -> Any:
@@ -1670,10 +2510,11 @@ class NativeJSHandle:
         return _remote_value(await self._call(expression, arg, True))
 
     async def evaluate_handle(self, expression: str, arg: Any = _MISSING) -> NativeJSHandle:
+        revision = self.page.observation_id
         reply = await self._call(expression, arg, False)
         if not isinstance(reply.get("result"), dict):
             raise NativeError("protocol_error", "native handle evaluation omitted result")
-        return _make_handle(self.page, reply["result"])
+        return await _make_handle(self.page, reply["result"], revision)
 
     async def get_property(self, property_name: str) -> NativeJSHandle:
         return await self.evaluate_handle("(object,key) => object[key]", property_name)
@@ -1696,6 +2537,25 @@ class NativeJSHandle:
 
 class NativeElementHandle(NativeJSHandle, NativeLocator):
     """Input methods operate on the original remote DOM node, never re-query."""
+    async def _keyboard_input(self, method: str, value: str, document: NativeJSHandle) -> None:
+        root = self.page.root if isinstance(self.page, NativeFrame) else self.page
+        if root._native_input_batch is not None:
+            raise NativeError("busy", "native input sequence is already being prepared")
+        object_id = self._check()
+        modifiers = root.keyboard.modifiers
+        events: list[dict[str, Any]] = []
+        try:
+            root._native_input_batch = (asyncio.current_task(), events)
+            try:
+                await getattr(root.keyboard, method)(value)
+            finally:
+                root._native_input_batch = None
+            self._check()
+            await self.page._send("Input.dispatchNativeAction", {
+                "expectedObjectId": object_id, "expectedDocumentId": document._check(), "events": events})
+        finally:
+            root.keyboard.modifiers = modifiers
+
     async def content_frame(self) -> NativeFrame | None:
         reply = await self.page._send("DOM.describeNode", {"objectId": self._check(), "depth": 1})
         node = reply.get("node", {})
@@ -1737,25 +2597,30 @@ class NativeElementHandle(NativeJSHandle, NativeLocator):
         if state not in {"visible", "hidden", "enabled", "disabled", "editable", "stable"}:
             raise NativeError("capability_unavailable", f"element state {state!r}")
         if state == "stable":
-            deadline = _deadline(timeout)
+            deadline = _deadline(self.page, timeout)
             previous = None
             while True:
                 box = await self._read("const r=el.getBoundingClientRect();return [r.x,r.y,r.width,r.height];")
                 if previous == box:
                     return
                 previous = box
-                await asyncio.sleep(min(0.05, _remaining(deadline)))
+                await asyncio.sleep(min(0.05, _remaining(self.page, deadline)))
         elif state in {"visible", "hidden"}:
             await NativeLocator.wait_for(self, state=state, timeout=timeout)
         else:
-            deadline = _deadline(timeout)
+            deadline = _deadline(self.page, timeout)
             while True:
                 enabled = await self.is_enabled()
                 editable = await self._read("return !el.readOnly && (el.isContentEditable || el.tagName==='INPUT' || el.tagName==='TEXTAREA');")
                 if enabled == (state != "disabled") and (state != "editable" or editable):
                     return
-                await asyncio.sleep(min(0.05, _remaining(deadline)))
+                await asyncio.sleep(min(0.05, _remaining(self.page, deadline)))
 
 
-def _make_handle(page: NativePage, remote: dict[str, Any]) -> NativeJSHandle:
-    return NativeElementHandle(page, remote) if remote.get("subtype") == "node" else NativeJSHandle(page, remote)
+async def _make_handle(page: NativePage | NativeFrame, remote: dict[str, Any], revision: int) -> NativeJSHandle:
+    handle = NativeElementHandle(page, remote) if remote.get("subtype") == "node" else NativeJSHandle(page, remote)
+    if page.is_closed() or page.observation_id != revision:
+        with contextlib.suppress(Exception):
+            await handle.dispose()
+        raise NativeError("stale_reference", "target changed while creating remote handle")
+    return handle

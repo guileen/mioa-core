@@ -28,7 +28,6 @@ Third-party Python dependencies
 No third-party source is vendored. The declared runtime dependencies are
 resolved by the package locks and remain under their own licenses:
 
-  psutil 7.2.2                 BSD-3-Clause
   requests 2.34.2              Apache-2.0
   certifi 2026.10.23           MPL-2.0
   charset-normalizer 3.5.2     MIT

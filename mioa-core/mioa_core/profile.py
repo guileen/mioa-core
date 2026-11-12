@@ -17,7 +17,7 @@ adapter fails with ``capability_unavailable`` instead of falling back silently.
 from __future__ import annotations
 
 import copy
-import fcntl
+from contextlib import contextmanager
 import hashlib
 import io
 import json
@@ -27,21 +27,26 @@ import re
 import stat
 import tarfile
 import tempfile
-import time
-from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator, Mapping, Protocol
+from typing import Any, Mapping, Protocol
+from mioa_os_api import ArtifactContent, AtomicDirectories, AtomicExchangeUnavailable, ProfileDataReset, ProfileLeases, ProfileOwners, ProxySecrets, WallClock
+from mioa_os_api.snapshots import SnapshotDirectories, UnsafeSnapshotStore
 from urllib.parse import urlsplit
 
 SCHEMA = 3
 NATIVE_RUNTIMES = frozenset({"obscura", "lightpanda", "mioa"})
-BASE = Path(os.environ.get("ANTI_TRACE_HOME", Path.home() / ".anti-trace"))
-_LEASE_DESCRIPTORS: dict[tuple[str,str,str], tuple[int,...]] = {}
+BASE: Path | None = None
+
+
+def _base() -> Path:
+    if BASE is None:
+        raise ProfileError("capability_unavailable: Host profile root is required")
+    return BASE
 
 
 def store() -> Path:
-    """The profile root, resolved at call time so ANTI_TRACE_HOME and tests work."""
-    return BASE / "profiles"
+    """Profile store under the explicitly Host-selected root."""
+    return _base() / "profiles"
 
 
 def _profiles() -> Path:
@@ -128,15 +133,6 @@ def clear_state(name: str) -> None:
     (profile_dir(name) / "state.json").unlink(missing_ok=True)
 
 
-def socket_path(name: str) -> Path:
-    directory = Path("/tmp") / f"anti-trace-{os.getuid()}"
-    directory.mkdir(mode=0o700, exist_ok=True)
-    info = directory.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
-        raise ProfileError(f"unsafe runtime directory: {directory}")
-    key = hashlib.sha256(f"{BASE.resolve()}\0{sanitize(name)}".encode()).hexdigest()[:32]
-    return directory / f"{key}.sock"
-
 
 def log_path(name: str) -> Path:
     return profile_dir(name) / "engine.log"
@@ -145,67 +141,31 @@ def log_path(name: str) -> Path:
 def exists(name: str) -> bool:
     return (profile_dir(name) / "config.json").is_file()
 
-def engine_lease_fds(name: str) -> tuple[int,...]:
-    return _LEASE_DESCRIPTORS.get((str(BASE.resolve()),sanitize(name),"engine"),())
-
-
-
-@contextmanager
-def exclusive(name: str, timeout: float = 0.0, kind: str = "engine") -> Iterator[bool]:
-    """Store-level leases survive profile replacement/removal; legacy locks drain cold."""
+def exclusive(name: str, timeout: float = 0.0, kind: str = "engine", *,
+              leases: ProfileLeases):
+    """Acquire an explicitly Host-provided store and legacy profile lease."""
     if kind not in LOCK_FILES:
         raise ProfileError(f"unknown lease kind: {kind}")
-    directory = BASE / ".leases"
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if directory.is_symlink() or directory.stat().st_uid != os.getuid():
-        raise ProfileError("unsafe profile lease directory")
-    os.chmod(directory, 0o700)
-    key = hashlib.sha256(sanitize(name).encode()).hexdigest() if kind != "catalog" else "catalog"
-    paths = [directory / f"{key}.{kind}"]
-    if kind != "catalog":
-        legacy = profile_dir(name) / LOCK_FILES[kind]
-        if legacy.exists() or legacy.is_symlink():
-            paths.append(legacy)
-    deadline = time.monotonic() + max(0.0, timeout)
-    handles = []
-    ownership_key = (str(BASE.resolve()),sanitize(name),kind)
-    acquired = False
-    try:
-        for path in paths:
-            descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            handle = os.fdopen(descriptor, "a+")
-            handles.append(handle)
-            while True:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        yield False
-                        return
-                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        acquired = True
-        _LEASE_DESCRIPTORS[ownership_key] = tuple(handle.fileno() for handle in handles)
-        yield True
-    finally:
-        if acquired:
-            _LEASE_DESCRIPTORS.pop(ownership_key,None)
-        for handle in reversed(handles):
-            if acquired:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
+    return leases.acquire(_base(), sanitize(name), kind, timeout)
 
 
-def list_profiles() -> list[dict[str, Any]]:
+def list_profiles(*, owners: ProfileOwners) -> list[dict[str, Any]]:
+    if owners is None:
+        raise ProfileError("capability_unavailable: Host profile owners service is required")
     _profiles().mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     for entry in sorted(_profiles().iterdir()):
         if not entry.is_dir() or not (entry / "config.json").is_file():
             continue
+        try:
+            if sanitize(entry.name) != entry.name:
+                continue
+        except ProfileError:
+            continue
         cfg = load_config(entry.name) or {}
         state = load_state(entry.name) or {}
         attached = cfg.get("mode") == "attached"
-        running = owner_alive(state)
+        running = owners.alive(BASE, entry.name)
         if not running:
             state = {}
         rows.append({
@@ -213,7 +173,6 @@ def list_profiles() -> list[dict[str, Any]]:
             "status": "ATTACHED" if attached else ("RUNNING" if running else "IDLE"),
             "mode": "attached" if attached else "managed",
             "cdp": cfg.get("cdp"),
-            "pid": state.get("pid"),
             "socket": state.get("socket"),
             "proxy": "CONFIGURED" if (cfg.get("network") or {}).get("proxy_ref") or (cfg.get("network") or {}).get("proxy") else "DIRECT",
             "egress_ip": (cfg.get("network") or {}).get("egress", {}).get("ip"),
@@ -227,34 +186,6 @@ def list_profiles() -> list[dict[str, Any]]:
     return rows
 
 
-def pid_alive(pid: int) -> bool:
-    return _alive(pid)
-
-
-def _alive(pid: int) -> bool:
-    try:
-        import psutil
-        proc = psutil.Process(pid)
-        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-    except Exception:
-        return False
-
-
-def process_start(pid: int) -> float | None:
-    try:
-        import psutil
-        return psutil.Process(pid).create_time()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
-        return None
-
-
-def owner_alive(state: dict[str, Any] | None) -> bool:
-    if not state or not _alive(state.get("pid") or 0):
-        return False
-    expected = state.get("process_start")
-    return type(expected) in (int, float) and process_start(state["pid"]) == expected
-
-
 def require(name: str) -> dict[str, Any]:
     cfg = load_config(name)
     if cfg is None:
@@ -262,19 +193,21 @@ def require(name: str) -> dict[str, Any]:
     return cfg
 
 
-def reset_data(name: str) -> None:
-    data = profile_dir(name) / "data"
-    if data.is_dir():
-        shutil.rmtree(data)
-    data.mkdir(parents=True, exist_ok=True)
-    for transient in TRANSIENT.difference(LOCK_FILES.values()):
-        (profile_dir(name) / transient).unlink(missing_ok=True)
+def reset_data(name: str, *, data_reset: ProfileDataReset) -> None:
+    """Reset runtime data through an explicit Host authority."""
+    if data_reset is None:
+        raise ProfileError("capability_unavailable: Host profile data reset service is required")
+    data_reset.reset(profile_dir(name))
 
 
-def remove(name: str) -> None:
+def remove(name: str, *, proxy_secrets: ProxySecrets | None = None) -> None:
     cfg = require(name)
+    owned_secret = bool(cfg.get("id") and (cfg.get("network") or {}).get("proxy_ref") == _proxy_ref(cfg))
+    if owned_secret:
+        _secret_authority(proxy_secrets)
     shutil.rmtree(profile_dir(name))
-    clear_proxy_secret(cfg)
+    if owned_secret:
+        clear_proxy_secret(cfg, proxy_secrets=proxy_secrets)
 
 
 def _proxy_ref(cfg: dict[str, Any]) -> str:
@@ -284,69 +217,41 @@ def _proxy_ref(cfg: dict[str, Any]) -> str:
     return "env:ANTI_TRACE_PROXY_" + hashlib.sha256(identity.encode()).hexdigest().upper()
 
 
-def _secret_directory(*, create: bool = False) -> Path:
-    directory = BASE / ".secrets" / "proxies"
-    for path in (BASE, BASE / ".secrets", directory):
-        if create:
-            path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if not path.exists() and not path.is_symlink():
-            return directory
-        details = path.lstat()
-        if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid() or (path != BASE and stat.S_IMODE(details.st_mode) != 0o700):
-            raise ProfileError("unsafe_secret_store: private credential directory is not owner-only")
-    return directory
+def _secret_authority(proxy_secrets: ProxySecrets | None) -> ProxySecrets:
+    if proxy_secrets is None:
+        raise ProfileError("capability_unavailable: Host proxy-secret service is required")
+    return proxy_secrets
 
 
-def _secret_path(cfg: dict[str, Any], *, create: bool = False) -> Path:
-    return _secret_directory(create=create) / (_proxy_ref(cfg)[4:] + ".json")
-
-
-def read_proxy_secret(cfg: dict[str, Any]) -> str | None:
+def read_proxy_secret(cfg: dict[str, Any], *, proxy_secrets: ProxySecrets | None) -> str | None:
     if (cfg.get("network") or {}).get("proxy_ref") != _proxy_ref(cfg):
         return None
-    path = _secret_path(cfg)
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise ProfileError("unsafe_secret_store: cannot open owned credential") from exc
-    with os.fdopen(descriptor, "rb") as stream:
-        details = os.fstat(stream.fileno())
-        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o600 or details.st_nlink != 1:
-            raise ProfileError("unsafe_secret_store: credential is not an owner-only regular file")
-        try:
-            value = json.load(stream)
-        except (ValueError, UnicodeError) as exc:
-            raise ProfileError("invalid_config: corrupt private credential") from exc
-    if not isinstance(value, dict) or value.get("id") != cfg["id"] or not isinstance(value.get("proxy"), str):
-        raise ProfileError("invalid_config: corrupt private credential")
-    return value["proxy"]
+    return _secret_authority(proxy_secrets).read(cfg["id"])
 
 
-def clear_proxy_secret(cfg: dict[str, Any]) -> None:
+def clear_proxy_secret(cfg: dict[str, Any], *, proxy_secrets: ProxySecrets | None) -> None:
     if cfg.get("id"):
-        path = _secret_path(cfg)
-        if path.exists() or path.is_symlink():
-            path.unlink()
-            _sync_directory(path.parent)
+        _secret_authority(proxy_secrets).delete(cfg["id"])
 
 
-def configure_proxy(cfg: dict[str, Any], value: str | None) -> None:
+def configure_proxy(cfg: dict[str, Any], value: str | None, *, proxy_secrets: ProxySecrets | None = None) -> None:
     network = cfg.setdefault("network", {})
     if value is None or value.strip().upper() in {"DIRECT", "NONE", ""}:
-        clear_proxy_secret(cfg)
+        if cfg.get("id") and network.get("proxy_ref") == _proxy_ref(cfg):
+            clear_proxy_secret(cfg, proxy_secrets=proxy_secrets)
         network["proxy_ref"] = None
     elif re.fullmatch(r"env:[A-Za-z_][A-Za-z0-9_]*", value):
         from .native_spec import resolve_proxy
         candidate = copy.deepcopy(cfg)
         candidate["network"]["proxy_ref"] = value
-        resolve_proxy(candidate)
+        resolve_proxy(candidate, proxy_secrets=proxy_secrets)
+        if cfg.get("id") and network.get("proxy_ref") == _proxy_ref(cfg) and value != network["proxy_ref"]:
+            clear_proxy_secret(cfg, proxy_secrets=proxy_secrets)
         network["proxy_ref"] = value
     else:
         # Validate without installing or changing process-global environment.
         _validate_proxy_url(value, cfg)
-        _write(_secret_path(cfg, create=True), {"id": cfg["id"], "proxy": value})
+        _secret_authority(proxy_secrets).write(cfg["id"], value)
         network["proxy_ref"] = _proxy_ref(cfg)
     network.pop("proxy", None)
     network.pop("proxy_credentials_required", None)
@@ -403,27 +308,29 @@ def _runtime_adapter(runtime: str | None, adapters: RuntimeAdapters | None) -> R
 
 
 def _validate_runtime(cfg: dict[str, Any], *, runtime_adapters: RuntimeAdapters | None = None,
-                      check_artifacts: bool = True) -> None:
+                      check_artifacts: bool = True,
+                      artifact_content: ArtifactContent | None = None) -> None:
     runtime = (cfg.get("runtime") or {}).get("id")
     if runtime in NATIVE_RUNTIMES:
         from .native_spec import validate_native_spec
-        validate_native_spec(cfg, check_artifacts=check_artifacts)
+        validate_native_spec(cfg, check_artifacts=check_artifacts, artifact_content=artifact_content)
     else:
         _runtime_adapter(runtime, runtime_adapters).validate(cfg, check_artifacts=check_artifacts)
 
 
 def _validate_managed(cfg: dict[str, Any], *, storage: Path | None = None,
-                      runtime_adapters: RuntimeAdapters | None = None) -> None:
+                      runtime_adapters: RuntimeAdapters | None = None,
+                      artifact_content: ArtifactContent | None = None) -> None:
     if cfg.get("mode") != "managed" or cfg.get("schema") != SCHEMA:
         raise ProfileError("incompatible_profile: explicit managed schema3 migration required")
     if cfg.get("network", {}).get("proxy"):
         raise ProfileError("incompatible_profile: managed schema3 credentials must use a private reference")
     if storage is not None and cfg.get("storage", {}).get("path") != str((storage / "data").resolve()):
         raise ProfileError("incompatible_profile: storage is not owned by this profile")
-    _validate_runtime(cfg, runtime_adapters=runtime_adapters)
+    _validate_runtime(cfg, runtime_adapters=runtime_adapters, artifact_content=artifact_content)
 
 
-def _archive(directory: Path, cfg: dict[str, Any], out: Path, *, include_credentials: bool = False, bundle_fonts: bool = True, snapshot_identity: str | None = None) -> Path:
+def _archive(directory: Path, cfg: dict[str, Any], out: Path, *, include_credentials: bool = False, bundle_fonts: bool = True, snapshot_identity: str | None = None, proxy_secrets: ProxySecrets | None = None, artifact_content: ArtifactContent | None = None) -> Path:
     name = cfg["name"]
     out = out.resolve()
     if out.is_relative_to(directory.resolve()):
@@ -466,7 +373,7 @@ def _archive(directory: Path, cfg: dict[str, Any], out: Path, *, include_credent
             if bundle_fonts:
                 from .native_spec import file_sha256
                 for filename in cfg.get("asset_paths", {}).get("fonts", []):
-                    digest = file_sha256(filename)
+                    digest = file_sha256(filename, artifact_content=artifact_content)
                     relative = f".assets/fonts/{digest}"
                     if relative not in entries:
                         add_file(relative, Path(filename))
@@ -488,9 +395,16 @@ def _archive(directory: Path, cfg: dict[str, Any], out: Path, *, include_credent
                     raise ProfileError(f"unsafe_archive: unsafe profile entry: {relative}")
             credentials = False
             if include_credentials and cfg.get("network", {}).get("proxy_ref"):
-                from .native_spec import resolve_proxy
-                add_bytes(".proxy-credentials.json", canonical_bytes({"id": cfg["id"], "proxy": resolve_proxy(cfg)}))
-                credentials = True
+                if snapshot_identity is None:
+                    from .native_spec import resolve_proxy
+                    secret = resolve_proxy(cfg, proxy_secrets=proxy_secrets)
+                elif cfg.get("id") and cfg["network"]["proxy_ref"] == _proxy_ref(cfg):
+                    secret = read_proxy_secret(cfg, proxy_secrets=proxy_secrets)
+                else:
+                    secret = None
+                if secret is not None:
+                    add_bytes(".proxy-credentials.json", canonical_bytes({"id": cfg["id"], "proxy": secret}))
+                    credentials = True
             manifest = canonical_bytes({"schema": 1, "profile_schema": cfg["schema"], "runtime": cfg.get("runtime"), "assets": cfg.get("assets"), "storage_format_version": cfg.get("storage", {}).get("format_version"), "credentials_included": credentials, "font_bindings": font_bindings, "snapshot_identity": snapshot_identity, "files": entries})
             info = tarfile.TarInfo(f"{name}/{ARCHIVE_MANIFEST}")
             info.size, info.mode = len(manifest), 0o600
@@ -504,15 +418,20 @@ def _archive(directory: Path, cfg: dict[str, Any], out: Path, *, include_credent
     return out
 
 
-def export(name: str, dest: Path | None = None, *, include_credentials: bool = False,
-           runtime_adapters: RuntimeAdapters | None = None) -> Path:
+def export(name: str, dest: Path, *, leases: ProfileLeases, owners: ProfileOwners,
+           include_credentials: bool = False, runtime_adapters: RuntimeAdapters | None = None, proxy_secrets: ProxySecrets | None = None,
+           artifact_content: ArtifactContent | None = None) -> Path:
+    if dest is None:
+        raise ProfileError("capability_unavailable: explicit export destination is required")
     name = sanitize(name)
-    with exclusive(name, kind="spawn") as serialized, exclusive(name) as owned:
-        if not serialized or not owned or owner_alive(load_state(name)):
+    with exclusive(name, kind="spawn", leases=leases) as serialized, exclusive(name, leases=leases) as owned:
+        if not serialized or not owned or owners.alive(BASE, name):
             raise ProfileError(f"busy: stop {name} before export")
         cfg = require(name)
-        _validate_managed(cfg, storage=profile_dir(name), runtime_adapters=runtime_adapters)
-        return _archive(profile_dir(name), cfg, dest or Path.cwd() / f"{name}.atb.tar.gz", include_credentials=include_credentials)
+        _validate_managed(cfg, storage=profile_dir(name), runtime_adapters=runtime_adapters,
+                          artifact_content=artifact_content)
+        return _archive(profile_dir(name), cfg, dest, include_credentials=include_credentials,
+                        proxy_secrets=proxy_secrets, artifact_content=artifact_content)
 
 
 @contextmanager
@@ -592,20 +511,21 @@ def _sync_tree(directory: Path) -> None:
     _sync_directory(directory)
 
 
-def import_archive(archive: Path, rename: str | None = None, *, proxy: str | None = None,
-                   native_binary: str | Path | None = None,
-                   runtime_adapters: RuntimeAdapters | None = None) -> str:
+def import_archive(archive: Path, rename: str | None = None, *, leases: ProfileLeases, owners: ProfileOwners,
+                   proxy: str | None = None, native_binary: str | Path | None = None,
+                   runtime_adapters: RuntimeAdapters | None = None, proxy_secrets: ProxySecrets | None = None,
+                   artifact_content: ArtifactContent | None = None) -> str:
     store().mkdir(parents=True, exist_ok=True, mode=0o700)
     staging = Path(tempfile.mkdtemp(prefix=".import-", dir=store())).resolve()
-    installed_secret = False
     cfg: dict[str, Any] = {}
     try:
         extracted, cfg, manifest = _extract_archive(archive, staging)
         if cfg["schema"] != SCHEMA:
             raise ProfileError("incompatible_profile: migrate the source profile before import")
-        _validate_runtime(cfg, runtime_adapters=runtime_adapters, check_artifacts=False)
+        _validate_runtime(cfg, runtime_adapters=runtime_adapters, check_artifacts=False,
+                          artifact_content=artifact_content)
         dest_name = sanitize(rename or cfg["name"])
-        with exclusive(dest_name, kind="spawn") as serialized, exclusive(dest_name) as owned, exclusive("catalog", kind="catalog") as catalog:
+        with exclusive(dest_name, kind="spawn", leases=leases) as serialized, exclusive(dest_name, leases=leases) as owned, exclusive("catalog", kind="catalog", leases=leases) as catalog:
             if not serialized or not owned or not catalog:
                 raise ProfileError(f"busy: {dest_name}")
             dest = profile_dir(dest_name)
@@ -614,7 +534,7 @@ def import_archive(archive: Path, rename: str | None = None, *, proxy: str | Non
             cfg["name"] = dest_name
             cfg.setdefault("storage", {})["path"] = str((dest / "data").resolve())
             from .native_spec import check_identity_collision, file_sha256
-            check_identity_collision(cfg, [load_config(row["name"]) or {} for row in list_profiles()])
+            check_identity_collision(cfg, [load_config(row["name"]) or {} for row in list_profiles(owners=owners)])
             bindings = manifest.get("font_bindings")
             fonts = cfg.get("asset_paths", {}).get("fonts", [])
             if not isinstance(bindings, dict) or set(bindings) != set(fonts):
@@ -622,61 +542,64 @@ def import_archive(archive: Path, rename: str | None = None, *, proxy: str | Non
             rebound = []
             for original in fonts:
                 relative = bindings[original]
-                if not isinstance(relative, str) or not re.fullmatch(r"\.assets/fonts/[0-9a-f]{64}", relative) or relative not in manifest["files"] or file_sha256(extracted / relative) != relative.rsplit("/", 1)[1]:
+                if not isinstance(relative, str) or not re.fullmatch(r"\.assets/fonts/[0-9a-f]{64}", relative) or relative not in manifest["files"] or file_sha256(extracted / relative, artifact_content=artifact_content) != relative.rsplit("/", 1)[1]:
                     raise ProfileError("archive_integrity: invalid bundled font binding")
                 rebound.append(str((extracted / relative).resolve()))
             cfg["asset_paths"]["fonts"] = sorted(set(rebound))
             if native_binary is not None:
                 binary = Path(native_binary).expanduser().resolve()
-                if file_sha256(binary) != cfg["runtime"]["artifact_sha256"]:
+                if file_sha256(binary, artifact_content=artifact_content) != cfg["runtime"]["artifact_sha256"]:
                     raise ProfileError("incompatible_profile: replacement runtime must have identical pinned bytes")
                 cfg["runtime"]["binary"] = str(binary)
-            _validate_managed(cfg, runtime_adapters=runtime_adapters)
+            _validate_managed(cfg, runtime_adapters=runtime_adapters, artifact_content=artifact_content)
             cfg["asset_paths"]["fonts"] = sorted({str(dest / Path(path).relative_to(extracted)) for path in rebound})
             credential = _read(extracted / ".proxy-credentials.json")
             if manifest.get("credentials_included") and credential is None:
                 raise ProfileError("archive_integrity: invalid credential payload")
             if credential is not None and (credential.get("id") != cfg["id"] or not isinstance(credential.get("proxy"), str)):
                 raise ProfileError("archive_integrity: credential identity mismatch")
-            if proxy is not None or credential is not None:
-                # All validation happens first; no existing identity can own this key.
-                installed_secret = True
-                configure_proxy(cfg, proxy if proxy is not None else credential["proxy"])
-            _write(extracted / "config.json", cfg)
-            (extracted / ARCHIVE_MANIFEST).unlink()
-            (extracted / ".proxy-credentials.json").unlink(missing_ok=True)
-            _sync_tree(extracted)
-            os.replace(extracted, dest)
-            installed_secret = False
+            secret_changed = False
+            secret_backup = None
+            try:
+                if proxy is not None or credential is not None:
+                    selected = proxy if proxy is not None else credential["proxy"]
+                    installs_secret = bool(selected and selected.strip().upper() not in {"DIRECT", "NONE"} and not re.fullmatch(r"env:[A-Za-z_][A-Za-z0-9_]*", selected))
+                    owns_secret = cfg.get("network", {}).get("proxy_ref") == _proxy_ref(cfg)
+                    if installs_secret:
+                        _validate_proxy_url(selected, cfg)
+                    if installs_secret or owns_secret:
+                        secret_backup = _secret_authority(proxy_secrets).read(cfg["id"])
+                        secret_changed = True
+                    configure_proxy(cfg, selected, proxy_secrets=proxy_secrets)
+                _write(extracted / "config.json", cfg)
+                (extracted / ARCHIVE_MANIFEST).unlink()
+                (extracted / ".proxy-credentials.json").unlink(missing_ok=True)
+                _sync_tree(extracted)
+                os.replace(extracted, dest)
+            except BaseException:
+                if secret_changed:
+                    authority = _secret_authority(proxy_secrets)
+                    if secret_backup is None:
+                        authority.delete(cfg["id"])
+                    else:
+                        authority.write(cfg["id"], secret_backup)
+                raise
             _sync_directory(store())
         return dest_name
     finally:
-        if installed_secret:
-            clear_proxy_secret(cfg)
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _exchange_directories(left: Path, right: Path) -> None:
-    """Atomically exchange complete trees; leases protect readers during cleanup."""
-    import ctypes
-    import sys
-    libc = ctypes.CDLL(None, use_errno=True)
-    symbol = "renameatx_np" if sys.platform == "darwin" else "renameat2"
-    operation = getattr(libc, symbol, None)
-    if operation is None:
-        raise ProfileError("capability_unavailable: atomic directory exchange is unavailable")
-    operation.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    operation.restype = ctypes.c_int
-    if operation(-2 if sys.platform == "darwin" else -100, os.fsencode(left), -2 if sys.platform == "darwin" else -100, os.fsencode(right), 2):
-        raise OSError(ctypes.get_errno(), "atomic profile tree exchange failed")
 
 
-def migrate(name: str, *, binary: str | Path | None = None, overrides: dict[str, Any] | None = None,
+def migrate(name: str, *, leases: ProfileLeases, owners: ProfileOwners, clock: WallClock, directories: AtomicDirectories,
+            snapshots: SnapshotDirectories, binary: str | Path | None = None, overrides: dict[str, Any] | None = None,
             assets: dict[str, list[str]] | None = None, rollback: str | Path | None = None,
-            runtime_adapters: RuntimeAdapters | None = None) -> dict[str, Any]:
+            runtime_adapters: RuntimeAdapters | None = None, proxy_secrets: ProxySecrets | None = None,
+            artifact_content: ArtifactContent | None = None) -> dict[str, Any]:
     name = sanitize(name)
-    with exclusive(name, kind="spawn") as serialized, exclusive(name) as owned, exclusive("catalog", kind="catalog") as catalog:
-        if not serialized or not owned or not catalog or owner_alive(load_state(name)):
+    with exclusive(name, kind="spawn", leases=leases) as serialized, exclusive(name, leases=leases) as owned, exclusive("catalog", kind="catalog", leases=leases) as catalog:
+        if not serialized or not owned or not catalog or owners.alive(BASE, name):
             raise ProfileError(f"busy: stop {name} before migration")
         cfg = require(name)
         directory = profile_dir(name)
@@ -693,11 +616,12 @@ def migrate(name: str, *, binary: str | Path | None = None, overrides: dict[str,
                 if previous.get("storage", {}).get("format_version", 1) != cfg.get("storage", {}).get("format_version", 1):
                     raise ProfileError("incompatible_profile: snapshot storage format differs")
                 if previous.get("schema") == SCHEMA:
-                    _validate_managed(previous, storage=directory, runtime_adapters=runtime_adapters)
+                    _validate_managed(previous, storage=directory, runtime_adapters=runtime_adapters,
+                                      artifact_content=artifact_content)
                     if previous["id"] != cfg.get("id"):
                         raise ProfileError("incompatible_profile: snapshot environment id changed")
                     from .native_spec import check_identity_collision
-                    check_identity_collision(previous, [load_config(row["name"]) or {} for row in list_profiles() if row["name"] != name])
+                    check_identity_collision(previous, [load_config(row["name"]) or {} for row in list_profiles(owners=owners) if row["name"] != name])
                 configuration_digest = manifest["files"]["config.json"]["sha256"]
                 credential = _read(extracted / ".proxy-credentials.json")
                 if manifest.get("credentials_included") and credential is None:
@@ -708,23 +632,32 @@ def migrate(name: str, *, binary: str | Path | None = None, overrides: dict[str,
                 (extracted / ARCHIVE_MANIFEST).unlink()
                 _sync_tree(extracted)
                 backup = None
-                owned_credential = credential is not None and previous.get("network", {}).get("proxy_ref") == _proxy_ref(previous)
-                if owned_credential:
-                    _validate_proxy_url(credential["proxy"], previous)
-                    backup = read_proxy_secret(previous)
-                    _write(_secret_path(previous, create=True), credential)
+                owned_credential = bool(previous.get("id") and previous.get("network", {}).get("proxy_ref") == _proxy_ref(previous))
+                remove_current = bool(not previous.get("network", {}).get("proxy_ref") and cfg.get("id") and cfg.get("network", {}).get("proxy_ref") == _proxy_ref(cfg))
+                secret_cfg = previous if owned_credential else cfg
+                if owned_credential or remove_current:
+                    if owned_credential and credential is not None:
+                        _validate_proxy_url(credential["proxy"], previous)
+                    backup = read_proxy_secret(secret_cfg, proxy_secrets=proxy_secrets)
                 try:
-                    _exchange_directories(directory, extracted)
-                except BaseException:
-                    if owned_credential:
-                        if backup is None:
-                            clear_proxy_secret(previous)
+                    if owned_credential or remove_current:
+                        if not owned_credential or credential is None:
+                            clear_proxy_secret(secret_cfg, proxy_secrets=proxy_secrets)
                         else:
-                            _write(_secret_path(previous, create=True), {"id": previous["id"], "proxy": backup})
+                            _secret_authority(proxy_secrets).write(previous["id"], credential["proxy"])
+                    try:
+                        directories.exchange(directory, extracted)
+                    except AtomicExchangeUnavailable as exc:
+                        raise ProfileError("capability_unavailable: atomic directory exchange is unavailable") from exc
+                except BaseException:
+                    if owned_credential or remove_current:
+                        if backup is None:
+                            clear_proxy_secret(secret_cfg, proxy_secrets=proxy_secrets)
+                        else:
+                            _secret_authority(proxy_secrets).write(secret_cfg["id"], backup)
                     raise
                 _sync_directory(store())
-                if not previous.get("network", {}).get("proxy_ref") and cfg.get("network", {}).get("proxy_ref") == _proxy_ref(cfg):
-                    clear_proxy_secret(cfg)
+                # Secret changes were committed before the tree exchange.
                 return {"status": "ok", "environment": name, "revision": previous.get("revision", 1), "rolled_back": True, "configuration_sha256": configuration_digest}
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
@@ -735,7 +668,8 @@ def migrate(name: str, *, binary: str | Path | None = None, overrides: dict[str,
         from .native_spec import check_identity_collision
         if runtime in NATIVE_RUNTIMES:
             from .native_spec import migrate_native_spec
-            result = migrate_native_spec(cfg, binary=binary, overrides=overrides, assets=assets)
+            result = migrate_native_spec(cfg, binary=binary, overrides=overrides, assets=assets,
+                                         artifact_content=artifact_content)
         else:
             if assets is not None:
                 raise ProfileError("invalid_config: asset migration requires a native runtime")
@@ -743,33 +677,37 @@ def migrate(name: str, *, binary: str | Path | None = None, overrides: dict[str,
                 cfg, name=name, binary=binary, overrides=overrides, inline_proxy=inline_proxy)
         with (directory / "config.json").open("rb") as stream:
             result["previous_environment_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
-        _validate_managed(result, storage=directory, runtime_adapters=runtime_adapters)
+        _validate_managed(result, storage=directory, runtime_adapters=runtime_adapters,
+                          artifact_content=artifact_content)
         if inline_proxy and inline_proxy.strip().upper() not in {"DIRECT", "NONE", ""}:
             _validate_proxy_url(inline_proxy, result)
-        check_identity_collision(result, [load_config(row["name"]) or {} for row in list_profiles() if row["name"] != name])
-        snapshots = BASE / "snapshots" / hashlib.sha256(str(cfg.get("id", name)).encode()).hexdigest()
-        for path in (BASE / "snapshots", snapshots):
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
-            details = path.lstat()
-            if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid():
-                raise ProfileError("unsafe_snapshot_store: snapshots must be manager-owned directories")
-            os.chmod(path, 0o700)
-        snapshot = snapshots / f"revision-{cfg.get('revision', 1)}-{time.time_ns()}.atb.tar.gz"
-        _archive(directory, cfg, snapshot, bundle_fonts=False, snapshot_identity=result["id"], include_credentials=True)
+        check_identity_collision(result, [load_config(row["name"]) or {} for row in list_profiles(owners=owners) if row["name"] != name])
+        timestamp = clock.unix_time_ns()
+        if type(timestamp) is not int:
+            raise ProfileError("capability_unavailable: invalid Host wall clock value")
+        try:
+            snapshot_dir = snapshots.prepare(str(cfg.get("id", name)))
+        except UnsafeSnapshotStore as exc:
+            raise ProfileError(f"unsafe_snapshot_store: {exc}") from exc
+        snapshot = snapshot_dir / f"revision-{cfg.get('revision', 1)}-{timestamp}.atb.tar.gz"
+        _archive(directory, cfg, snapshot, bundle_fonts=False, snapshot_identity=result["id"], include_credentials=True, proxy_secrets=proxy_secrets,
+                 artifact_content=artifact_content)
         backup = None
-        if inline_proxy:
+        installed_inline = bool(inline_proxy and inline_proxy.strip().upper() not in {"DIRECT", "NONE", ""})
+        if installed_inline:
             probe = copy.deepcopy(result)
             probe["network"]["proxy_ref"] = _proxy_ref(result)
-            backup = read_proxy_secret(probe)
-            configure_proxy(result, inline_proxy)
+            backup = read_proxy_secret(probe, proxy_secrets=proxy_secrets)
         try:
+            if inline_proxy:
+                configure_proxy(result, inline_proxy, proxy_secrets=proxy_secrets)
             save_config(name, result)
         except BaseException:
-            if inline_proxy and load_config(name) != result:
+            if installed_inline and load_config(name) != result:
                 if backup is None:
-                    clear_proxy_secret(result)
+                    clear_proxy_secret(result, proxy_secrets=proxy_secrets)
                 else:
-                    _write(_secret_path(result, create=True), {"id": result["id"], "proxy": backup})
+                    _secret_authority(proxy_secrets).write(result["id"], backup)
             raise
         with snapshot.open("rb") as stream:
             snapshot_digest = hashlib.file_digest(stream, "sha256").hexdigest()

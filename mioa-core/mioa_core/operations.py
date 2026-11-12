@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import inspect
 from typing import Any, Awaitable, Callable
-import uuid
+from mioa_os_api import SecureRandom
+
+from .native_spec import NativeError, _secure_bytes
 
 MAX_ELEMENTS = 300
 MAX_TEXT = 120
@@ -57,17 +59,21 @@ class ScriptOperations:
     """
 
     def __init__(self, context: Any, *, active_page: Callable[[], Any],
-                 axtree: Callable[..., Awaitable[dict[str, Any]]] | None = None):
+                 axtree: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+                 random: SecureRandom | None = None):
         self.context = context
         self.active_page = active_page
         self.axtree = axtree
+        self.random = random
         self._pages: dict[str, Any] = {}
 
     def page_id(self, page: Any) -> str:
         for key, existing in self._pages.items():
             if existing is page:
                 return key
-        key = "page-" + uuid.uuid4().hex
+        if self.random is None:
+            raise NativeError("capability_unavailable", "Host secure randomness capability is required")
+        key = "page-" + _secure_bytes(self.random, 16).hex()
         self._pages[key] = page
         return key
 

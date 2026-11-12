@@ -9,18 +9,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 import re
-import secrets
 import struct
-from pathlib import Path
+from pathlib import PurePath
 from typing import Any, Iterable, Literal, TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from mioa_os_api import ArtifactContent, ArtifactDiscovery, ProxySecrets, SecureRandom
 
 SCHEMA = 3
 GENERATOR_VERSION = "native-3.3"
 ADAPTER_VERSION = "native-cdp-1"
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = PurePath(__file__).parents[2]
 PINS = {
     "obscura": ("7c751c5cd8833ac951d48320218c4fe91aa97ac8", "runtime/.local/build/renderer/target/release/obscura"),
     "lightpanda": ("c5f7bb29b127040c899d4e181b5709f76fc71a6f", "runtime/.local/build/engine/zig-out/bin/lightpanda"),
@@ -88,32 +87,45 @@ def environment_digest(cfg: dict[str, Any]) -> str:
     return hashlib.sha256(native_config_bytes(native_engine_config(cfg))).hexdigest()
 
 
-def file_sha256(path: str | Path) -> str:
-    location = Path(path).resolve()
-    def identity(stat: os.stat_result) -> tuple[Any, ...]:
-        return (str(location), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+def _artifact_content(content: ArtifactContent | None) -> ArtifactContent:
+    _require(content is not None, "Host artifact-content capability is required", "capability_unavailable")
+    return content
+
+
+def _resolved_path(content: ArtifactContent | None, path: str | PurePath) -> str:
     try:
-        key = identity(location.stat())
+        return _artifact_content(content).resolve(path)
+    except OSError as exc:
+        raise NativeError("invalid_config", f"cannot resolve artifact path {path}: {exc}") from exc
+
+
+def file_sha256(path: str | PurePath, *, artifact_content: ArtifactContent | None = None) -> str:
+    content = _artifact_content(artifact_content)
+    try:
+        location = content.resolve(path)
+        key = (location, *content.fingerprint(location))
         cached = _FILE_SHA_CACHE.get(key)
         if cached is not None:
             return cached
-        with location.open("rb") as stream:
-            before = identity(os.fstat(stream.fileno()))
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            after = identity(os.fstat(stream.fileno()))
-        if before != after:
-            raise NativeError("incompatible_profile", f"pinned artifact changed while hashing: {location}")
-        if len(_FILE_SHA_CACHE) >= 8192:
-            _FILE_SHA_CACHE.clear()
-        _FILE_SHA_CACHE[before] = digest
-        return digest
+        digest = content.digest(location)
     except OSError as exc:
-        raise NativeError("incompatible_profile", f"cannot read pinned artifact {location}: {exc}") from exc
+        raise NativeError("incompatible_profile", f"cannot read pinned artifact {path}: {exc}") from exc
+    if len(_FILE_SHA_CACHE) >= 8192:
+        _FILE_SHA_CACHE.clear()
+    _FILE_SHA_CACHE[key] = digest
+    return digest
 
 
 def _require(condition: bool, message: str, code: str = "invalid_config") -> None:
     if not condition:
         raise NativeError(code, message)
+
+
+def _secure_bytes(random: SecureRandom, count: int) -> bytes:
+    value = random.bytes(count)
+    _require(isinstance(value, bytes) and len(value) == count,
+             "Host secure randomness returned invalid bytes", "capability_unavailable")
+    return value
 
 
 def _sha(value: Any) -> bool:
@@ -125,29 +137,30 @@ def _integer(value: Any, low: int, high: int) -> bool:
 
 
 
-def resolve_binary(runtime: str, binary: str | Path | None = None) -> Path:
+def resolve_binary(runtime: str, binary: str | PurePath | None = None, *,
+                   artifact_discovery: ArtifactDiscovery | None = None,
+                   artifact_content: ArtifactContent | None = None) -> PurePath:
     _require(runtime in PINS, f"unknown native runtime {runtime!r}")
-    configured = binary or os.environ.get(f"ANTI_TRACE_{runtime.upper()}_BINARY")
-    path = Path(configured).expanduser() if configured else ROOT / PINS[runtime][1]
-    path = path.resolve()
-    _require(path.is_file() and os.access(path, os.X_OK), f"native executable missing or not executable: {path}; build the Core runtime with runtime/build.mjs or set --native-binary", "capability_unavailable")
-    return path
+    content = _artifact_content(artifact_content)
+    if binary is None:
+        _require(artifact_discovery is not None, "native binary discovery capability is unavailable; provide an explicit binary", "capability_unavailable")
+        binary = artifact_discovery.default_binary(runtime, ROOT / PINS[runtime][1])
+    try:
+        return PurePath(content.executable(binary))
+    except OSError as exc:
+        raise NativeError("capability_unavailable", f"{exc}; build the Core runtime with runtime/build.mjs or set --native-binary") from exc
 
 
-def runtime_spec(runtime: str, binary: str | Path | None = None) -> RuntimeSpec:
-    path = resolve_binary(runtime, binary)
-    return {"id": runtime, "version": PINS[runtime][0], "artifact_sha256": file_sha256(path), "adapter_version": ADAPTER_VERSION, "binary": str(path)}
+def runtime_spec(runtime: str, binary: str | PurePath | None = None, *,
+                 artifact_discovery: ArtifactDiscovery | None = None,
+                 artifact_content: ArtifactContent | None = None) -> RuntimeSpec:
+    path = resolve_binary(runtime, binary, artifact_discovery=artifact_discovery,
+                          artifact_content=artifact_content)
+    return {"id": runtime, "version": PINS[runtime][0], "artifact_sha256": file_sha256(path, artifact_content=artifact_content), "adapter_version": ADAPTER_VERSION, "binary": str(path)}
 
 
-def _host_font_paths() -> list[str]:
-    directories = [Path("/System/Library/Fonts"), Path("/Library/Fonts"), Path.home() / "Library/Fonts"]
-    paths = {str(p.resolve()) for directory in directories if directory.is_dir() for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in {".ttf", ".otf", ".ttc"}}
-    _require(bool(paths), "no actual font files found; provide asset_paths.fonts", "capability_unavailable")
-    return sorted(paths)
-
-
-def _assets(resolved: dict[str, Any], paths: list[str]) -> dict[str, str]:
-    fonts = sorted({file_sha256(path) for path in paths})
+def _assets(resolved: dict[str, Any], paths: list[str], *, artifact_content: ArtifactContent | None = None) -> dict[str, str]:
+    fonts = sorted({file_sha256(path, artifact_content=artifact_content) for path in paths})
     render = {k: resolved[k] for k in ("device_scale_factor", "color_depth", "pixel_depth", "screen_width", "screen_height", "fonts", "gl_backend")}
     render["device_scale_factor"] = format(resolved["device_scale_factor"], ".6f").rstrip("0").rstrip(".")
     return {"fonts_sha256": _digest(fonts), "render_config_sha256": _digest(render)}
@@ -218,26 +231,34 @@ def check_identity_collision(cfg: dict[str, Any], existing: Iterable[dict[str, A
             raise NativeError("identity_collision", f"resolved runtime/assets identity duplicates environment {other.get('name', other.get('id'))!r}")
 
 
-def create_native_spec(name: str, *, runtime: str, storage_path: str | Path, seed: str | None = None, overrides: dict[str, Any] | None = None, network: dict[str, Any] | None = None, permissions: dict[str, str] | None = None, existing: Iterable[dict[str, Any]] = (), binary: str | Path | None = None, asset_paths: dict[str, list[str]] | None = None) -> dict[str, Any]:
+def create_native_spec(name: str, *, runtime: str, storage_path: str | PurePath, seed: str | None = None, overrides: dict[str, Any] | None = None, network: dict[str, Any] | None = None, permissions: dict[str, str] | None = None, existing: Iterable[dict[str, Any]] = (), binary: str | PurePath | None = None, asset_paths: dict[str, list[str]] | None = None, artifact_discovery: ArtifactDiscovery | None = None, artifact_content: ArtifactContent | None = None, random: SecureRandom | None = None) -> dict[str, Any]:
+    _require(random is not None, "Host secure randomness capability is required", "capability_unavailable")
+    return _build_native_spec(name, runtime=runtime, storage_path=storage_path,
+        seed=seed if seed is not None else _secure_bytes(random, 32).hex(), identity=_secure_bytes(random, 16).hex(), overrides=overrides,
+        network=network, permissions=permissions, existing=existing, binary=binary,
+        asset_paths=asset_paths, artifact_discovery=artifact_discovery, artifact_content=artifact_content)
+
+
+def _build_native_spec(name: str, *, runtime: str, storage_path: str | PurePath, seed: str, identity: str, overrides: dict[str, Any] | None = None, network: dict[str, Any] | None = None, permissions: dict[str, str] | None = None, existing: Iterable[dict[str, Any]] = (), binary: str | PurePath | None = None, asset_paths: dict[str, list[str]] | None = None, artifact_discovery: ArtifactDiscovery | None = None, artifact_content: ArtifactContent | None = None) -> dict[str, Any]:
     _require(runtime in PINS, f"unknown native runtime {runtime!r}")
     _require(overrides is None or isinstance(overrides, dict), "overrides must be an object")
     _require(network is None or isinstance(network, dict), "network must be an object")
     _require(permissions is None or isinstance(permissions, dict), "permissions must be an object")
-    seed = seed if seed is not None else secrets.token_hex(32)
     _require(isinstance(seed, str) and re.fullmatch(r"[0-9a-f]{32,128}", seed) is not None and len(seed) % 2 == 0, "seed must be 16..64 bytes lowercase hex")
     overrides = copy.deepcopy(overrides or {})
     resolved = _resolve(seed, runtime, overrides)
     _validate_resolved(resolved)
-    paths = asset_paths or {"fonts": _host_font_paths()}
-    _require(isinstance(paths, dict) and set(paths) == {"fonts"} and isinstance(paths["fonts"], list) and bool(paths["fonts"]) and all(isinstance(p, str) and Path(p).is_absolute() for p in paths["fonts"]), "asset_paths must contain actual absolute font files")
-    cfg = {"schema": SCHEMA, "id": secrets.token_hex(16), "name": name, "mode": "managed", "revision": 1, "seed": seed, "generator_version": GENERATOR_VERSION, "runtime": runtime_spec(runtime, binary), "overrides": overrides, "resolved": resolved, "asset_paths": copy.deepcopy(paths), "assets": _assets(resolved, paths["fonts"]), "network": {"proxy_ref": None, "egress_policy": "strict", "allow_private_network": False, **(network or {})}, "storage": {"format_version": 1, "path": str(Path(storage_path).expanduser().resolve())}, "permissions": dict(permissions or {}), "capabilities": {}, "identity_scope": "environment"}
+    paths = asset_paths if asset_paths is not None else native_font_assets(artifact_discovery=artifact_discovery)
+    _require(isinstance(paths, dict) and set(paths) == {"fonts"} and isinstance(paths["fonts"], list) and bool(paths["fonts"]) and all(isinstance(p, str) and PurePath(p).is_absolute() for p in paths["fonts"]), "asset_paths must contain actual absolute font files")
+    cfg = {"schema": SCHEMA, "id": identity, "name": name, "mode": "managed", "revision": 1, "seed": seed, "generator_version": GENERATOR_VERSION, "runtime": runtime_spec(runtime, binary, artifact_discovery=artifact_discovery, artifact_content=artifact_content), "overrides": overrides, "resolved": resolved, "asset_paths": copy.deepcopy(paths), "assets": _assets(resolved, paths["fonts"], artifact_content=artifact_content), "network": {"proxy_ref": None, "egress_policy": "strict", "allow_private_network": False, **(network or {})}, "storage": {"format_version": 1, "path": _resolved_path(artifact_content, storage_path)}, "permissions": dict(permissions or {}), "capabilities": {}, "identity_scope": "environment"}
     cfg["resolved_sha256"] = _digest(resolved)
-    validate_native_spec(cfg, name=name)
+    validate_native_spec(cfg, name=name, artifact_content=artifact_content)
     check_identity_collision(cfg, existing)
     return cfg
 
 
-def validate_native_spec(cfg: dict[str, Any], *, name: str | None = None, check_artifacts: bool = True) -> dict[str, Any]:
+def validate_native_spec(cfg: dict[str, Any], *, name: str | None = None, check_artifacts: bool = True,
+                         artifact_content: ArtifactContent | None = None) -> dict[str, Any]:
     _require(isinstance(cfg, dict) and cfg.get("schema") == SCHEMA, "native profiles require schema3; migrate explicitly", "incompatible_profile")
     _require(isinstance(cfg.get("id"), str) and bool(cfg["id"]) and _integer(cfg.get("revision"), 1, 2**53 - 1), "invalid environment id/revision")
     _require(isinstance(cfg.get("name"), str) and re.fullmatch(r"[\w-]+", cfg["name"]) is not None and cfg.get("mode") == "managed", "invalid managed environment name/mode")
@@ -249,13 +270,13 @@ def validate_native_spec(cfg: dict[str, Any], *, name: str | None = None, check_
     _require(isinstance(runtime, dict) and runtime.get("id") in PINS, "invalid native runtime")
     _require(runtime.get("version") == PINS[runtime["id"]][0] and runtime.get("adapter_version") == ADAPTER_VERSION, "runtime/adapter version changed; migrate explicitly", "incompatible_profile")
     _require(_sha(runtime.get("artifact_sha256")), "missing pinned runtime digest")
-    _require(isinstance(runtime.get("binary"), str) and Path(runtime["binary"]).is_absolute(), "runtime.binary must be absolute")
+    _require(isinstance(runtime.get("binary"), str) and PurePath(runtime["binary"]).is_absolute(), "runtime.binary must be absolute")
     _require(isinstance(cfg.get("resolved"), dict), "resolved must be an object")
     _validate_resolved(cfg["resolved"])
     _require(cfg["resolved"] == _resolve(cfg["seed"], runtime["id"], cfg.get("overrides", {})), "resolved does not match generator + explicit overrides", "incompatible_profile")
     _require(cfg.get("resolved_sha256") == _digest(cfg["resolved"]), "resolved digest mismatch", "incompatible_profile")
     storage = cfg.get("storage", {})
-    _require(isinstance(storage, dict) and storage.get("format_version") == 1 and isinstance(storage.get("path"), str) and Path(storage["path"]).is_absolute(), "invalid storage path/format")
+    _require(isinstance(storage, dict) and storage.get("format_version") == 1 and isinstance(storage.get("path"), str) and PurePath(storage["path"]).is_absolute(), "invalid storage path/format")
     net = cfg.get("network", {})
     _require(isinstance(net, dict) and not (set(net) - {"proxy_ref", "egress_policy", "allow_private_network"}) and net.get("egress_policy") in ("strict", "observe") and type(net.get("allow_private_network", False)) is bool, "invalid native network policy")
     ref = net.get("proxy_ref")
@@ -265,27 +286,28 @@ def validate_native_spec(cfg: dict[str, Any], *, name: str | None = None, check_
     _require(not any(v != "deny" for v in permissions.values()), "native permission grants/prompt backends are not implemented", "capability_unavailable")
     assets, paths = cfg.get("assets", {}), cfg.get("asset_paths", {})
     _require(isinstance(assets, dict) and set(assets) == {"fonts_sha256", "render_config_sha256"} and all(_sha(v) for v in assets.values()), "invalid asset digests")
-    _require(isinstance(paths, dict) and set(paths) == {"fonts"} and isinstance(paths["fonts"], list) and bool(paths["fonts"]) and all(isinstance(p, str) and Path(p).is_absolute() for p in paths["fonts"]), "asset_paths.fonts must pin actual absolute font files")
+    _require(isinstance(paths, dict) and set(paths) == {"fonts"} and isinstance(paths["fonts"], list) and bool(paths["fonts"]) and all(isinstance(p, str) and PurePath(p).is_absolute() for p in paths["fonts"]), "asset_paths.fonts must pin actual absolute font files")
     _require(isinstance(cfg.get("capabilities"), dict), "capabilities must be an object")
     _require(all(isinstance(feature, str) and isinstance(value, dict) and value.get("state") in {"implemented", "disabled", "unsupported"} and isinstance(value.get("reason"), str) for feature, value in cfg["capabilities"].items()), "invalid capability entries")
     if "previous_environment_sha256" in cfg:
         _require(cfg["revision"] > 1 and _sha(cfg["previous_environment_sha256"]), "migration must bind prior revision digest")
     _require(cfg["revision"] == 1 or _sha(cfg.get("previous_environment_sha256")), "revision >1 requires the prior committed environment digest")
     if check_artifacts:
-        binary = resolve_binary(runtime["id"], runtime["binary"])
-        _require(file_sha256(binary) == runtime["artifact_sha256"], "native executable bytes changed; explicit migration required", "incompatible_profile")
-        _require(_assets(cfg["resolved"], paths["fonts"]) == assets, "font/render assets changed; explicit migration required", "incompatible_profile")
+        content = _artifact_content(artifact_content)
+        binary = resolve_binary(runtime["id"], runtime["binary"], artifact_content=content)
+        _require(file_sha256(binary, artifact_content=content) == runtime["artifact_sha256"], "native executable bytes changed; explicit migration required", "incompatible_profile")
+        _require(_assets(cfg["resolved"], paths["fonts"], artifact_content=content) == assets, "font/render assets changed; explicit migration required", "incompatible_profile")
     return cfg
 
 
-def resolve_proxy(cfg: dict[str, Any]) -> str | None:
+def resolve_proxy(cfg: dict[str, Any], *, proxy_secrets: ProxySecrets | None) -> str | None:
     ref = cfg["network"].get("proxy_ref")
     if ref is None:
         return None
+    _require(proxy_secrets is not None, "Host proxy-secret service is required", "capability_unavailable")
     from . import profile
-    value = os.environ.get(ref[4:])
-    if value is None:
-        value = profile.read_proxy_secret(cfg)
+    identity = cfg.get("id") if cfg.get("id") and ref == profile._proxy_ref(cfg) else None
+    value = proxy_secrets.resolve(ref[4:], identity)
     _require(bool(value), "configured proxy credential reference is unavailable", "network_unavailable")
     try:
         profile._validate_proxy_url(value, cfg)
@@ -307,7 +329,7 @@ def compatibility_differences(saved: dict[str, Any], current: dict[str, Any]) ->
     return differences
 
 
-def migrate_native_spec(cfg: dict[str, Any], *, runtime: str | None = None, binary: str | Path | None = None, overrides: dict[str, Any] | None = None, assets: dict[str, list[str]] | None = None, network: dict[str, Any] | None = None) -> dict[str, Any]:
+def migrate_native_spec(cfg: dict[str, Any], *, runtime: str | None = None, binary: str | PurePath | None = None, overrides: dict[str, Any] | None = None, assets: dict[str, list[str]] | None = None, network: dict[str, Any] | None = None, artifact_content: ArtifactContent | None = None) -> dict[str, Any]:
     """Return a new revision, never mutate/archive/commit the old one.
 
     Native persistent storage cannot be relabeled as another engine. The manager
@@ -316,115 +338,116 @@ def migrate_native_spec(cfg: dict[str, Any], *, runtime: str | None = None, bina
     target = runtime or cfg.get("runtime", {}).get("id")
     _require(target in PINS, "migration requires an existing native runtime")
     _require(cfg.get("schema") == SCHEMA and target == cfg.get("runtime", {}).get("id"), "storage migration requires the same native engine and schema3", "incompatible_profile")
-    result = create_native_spec(cfg["name"], runtime=target, storage_path=cfg["storage"]["path"], seed=cfg["seed"], overrides=overrides if overrides is not None else cfg["overrides"], network=network if network is not None else cfg["network"], permissions=cfg["permissions"], binary=binary or cfg["runtime"]["binary"], asset_paths=assets or cfg["asset_paths"])
+    result = _build_native_spec(cfg["name"], runtime=target, storage_path=cfg["storage"]["path"], seed=cfg["seed"], identity=cfg["id"], overrides=overrides if overrides is not None else cfg["overrides"], network=network if network is not None else cfg["network"], permissions=cfg["permissions"], binary=binary if binary is not None else cfg["runtime"]["binary"], asset_paths=assets if assets is not None else cfg["asset_paths"], artifact_content=artifact_content)
     result.update(id=cfg["id"], revision=cfg["revision"] + 1, previous_environment_sha256=environment_digest(cfg))
     return result
 
 
-def native_asset_descriptors(cfg: dict[str, Any]) -> list[dict[str, str]]:
+def native_asset_descriptors(cfg: dict[str, Any], *, artifact_content: ArtifactContent | None = None) -> list[dict[str, str]]:
     """Return actual pinned source files for the manager's cold archive policy."""
-    validate_native_spec(cfg)
+    validate_native_spec(cfg, artifact_content=artifact_content)
     return [
         {"kind": "runtime", "path": cfg["runtime"]["binary"], "sha256": cfg["runtime"]["artifact_sha256"]},
-        *({"kind": "font", "path": path, "sha256": file_sha256(path)} for path in sorted(cfg["asset_paths"]["fonts"])),
+        *({"kind": "font", "path": path, "sha256": file_sha256(path, artifact_content=artifact_content)} for path in sorted(cfg["asset_paths"]["fonts"])),
     ]
 
 
-def rebind_asset_paths(cfg: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
+def rebind_asset_paths(cfg: dict[str, Any], mapping: dict[str, str], *, artifact_content: ArtifactContent | None = None) -> dict[str, Any]:
     """Return a byte-verified relocation without changing identity/revision.
 
     Reads new assets but never writes files or reads an absent original path.
     Changed bytes require explicit migration, not path rebinding.
     """
     validate_native_spec(cfg, check_artifacts=False)
-    _require(isinstance(mapping, dict) and all(isinstance(old, str) and Path(old).is_absolute() and isinstance(new, str) and Path(new).is_absolute() for old, new in mapping.items()), "asset rebind mapping must contain absolute paths")
+    _require(isinstance(mapping, dict) and all(isinstance(old, str) and PurePath(old).is_absolute() and isinstance(new, str) and PurePath(new).is_absolute() for old, new in mapping.items()), "asset rebind mapping must contain absolute paths")
     allowed = {*cfg["asset_paths"]["fonts"], cfg["runtime"]["binary"]}
     _require(not (set(mapping) - allowed), "asset rebind contains paths not owned by this configuration")
     result = copy.deepcopy(cfg)
     result["asset_paths"]["fonts"] = sorted({mapping.get(path, path) for path in cfg["asset_paths"]["fonts"]})
     result["runtime"]["binary"] = mapping.get(cfg["runtime"]["binary"], cfg["runtime"]["binary"])
-    validate_native_spec(result)
+    validate_native_spec(result, artifact_content=artifact_content)
     return result
 
 
-def native_font_assets() -> dict[str, list[str]]:
-    """Discover actual host font files; no browser launch or family presets."""
-    return {"fonts": _host_font_paths()}
+def native_font_assets(*, artifact_discovery: ArtifactDiscovery | None = None) -> dict[str, list[str]]:
+    """Discover actual host font files using the supplied capability."""
+    _require(artifact_discovery is not None, "font discovery capability is unavailable; provide asset_paths.fonts", "capability_unavailable")
+    paths = artifact_discovery.font_paths()
+    _require(bool(paths), "no actual font files found; provide asset_paths.fonts", "capability_unavailable")
+    return {"fonts": paths}
 
 
-def _font_file_families(path: str, digest: str) -> tuple[str, ...]:
+def _font_file_families(path: str, digest: str, *, artifact_content: ArtifactContent | None = None) -> tuple[str, ...]:
     cached = _FONT_FAMILY_CACHE.get(digest)
     if cached is not None:
         return cached
+    content = _artifact_content(artifact_content)
     families: set[str] = set()
     try:
-        with Path(path).open("rb") as stream:
-            size = os.fstat(stream.fileno()).st_size
-            def section(offset: int, length: int) -> bytes:
-                _require(0 <= offset <= size and 0 <= length <= min(size - offset, 16 * 1024 * 1024), f"invalid font table bounds: {path}")
-                stream.seek(offset)
-                value = stream.read(length)
-                _require(len(value) == length, f"truncated font file: {path}")
-                return value
-            magic = section(0, 4)
-            if magic == b"ttcf":
-                count = struct.unpack(">I", section(8, 4))[0]
-                _require(0 < count <= 4096, f"invalid font collection count: {path}")
-                offsets = struct.unpack(f">{count}I", section(12, count * 4))
-            else:
-                offsets = (0,)
-            for offset in offsets:
-                header = section(offset, 12)
-                _require(header[:4] in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1"), f"unsupported SFNT font header: {path}", "capability_unavailable")
-                table_count = struct.unpack_from(">H", header, 4)[0]
-                _require(0 < table_count <= 4096, f"invalid font table count: {path}")
-                tables = section(offset + 12, table_count * 16)
-                names = None
-                for index in range(table_count):
-                    tag, _, start, length = struct.unpack_from(">4sIII", tables, index * 16)
-                    if tag == b"name":
-                        names = section(start, length)
-                        break
-                _require(names is not None and len(names) >= 6, f"font name table unavailable: {path}", "capability_unavailable")
-                name_format, count, strings = struct.unpack_from(">HHH", names, 0)
-                _require(name_format in (0, 1) and 6 + count * 12 <= len(names) and strings <= len(names), f"invalid font name table: {path}")
-                candidates = []
-                for index in range(count):
-                    platform, encoding, language, name_id, length, start = struct.unpack_from(">HHHHHH", names, 6 + index * 12)
-                    if name_id not in (1, 16):
-                        continue
-                    _require(strings + start + length <= len(names), f"invalid font family name bounds: {path}")
-                    raw = names[strings + start:strings + start + length]
-                    codec = "utf-16-be" if platform in (0, 3) else "mac_roman" if platform == 1 and encoding == 0 else None
-                    if codec is None:
-                        continue
-                    try:
-                        family = raw.decode(codec).strip("\0 \t\r\n")
-                    except UnicodeDecodeError:
-                        continue
-                    if family and len(family) <= 256:
-                        english = language in (0, 0x0409)
-                        candidates.append((not english, name_id != 16, platform != 3, family))
-                if candidates:
-                    # One preferred real family per face; use typographic names
-                    # where available, with actual legacy family names otherwise.
-                    families.add(min(candidates)[3])
+        size = content.size(path)
+        def section(offset: int, length: int) -> bytes:
+            _require(0 <= offset <= size and 0 <= length <= min(size - offset, 16 * 1024 * 1024), f"invalid font table bounds: {path}")
+            return content.read(path, offset, length)
+        magic = section(0, 4)
+        if magic == b"ttcf":
+            count = struct.unpack(">I", section(8, 4))[0]
+            _require(0 < count <= 4096, f"invalid font collection count: {path}")
+            offsets = struct.unpack(f">{count}I", section(12, count * 4))
+        else:
+            offsets = (0,)
+        for offset in offsets:
+            header = section(offset, 12)
+            _require(header[:4] in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1"), f"unsupported SFNT font header: {path}", "capability_unavailable")
+            table_count = struct.unpack_from(">H", header, 4)[0]
+            _require(0 < table_count <= 4096, f"invalid font table count: {path}")
+            tables = section(offset + 12, table_count * 16)
+            names = None
+            for index in range(table_count):
+                tag, _, start, length = struct.unpack_from(">4sIII", tables, index * 16)
+                if tag == b"name":
+                    names = section(start, length)
+                    break
+            _require(names is not None and len(names) >= 6, f"font name table unavailable: {path}", "capability_unavailable")
+            name_format, count, strings = struct.unpack_from(">HHH", names, 0)
+            _require(name_format in (0, 1) and 6 + count * 12 <= len(names) and strings <= len(names), f"invalid font name table: {path}")
+            candidates = []
+            for index in range(count):
+                platform, encoding, language, name_id, length, start = struct.unpack_from(">HHHHHH", names, 6 + index * 12)
+                if name_id not in (1, 16):
+                    continue
+                _require(strings + start + length <= len(names), f"invalid font family name bounds: {path}")
+                raw = names[strings + start:strings + start + length]
+                codec = "utf-16-be" if platform in (0, 3) else "mac_roman" if platform == 1 and encoding == 0 else None
+                if codec is None:
+                    continue
+                try:
+                    family = raw.decode(codec).strip("\0 \t\r\n")
+                except UnicodeDecodeError:
+                    continue
+                if family and len(family) <= 256:
+                    english = language in (0, 0x0409)
+                    candidates.append((not english, name_id != 16, platform != 3, family))
+            if candidates:
+                # One preferred real family per face; use typographic names
+                # where available, with actual legacy family names otherwise.
+                families.add(min(candidates)[3])
     except OSError as exc:
         raise NativeError("incompatible_profile", f"cannot read font metadata {path}: {exc}") from exc
     _require(bool(families), f"no supported family metadata in pinned font {path}", "capability_unavailable")
-    _require(file_sha256(path) == digest, f"font changed while reading family metadata: {path}", "incompatible_profile")
+    _require(file_sha256(path, artifact_content=content) == digest, f"font changed while reading family metadata: {path}", "incompatible_profile")
     result = tuple(sorted(families, key=lambda name: (name.casefold(), name)))
     _FONT_FAMILY_CACHE[digest] = result
     return result
 
 
-def native_font_families(asset_paths: dict[str, list[str]] | None = None) -> list[str]:
+def native_font_families(asset_paths: dict[str, list[str]] | None = None, *, artifact_discovery: ArtifactDiscovery | None = None,
+                         artifact_content: ArtifactContent | None = None) -> list[str]:
     """Read actual SFNT/TTC family names, cached by immutable content digest.
 
     The caller can seed-select a subset, then pass those names as resolved.fonts.
     Native font backends still validate their actual selectable family inventory.
     """
-    paths = asset_paths if asset_paths is not None else native_font_assets()
-    _require(isinstance(paths, dict) and set(paths) == {"fonts"} and isinstance(paths["fonts"], list) and bool(paths["fonts"]) and all(isinstance(path, str) and Path(path).is_absolute() for path in paths["fonts"]), "font metadata requires a nonempty absolute fonts asset list")
-    families = {family for path in paths["fonts"] for family in _font_file_families(path, file_sha256(path))}
+    paths = asset_paths if asset_paths is not None else native_font_assets(artifact_discovery=artifact_discovery)
+    _require(isinstance(paths, dict) and set(paths) == {"fonts"} and isinstance(paths["fonts"], list) and bool(paths["fonts"]) and all(isinstance(path, str) and PurePath(path).is_absolute() for path in paths["fonts"]), "font metadata requires a nonempty absolute fonts asset list")
+    families = {family for path in paths["fonts"] for family in _font_file_families(path, file_sha256(path, artifact_content=artifact_content), artifact_content=artifact_content)}
     return sorted(families, key=lambda name: (name.casefold(), name))
