@@ -65,10 +65,11 @@ def _load_library(path: Path):
 
 
 class FrameRing:
-    def __init__(self, path: Path, socket: Path):
+    def __init__(self, path: Path, socket: Path | None = None):
         self.path, self.socket = path, socket
-        if (not path.is_absolute() or not socket.is_absolute() or path.parent != socket.parent or path == socket
-                or path.name == ".native-owner" or socket.name == ".native-owner" or len(os.fsencode(socket)) > 103):
+        if (not path.is_absolute() or path.name == ".native-owner"
+                or (socket is not None and (not socket.is_absolute() or path.parent != socket.parent
+                    or path == socket or socket.name == ".native-owner" or len(os.fsencode(socket)) > 103))):
             raise ValueError("native paths must be distinct absolute paths in the same private directory")
         info = path.parent.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
@@ -82,6 +83,8 @@ class FrameRing:
             acquired = True
             # Only the lock owner may reclaim the previous crashed session's files.
             for item, kind in ((path, stat.S_ISREG), (socket, stat.S_ISSOCK)):
+                if item is None:
+                    continue
                 if item.exists() or item.is_symlink():
                     old = item.lstat()
                     if old.st_uid != os.getuid() or not kind(old.st_mode):
@@ -130,6 +133,7 @@ class FrameRing:
     def close(self):
         self.mapping.close()
         self.path.unlink(missing_ok=True)
-        self.socket.unlink(missing_ok=True)
+        if self.socket is not None:
+            self.socket.unlink(missing_ok=True)
         self.lock_path.unlink(missing_ok=True)
         os.close(self.lock)

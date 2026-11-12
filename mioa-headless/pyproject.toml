@@ -6,7 +6,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12,<3.13"
-dependencies = ["mioa-core==0.1.0"]
+dependencies = ["mioa-core==0.1.0", "mioa-os==0.1.0"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
@@ -17,8 +17,13 @@ classifiers = [
 [project.scripts]
 mioa-headless = "mioa_headless.__main__:main"
 
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "mioa_headless/**/*.py" }]
+
 [tool.uv.sources]
 mioa-core = { path = "../mioa-core" }
+mioa-os-api = { path = "../mioa-os/api/system" }
+mioa-os = { path = "../mioa-os" }
 
 [build-system]
 requires = ["setuptools>=77"]

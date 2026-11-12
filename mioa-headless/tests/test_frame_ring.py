@@ -100,6 +100,24 @@ class FrameRingTests(unittest.TestCase):
                 self.ring.publish({**self.metadata(), **changed})
             self.assertEqual(self.ring.seq, 0)
 
+    def test_pixel_only_ring_omits_socket_limit_but_transport_ring_keeps_it(self):
+        root = self.root / ("x" * 104)
+        root.mkdir(mode=0o700)
+        path = root / "frame"
+        with self.assertRaises(ValueError):
+            FrameRing(path, root / "control.sock")
+        ring = FrameRing(path)
+        try:
+            self.assertIsNone(ring.socket)
+            self.assertEqual(ring.publish(self.metadata()), 1)
+            front = ring.lib.lpfr_acquire(ring.base, 0)
+            seq, = struct.unpack_from("<Q", ring.mapping, HEADER + front * SLOT_SIZE)
+            self.assertEqual(seq, 1)
+        finally:
+            ring.close()
+        self.assertFalse(path.exists())
+        self.assertFalse((root / ".native-owner").exists())
+
     def test_live_owner_cannot_be_reclaimed(self):
         with self.assertRaises(BlockingIOError):
             FrameRing(self.ring.path, self.ring.socket)

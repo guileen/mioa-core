@@ -38,6 +38,8 @@ class NativeProtocol:
         self.client: asyncio.Task | None = None
         self.notification: asyncio.Task | None = None
         self.invalidation_revision = 0
+        self.invalidated_pages: set[str] = set()
+        self.global_invalidation = False
         self.server = None
         self.ring = None
         self.session = None
@@ -46,9 +48,15 @@ class NativeProtocol:
         self.observed_pages = set()
         self.lifecycle: asyncio.Task | None = None
         self.fatal: ServiceError | None = None
-        self.normal: asyncio.Task | None = None
-        self.interrupt: asyncio.Task | None = None
-        self.requests: asyncio.Queue = asyncio.Queue(maxsize=16)
+        # One bounded FIFO per resolved execution domain, plus the legacy lane.
+        # Control/stop have reserved slots and never queue behind native work.
+        self.lanes: dict[int | None, tuple[asyncio.Queue, asyncio.Task]] = {}
+        self.interrupts: dict[int | None, asyncio.Task] = {}
+        self.demands: dict[int, asyncio.Task] = {}
+        self.control_transition: asyncio.Task | None = None
+        self.queued_terminals: set[int] = set()
+        self.admitted_input_channels: dict[int, dict] = {}
+        self.input_channel_high_water = 0
 
     async def emit(self, value: dict):
         encoded = json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode()
@@ -62,7 +70,8 @@ class NativeProtocol:
                 await self.writer.drain()
 
     async def observe_page(self, page):
-        if page.session_id in self.observed_pages:
+        identity = (page.context.cdp.execution_domain, page.session_id)
+        if identity in self.observed_pages:
             return
         await page._send("Page.subscribeNativeFrames")
         await page._send("Runtime.addBinding", {"name": "__pandaNativeInvalidated", "executionContextName": OBSERVER_WORLD})
@@ -77,8 +86,8 @@ class NativeProtocol:
             if reply.get("exceptionDetails"):
                 raise ServiceError("capability_unavailable", "Native isolated observation could not be installed.")
         await page._send("Page.addScriptToEvaluateOnNewDocument", {"source": OBSERVER, "worldName": OBSERVER_WORLD})
-        self.observed_pages.add(page.session_id)
-        self.invalidate()
+        self.observed_pages.add(identity)
+        self.invalidate(self.engine.operations.page_id(page))
 
     def event(self, value: dict):
         method, params = value.get("method"), value.get("params", {})
@@ -90,8 +99,15 @@ class NativeProtocol:
         if method == "Runtime.bindingCalled":
             meaningful = params.get("name") == "__pandaNativeInvalidated"
         if meaningful:
+            if not any(value.get("_execution_domain", 0) == page.context.cdp.execution_domain
+                       and value.get("_execution_epoch", 0) == getattr(page.context.cdp, "execution_epoch", 0)
+                       for page in self.engine.context.pages):
+                return
+            page_id = None
             for page in self.engine.context.pages:
-                if value.get("sessionId") == page.session_id:
+                if (value.get("sessionId") == page.session_id
+                        and value.get("_execution_domain", 0) == page.context.cdp.execution_domain
+                        and value.get("_execution_epoch", 0) == getattr(page.context.cdp, "execution_epoch", 0)):
                     if method in {"Page.frameNavigated", "Page.navigatedWithinDocument",
                                   "Page.frameStartedLoading", "Page.frameStoppedLoading"}:
                         page.native_navigation_revision = getattr(page, "native_navigation_revision", 0) + 1
@@ -102,9 +118,16 @@ class NativeProtocol:
                     if method in {"Page.frameStartedLoading", "Page.frameStoppedLoading"} and params.get("frameId") == page.frame_id:
                         page.native_loading = method == "Page.frameStartedLoading"
                     page.native_visual_epoch = getattr(page, "native_visual_epoch", 0) + 1
-            self.invalidate()
+                    page_id = self.engine.operations.page_id(page)
+            self.invalidate(page_id)
 
-    def invalidate(self):
+    def invalidate(self, page_id: str | None = None):
+        if page_id is None:
+            self.global_invalidation = True
+        elif len(self.invalidated_pages) < 100 or page_id in self.invalidated_pages:
+            self.invalidated_pages.add(page_id)
+        else:
+            self.global_invalidation = True
         self.invalidation_revision += 1
         if self.notification is None or self.notification.done():
             self.notification = asyncio.create_task(self.notify())
@@ -112,9 +135,16 @@ class NativeProtocol:
     async def notify(self):
         try:
             while not self.engine.stopping.is_set():
-                await asyncio.sleep(0.008)  # bounded event burst coalescing, not a capture loop
                 revision = self.invalidation_revision
-                await self.emit({"event": "invalidated"})
+                pages, self.invalidated_pages = self.invalidated_pages, set()
+                global_invalidation, self.global_invalidation = self.global_invalidation, False
+                if global_invalidation:
+                    await self.emit({"event": "invalidated", "revision": revision})
+                for page_id in pages:
+                    await self.emit({"event": "invalidated", "page_id": page_id, "revision": revision})
+                # Leading-edge feedback is immediate; only subsequent bursts wait.
+                # Keep the task alive through the cooldown so new events coalesce.
+                await asyncio.sleep(0.008)
                 if revision == self.invalidation_revision:
                     return
         except (ConnectionError, OSError, TimeoutError):
@@ -125,38 +155,147 @@ class NativeProtocol:
         method, params = request["method"], request["params"]
         try:
             async with asyncio.timeout(OPERATION_TIMEOUT):
-                if method in {"state", "frame"}:
+                if getattr(request.get("_source_page"), "_headless_stop_revoked", False):
+                    channel = (self.session.input_channels.get(params.get("channel_id"))
+                               if method == "page_broker_action" and
+                               params.get("operation") in {"mouse.up", "keyboard.up", "input.cancel"} else None)
+                    if channel is None or channel["page"] is not request.get("_source_page"):
+                        raise ServiceError("stale_reference", "Request execution incarnation was revoked.")
+                if ("_execution_domain" in request
+                        and self.request_domain(request) != request["_execution_domain"]):
+                    raise ServiceError("stale_reference", "Request source execution domain changed.")
+                if ("_active_page_id" in request and self.engine.operations.page_id(self.engine.page())
+                        != request["_active_page_id"]):
+                    raise ServiceError("stale_reference", "Request source active page changed.")
+                if method == "state":
                     if params:
-                        raise ServiceError("invalid_config", "State and frame take no parameters.")
-                    result = await (self.session.state() if method == "state" else self.session.capture())
+                        raise ServiceError("invalid_config", "State takes no parameters.")
+                    result = await self.session.state()
+                elif method == "frame":
+                    if set(params) - {"page_id"} or ("page_id" in params and
+                            (not isinstance(params["page_id"], str) or not 0 < len(params["page_id"]) <= 256)):
+                        raise ServiceError("invalid_config", "Frame accepts an optional page_id.")
+                    revision = self.invalidation_revision
+                    result = await self.session.capture(params.get("page_id"))
+                    result["invalidation_revision"] = revision
+                elif method == "page_resize":
+                    result = await self.session.resize_page(params)
+                elif method == "page_viewport":
+                    result = await self.session.page_viewport(params)
+                elif method == "page_demand":
+                    result = await self.session.page_demand(params)
+                elif method == "page_broker_frame":
+                    result = await self.session.page_broker_frame(params)
+                elif method == "page_bind_displayed":
+                    result = await self.session.page_bind_displayed(params)
+                elif method == "page_broker_action":
+                    result = await self.session.page_broker_action(params)
+                elif method == "page_action":
+                    result = await self.session.page_action(params)
+                elif method == "page_stop":
+                    result = await self.session.page_stop(params)
                 elif method == "resize":
                     result = await self.session.resize(params)
                 elif method == "control":
                     result = await self.session.control(params)
+                elif method == "new_application":
+                    result = await self.session.new_application(params)
                 elif method == "axtree":
                     result = await self.session.axtree(params)
                 elif method == "stop":
                     result = await self.session.stop(params)
                 else:
                     result = await self.session.action(params)
+            if (method in {"frame", "axtree", "page_viewport"}
+                    and getattr(request.get("_source_page"), "_headless_stop_revoked", False)):
+                raise ServiceError("stale_reference", "Observation source was revoked by execution domain Stop.")
             response["result"] = result
         except Exception as exc:
+            # A read already dispatched when explicit Stop revoked its source
+            # still settles its own ID, but cannot become a healthy observation
+            # or a transport-fatal failure for a surviving domain. Never rewrite
+            # action errors: dispatched input can have unknown side effects.
+            if (method in {"frame", "axtree", "page_viewport"}
+                    and getattr(request.get("_source_page"), "_headless_stop_revoked", False)):
+                exc = ServiceError("stale_reference", "Observation source was revoked by execution domain Stop.")
             response["error"] = safe_error(exc)
         try:
             await self.emit(response)
         except (ConnectionError, OSError, TimeoutError, ServiceError):
             self.engine.stopping.set()
 
-    async def serial_requests(self):
+    def request_domain(self, request: dict) -> int | None:
+        method, params = request["method"], request["params"]
+        if method == "page_broker_action" and params.get("operation") in {"mouse.up", "keyboard.up", "input.cancel"}:
+            channel = (self.session.input_channels.get(params.get("channel_id")) or
+                       self.admitted_input_channels.get(params.get("channel_id")))
+            if channel is None:
+                raise ServiceError("stale_reference", "Input terminal has no reservation.")
+            return channel["domain"]
+        if method.startswith("page_") or (method == "frame" and "page_id" in params):
+            return self.session.execution_domain(params.get("page_id"))
+        if method == "frame" and not self.engine.context.pages:
+            return None
+        if method in {"action", "resize", "stop", "axtree", "frame"}:
+            return self.session.active_execution_domain()
+        return None
+
+    async def serial_requests(self, requests: asyncio.Queue, domain: int | None):
         while not self.engine.stopping.is_set():
-            request = await self.requests.get()
+            request = await requests.get()
             try:
-                # A later normal request must not overtake an outstanding stop.
-                if self.interrupt is not None:
-                    await self.interrupt
+                # Stop only fences its source domain. Global ownership changes
+                # revoke admission in ControlState before waiting for all actions.
+                fences = [task for key, task in self.interrupts.items()
+                          if key is None or key == domain]
+                if fences:
+                    await asyncio.gather(*fences)
                 await self.respond(request)
             finally:
-                self.requests.task_done()
+                if "_terminal_channel" in request:
+                    self.queued_terminals.discard(request["_terminal_channel"])
+                    if request["_terminal_channel"] not in self.session.input_channels:
+                        self.admitted_input_channels.pop(request["_terminal_channel"], None)
+                requests.task_done()
+
+    def enqueue(self, request: dict, domain: int | None) -> None:
+        if domain not in self.lanes:
+            if len(self.lanes) >= 8:
+                raise ServiceError("busy", "Native execution lane capacity is exhausted.")
+            queue = asyncio.Queue(maxsize=32)  # 16 ordinary + 16 reserved terminals
+            self.lanes[domain] = (queue, asyncio.create_task(self.serial_requests(queue, domain)))
+        queue = self.lanes[domain][0]
+        terminal = (request["method"] == "page_broker_action" and
+                    request["params"].get("operation") in {"mouse.up", "keyboard.up", "input.cancel"})
+        channel_id = request["params"].get("channel_id")
+        begin = (request["method"] == "page_broker_action" and
+                 request["params"].get("operation") in {"mouse.down", "keyboard.down"})
+        if begin:
+            if type(channel_id) is not int or not 0 < channel_id <= 2**53 - 1 or channel_id <= self.input_channel_high_water:
+                raise ServiceError("invalid_config", "Input channel identity was already used or invalid.")
+            if len(self.admitted_input_channels) >= 16:
+                raise ServiceError("busy", "Input terminal reservation capacity is exhausted.")
+        if terminal:
+            if type(channel_id) is not int or not 0 < channel_id <= 2**53 - 1:
+                raise ServiceError("invalid_config", "Invalid input terminal identity.")
+            if channel_id not in self.admitted_input_channels:
+                raise ServiceError("stale_reference", "Input terminal has no reservation.")
+            if channel_id in self.queued_terminals:
+                raise ServiceError("invalid_config", "Input terminal is already queued.")
+            if len(self.queued_terminals) >= 16:
+                raise ServiceError("busy", "Input terminal queue capacity is exhausted.")
+        elif queue.qsize() >= 16:
+            raise ServiceError("busy", "Native execution domain queue is full.")
+        try:
+            queue.put_nowait(request)
+        except asyncio.QueueFull:
+            raise ServiceError("busy", "Native execution domain queue is full.") from None
+        if terminal:
+            self.queued_terminals.add(channel_id)
+            request["_terminal_channel"] = channel_id
+        if begin:
+            self.admitted_input_channels[channel_id] = {"domain": domain, "page": request.get("_source_page")}
+            self.input_channel_high_water = channel_id
 
     async def accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         if self.writer is not None or self.engine.stopping.is_set():
@@ -167,7 +306,7 @@ class NativeProtocol:
             return
         self.writer = writer
         self.client = asyncio.current_task()
-        self.normal = asyncio.create_task(self.serial_requests())
+        # Workers are admitted lazily only for live, locally resolved domains.
         try:
             while not self.engine.stopping.is_set():
                 first = await reader.readexactly(1)  # idle connections need no heartbeat
@@ -188,15 +327,36 @@ class NativeProtocol:
                         self.shutdown_id = request["id"]
                         self.engine.stopping.set()
                         return  # response follows durable engine shutdown
-                    if method == "stop":
-                        if self.interrupt is not None and not self.interrupt.done():
-                            raise ServiceError("busy", "Only one stop may be pending.")
-                        self.interrupt = asyncio.create_task(self.respond(request))
+                    if method == "control":
+                        if self.control_transition is not None and not self.control_transition.done():
+                            raise ServiceError("busy", "Only one ownership transition may be pending.")
+                        self.control_transition = asyncio.create_task(self.respond(request))
                     else:
-                        try:
-                            self.requests.put_nowait(request)
-                        except asyncio.QueueFull:
-                            raise ServiceError("busy", "Native request queue is full.")
+                        domain = self.request_domain(request)
+                        request["_execution_domain"] = domain
+                        if domain is not None:
+                            if method == "page_broker_action" and params.get("operation") in {"mouse.up", "keyboard.up", "input.cancel"}:
+                                channel = (self.session.input_channels.get(params.get("channel_id")) or
+                                           self.admitted_input_channels[params["channel_id"]])
+                                request["_source_page"] = channel["page"]
+                            elif method.startswith("page_") or (method == "frame" and "page_id" in params):
+                                request["_source_page"] = self.engine.local_page_by_id(params.get("page_id"))
+                            else:
+                                # Active work already has an authoritative local
+                                # page; never resolve it again through inventory.
+                                page = self.engine.page()
+                                request["_source_page"] = page
+                                request["_active_page_id"] = self.engine.operations.page_id(page)
+                        if method in {"stop", "page_stop"}:
+                            if domain in self.interrupts and not self.interrupts[domain].done():
+                                raise ServiceError("busy", "Only one stop per domain may be pending.")
+                            self.interrupts[domain] = asyncio.create_task(self.respond(request))
+                        elif method == "page_demand":
+                            if domain in self.demands and not self.demands[domain].done():
+                                raise ServiceError("busy", "Only one demand transition per domain may be pending.")
+                            self.demands[domain] = asyncio.create_task(self.respond(request))
+                        else:
+                            self.enqueue(request, domain)
                     # Let dispatch enter its boundary before reading another
                     # complete packet already buffered on the same connection.
                     await asyncio.sleep(0)
@@ -211,10 +371,13 @@ class NativeProtocol:
             # otherwise closes the transport before its terminal frame is sent.
             return
         finally:
-            for task in (self.normal, self.interrupt):
-                if task is not None and not task.done():
+            lanes = (tuple(task for _, task in self.lanes.values()) + tuple(self.interrupts.values())
+                     + tuple(self.demands.values()))
+            if self.control_transition is not None:
+                lanes += (self.control_transition,)
+            for task in lanes:
+                if not task.done():
                     task.cancel()
-            lanes = tuple(task for task in (self.normal, self.interrupt) if task is not None)
             try:
                 await asyncio.gather(*lanes, return_exceptions=True)
             except asyncio.CancelledError:
@@ -237,6 +400,9 @@ class NativeProtocol:
         try:
             done, _ = await asyncio.wait({process, reader}, return_when=asyncio.FIRST_COMPLETED)
             if not self.engine.stopping.is_set():
+                if hasattr(self.engine.native.process, "domain") and self.ready:
+                    self.invalidate()
+                    return
                 message = ("Native runtime exited unexpectedly." if process in done
                            else "Native control connection closed unexpectedly.")
                 self.fatal = ServiceError("runtime_error", message)
@@ -298,8 +464,8 @@ class NativeProtocol:
         if self.engine.stopping.is_set():
             return
         sys.stdout.write(json.dumps({"event": "ready", "protocol": 1, "profile": self.engine.name,
-            "runtime": "mioa", "home": str(self.home), "pid": os.getpid(),
-            "native_pid": self.engine.native.pid, "native_socket": str(self.socket),
+            "runtime": "mioa", "home": str(self.home),
+            "native_socket": str(self.socket),
             "frame_shm": str(self.shm), "frame_protocol": 2}, separators=(",", ":")) + "\n")
         sys.stdout.flush()
         self.ready = True
