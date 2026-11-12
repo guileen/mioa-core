@@ -1,0 +1,21 @@
+[project]
+name = "mioa-os"
+version = "0.1.0"
+description = "Private Mioa OS services assembled by trusted Hosts"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.13"
+dependencies = ["mioa-os-api==0.1.0", "psutil==7.2.2", "requests==2.34.2"]
+
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "mioa_os/**/*.py" }]
+
+[tool.uv.sources]
+mioa-os-api = { path = "api/system" }
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mioa_os*"]
