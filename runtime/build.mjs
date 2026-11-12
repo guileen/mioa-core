@@ -182,7 +182,16 @@ try {
   {
     const binary = join(output, 'engine/zig-out/bin/lightpanda');
     await rm(binary, { force: true });
-    execute(config.zig, ['build', '-Doptimize=fast', '-Ddev_fast=false', '-Dshared_v8=false', `-Dprebuilt_v8_path=${receipt.v8_archive.path}`, `-Dmioa_os_dir=${join(core, 'mioa-os')}`, `-j${jobs}`, '--cache-dir', env.ZIG_LOCAL_CACHE_DIR], join(output, 'engine'), env);
+    // The engine is materialized under --output-root, so the vendor-relative
+    // ../../../../src/render_kernel path depends on output depth. Pass the
+    // desktop kernel the same way mioa-os is passed: an absolute -D path.
+    const renderKernel = resolve(core, '../../src/render_kernel/document.zig');
+    try {
+      if (!(await stat(renderKernel)).isFile()) throw new Error('not a file');
+    } catch (error) {
+      throw new Error(`Desktop render_kernel not found at ${renderKernel}`, { cause: error });
+    }
+    execute(config.zig, ['build', '-Doptimize=fast', '-Ddev_fast=false', '-Dshared_v8=false', `-Dprebuilt_v8_path=${receipt.v8_archive.path}`, `-Dmioa_os_dir=${join(core, 'mioa-os')}`, `-Drender_kernel=${renderKernel}`, `-j${jobs}`, '--cache-dir', env.ZIG_LOCAL_CACHE_DIR], join(output, 'engine'), env);
     receipt.artifacts.engine = { path: binary, ...await fileInfo(binary) };
     receipt.binary = receipt.artifacts.engine;
   }

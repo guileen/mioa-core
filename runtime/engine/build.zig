@@ -100,6 +100,16 @@ pub fn build(b: *Build) !void {
         .{ .cwd_relative = mioa_os_dir }
     else
         b.path(mioa_os_dir);
+    // Default is the vendor-layout relative path from runtime/engine. Source
+    // builds that materialize the engine under a deeper output root (for
+    // example mioa-desktop/.local/release-runs/<id>/core-runtime/engine) must
+    // pass an absolute -Drender_kernel; otherwise ../../../../src resolves
+    // into .local/src and the compile fails with FileNotFound.
+    const render_kernel_path = b.option([]const u8, "render_kernel", "Path to desktop render_kernel/document.zig when the engine is built outside runtime/engine") orelse "../../../../src/render_kernel/document.zig";
+    const render_kernel_root: std.Build.LazyPath = if (std.fs.path.isAbsolute(render_kernel_path))
+        .{ .cwd_relative = render_kernel_path }
+    else
+        b.path(render_kernel_path);
     const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
     // Hot-code layout for the Linux release artifacts, see orderfile/README.md.
     // Opt-in (CI passes it): it needs LLD and costs link time on every build.
@@ -155,7 +165,7 @@ pub fn build(b: *Build) !void {
     // The Desktop-owned Zig kernel is the only renderer; `@import("render_kernel")`
     // resolves to `mioa-desktop/src/render_kernel/document.zig`.
     const render_kernel_module = b.createModule(.{
-        .root_source_file = b.path("../../../../src/render_kernel/document.zig"),
+        .root_source_file = render_kernel_root,
         .target = target,
         .optimize = optimize,
     });
