@@ -66,12 +66,14 @@ name = "mioa-core"
 version = "0.1.0"
 source = { directory = "../mioa-core" }
 dependencies = [
+    { name = "mioa-os-api" },
     { name = "psutil" },
     { name = "requests" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "mioa-os-api", directory = "../mioa-os/api/system" },
     { name = "psutil", specifier = "==7.2.2" },
     { name = "requests", specifier = "==2.34.2" },
 ]
@@ -82,10 +84,36 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mioa-core" },
+    { name = "mioa-os" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mioa-core", directory = "../mioa-core" }]
+requires-dist = [
+    { name = "mioa-core", directory = "../mioa-core" },
+    { name = "mioa-os", directory = "../mioa-os" },
+]
+
+[[package]]
+name = "mioa-os"
+version = "0.1.0"
+source = { directory = "../mioa-os" }
+dependencies = [
+    { name = "mioa-os-api" },
+    { name = "psutil" },
+    { name = "requests" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mioa-os-api", directory = "../mioa-os/api/system" },
+    { name = "psutil", specifier = "==7.2.2" },
+    { name = "requests", specifier = "==2.34.2" },
+]
+
+[[package]]
+name = "mioa-os-api"
+version = "0.1.0"
+source = { directory = "../mioa-os/api/system" }
 
 [[package]]
 name = "psutil"
